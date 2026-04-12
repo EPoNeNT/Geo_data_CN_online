@@ -48,6 +48,12 @@ jobs:
         timeout-minutes: 360
         env:
           LOG_TO_FILE: '1'
+
+      - name: Assign cache cities
+        run: python assign_cities.py
+        timeout-minutes: 60
+        env:
+          LOG_TO_FILE: '1'
       
       - name: Upload logs on failure
         if: failure()

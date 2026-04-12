@@ -20,24 +20,21 @@ SET city = CASE
     WHEN p.country = 'Hong Kong' THEN '香港'
     WHEN p.country = 'Macao' THEN '澳门'
     WHEN p.country = 'Taiwan' THEN '台湾'
-    ELSE nearest.display_city_name
+    ELSE (
+        SELECT CASE
+            WHEN m.id LIKE '11%%' THEN '北京市'
+            WHEN m.id LIKE '31%%' THEN '上海市'
+            WHEN m.id LIKE '12%%' THEN '天津市'
+            WHEN m.id LIKE '50%%' THEN '重庆市'
+            ELSE m.name
+        END AS display_city_name
+        FROM map_cities AS m
+        ORDER BY
+            m.geom <-> ST_SetSRID(ST_MakePoint(p.longitude, p.latitude), 4326),
+            ST_Distance(m.geom, ST_SetSRID(ST_MakePoint(p.longitude, p.latitude), 4326))
+        LIMIT 1
+    )
 END
-FROM (SELECT 1) AS anchor
-LEFT JOIN LATERAL (
-    SELECT CASE
-        WHEN m.id LIKE '11%%' THEN '北京市'
-        WHEN m.id LIKE '31%%' THEN '上海市'
-        WHEN m.id LIKE '12%%' THEN '天津市'
-        WHEN m.id LIKE '50%%' THEN '重庆市'
-        ELSE m.name
-    END AS display_city_name
-    FROM map_cities AS m
-    WHERE p.country NOT IN ('Hong Kong', 'Macao', 'Taiwan')
-    ORDER BY
-        m.geom <-> ST_SetSRID(ST_MakePoint(p.longitude, p.latitude), 4326),
-        ST_Distance(m.geom, ST_SetSRID(ST_MakePoint(p.longitude, p.latitude), 4326))
-    LIMIT 1
-) AS nearest ON TRUE
 WHERE p.city IS NULL
   AND (
       p.country IN ('Hong Kong', 'Macao', 'Taiwan')

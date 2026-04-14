@@ -589,7 +589,6 @@ def crawl_cache_group(
                     all_logs.extend(cache_logs)
                     logger.info(f"  获取 {len(cache_logs)} 条 logs")
                     success_count += 1
-                    logs_count += len(cache_logs)
                 else:
                     logger.info("  无 logs 数据")
 
@@ -620,7 +619,8 @@ def crawl_cache_group(
         if (i + 1) % 30 == 0:
             if all_logs:
                 inserted, updated = db.smart_upsert_logs(all_logs)
-                logger.info(f"{group_name} 组处理 {len(all_logs)} 条 logs: 新增 {inserted} 条, 更新 {updated} 条")
+                logs_count += (inserted + updated)
+                logger.info(f"{group_name} 组处理 {len(all_logs)} 条原始 logs: 新增 {inserted} 条, 更新 {updated} 条 (净增 {inserted+updated} 条)")
                 all_logs = []
             db.batch_update_logs_crawled_at(crawled_codes, today_str)
             crawled_codes = []
@@ -628,7 +628,8 @@ def crawl_cache_group(
 
     if all_logs:
         inserted, updated = db.smart_upsert_logs(all_logs)
-        logger.info(f"{group_name} 组处理 {len(all_logs)} 条 logs: 新增 {inserted} 条, 更新 {updated} 条")
+        logs_count += (inserted + updated)
+        logger.info(f"{group_name} 组处理 {len(all_logs)} 条原始 logs: 新增 {inserted} 条, 更新 {updated} 条 (净增 {inserted+updated} 条)")
     if crawled_codes:
         db.batch_update_logs_crawled_at(crawled_codes, today_str)
 

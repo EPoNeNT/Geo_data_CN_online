@@ -48,7 +48,7 @@ REGION_COUNTRY_MAP = {
 DT_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 
 # Exclusion filters for caches
-EXCLUDE_CACHE_WHERE = "cache_status != 2 AND geocache_type NOT IN (6, 13)"
+EXCLUDE_CACHE_WHERE = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
 EXCLUDE_CACHE_JOIN = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
 
 
@@ -99,11 +99,12 @@ class DataGenerator:
 
     def generate_summary_metrics(self, country_filter: Optional[str] = None) -> Dict:
         """Generate summary metrics for a region or overall."""
-        cache_where = f"WHERE {EXCLUDE_CACHE_WHERE}"
-        log_where = f"WHERE {EXCLUDE_CACHE_JOIN}"
         if country_filter:
-            cache_where += f" AND c.country = '{country_filter}'"
-            log_where += f" AND c2.country = '{country_filter}'"
+            cache_where = f"WHERE c.cache_status != 2 AND c.geocache_type NOT IN (6, 13) AND c.country = '{country_filter}'"
+            log_where = f"WHERE c2.cache_status != 2 AND c2.geocache_type NOT IN (6, 13) AND c2.country = '{country_filter}'"
+        else:
+            cache_where = "WHERE c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
+            log_where = "WHERE c2.cache_status != 2 AND c2.geocache_type NOT IN (6, 13)"
 
         query = f"""
         WITH cache_scope AS (
@@ -337,12 +338,12 @@ class DataGenerator:
             else:
                 return f"""
                 SELECT owner_username AS name, COUNT(*)::int AS score
-                FROM caches
-                WHERE owner_username IS NOT NULL AND owner_username <> ''
-                  AND placed_date {date_filter}
+                FROM caches c
+                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND c.placed_date {date_filter}
                   AND {EXCLUDE_CACHE_WHERE}
-                GROUP BY owner_username
-                ORDER BY score DESC, owner_username ASC
+                GROUP BY c.owner_username
+                ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
                 """
 
@@ -399,12 +400,12 @@ class DataGenerator:
             else:
                 return f"""
                 SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
-                FROM caches
-                WHERE owner_username IS NOT NULL AND owner_username <> ''
-                  AND placed_date {date_filter}
+                FROM caches c
+                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND c.placed_date {date_filter}
                   AND {EXCLUDE_CACHE_WHERE}
-                GROUP BY owner_username
-                ORDER BY score DESC, owner_username ASC
+                GROUP BY c.owner_username
+                ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
                 """
 
@@ -520,7 +521,7 @@ class DataGenerator:
             growth_pct = round((active_players - prev_active_players) / prev_active_players * 100, 1)
 
         # Total caches
-        total_query = f"SELECT COUNT(*)::int AS count FROM caches WHERE {EXCLUDE_CACHE_WHERE};"
+        total_query = f"SELECT COUNT(*)::int AS count FROM caches c WHERE {EXCLUDE_CACHE_WHERE};"
         total_result = self.execute_query(total_query)
         total_caches = total_result[0]["count"] if total_result else 0
 
@@ -571,9 +572,9 @@ class DataGenerator:
         ),
         counts AS (
           SELECT EXTRACT(YEAR FROM placed_date)::int AS year, COUNT(*)::int AS count
-          FROM caches
+          FROM caches c
           WHERE {EXCLUDE_CACHE_WHERE}
-            AND placed_date IS NOT NULL
+            AND c.placed_date IS NOT NULL
             AND EXTRACT(YEAR FROM placed_date)::int >= EXTRACT(YEAR FROM CURRENT_DATE)::int - 6
           GROUP BY 1
         )

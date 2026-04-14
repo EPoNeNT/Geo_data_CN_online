@@ -289,12 +289,28 @@ class DataGenerator:
 
     # ==================== PLAYER-RANKINGS.JSON ====================
 
-    def calculate_trend(self, current_score: int, previous_score: int) -> Tuple[str, int]:
-        """Calculate trend direction and delta."""
-        delta = current_score - previous_score
+    def calculate_trend(self, current_rank: int, previous_rank: int) -> Tuple[str, int]:
+        """Calculate trend direction and delta based on rank change.
+
+        Args:
+            current_rank: Current period rank (1-based)
+            previous_rank: Previous period rank (1-based), 0 if not ranked
+
+        Returns:
+            (trend, trendDelta) where:
+            - trend: "up", "down", or "flat"
+            - trendDelta: absolute rank change (positive means improved)
+        """
+        if previous_rank == 0:
+            # New entry in rankings (was not in previous period)
+            return ("up", current_rank)
+
+        delta = previous_rank - current_rank
         if delta > 0:
-            return ("up", delta)
+            # Rank number decreased (e.g., 4->2): improved position
+            return ("up", abs(delta))
         elif delta < 0:
+            # Rank number increased (e.g., 2->4): dropped position
             return ("down", abs(delta))
         else:
             return ("flat", 0)
@@ -457,7 +473,13 @@ class DataGenerator:
         is_city_ranking: bool = False,
         limit: int = 999999,
     ) -> str:
-        """Generate SQL query for previous period (for trend calculation)."""
+        """Generate SQL query for previous period (for trend calculation).
+
+        Previous period definitions:
+        - 30d: Previous 30-60 days
+        - ytd: Last full calendar year (Jan 1 to Dec 31)
+        - all: All time up to end of last year (Dec 31)
+        """
 
         # Determine date column and table alias based on ranking type
         # hides/favorites use caches.placed_date, finds/logs use logs.visited
@@ -470,13 +492,26 @@ class DataGenerator:
 
         # Previous period date filter with proper column name
         if time_range == "30d":
+            # Previous 30-day window (days 30-60 ago)
             prev_start = "CURRENT_DATE - INTERVAL '60 day'"
             prev_end = "CURRENT_DATE - INTERVAL '30 day'"
         elif time_range == "ytd":
+            # Last full calendar year (Jan 1 to Dec 31 of last year)
             prev_start = "date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date"
             prev_end = "date_trunc('year', CURRENT_DATE)::date"
+        elif time_range == "all":
+            # All time up to end of last year (Dec 31)
+            prev_start = None  # No lower bound
+            prev_end = "date_trunc('year', CURRENT_DATE)::date"
         else:
-            raise ValueError("Cannot generate previous period query for 'all' time range")
+            raise ValueError(f"Unknown time range: {time_range}")
+
+        # Build date filter conditions
+        if prev_start:
+            date_filter = f"AND {date_col} >= {prev_start}\n                  AND {date_col} < {prev_end}"
+        else:
+            # No lower bound (for 'all' time range)
+            date_filter = f"AND {date_col} < {prev_end}"
 
         # Reuse the same query structure but with previous period filter
         if ranking_type == "hides":
@@ -489,8 +524,7 @@ class DataGenerator:
                     c.country AS subtitle
                   FROM caches c
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND {date_col} >= {prev_start}
-                    AND {date_col} < {prev_end}
+                    {date_filter}
                     AND {EXCLUDE_CACHE_WHERE}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -502,8 +536,7 @@ class DataGenerator:
                 SELECT owner_username AS name, COUNT(*)::int AS score
                 FROM caches c
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                  AND {date_col} >= {prev_start}
-                  AND {date_col} < {prev_end}
+                  {date_filter}
                   AND {EXCLUDE_CACHE_WHERE}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -522,8 +555,7 @@ class DataGenerator:
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND {date_col} >= {prev_start}
-                    AND {date_col} < {prev_end}
+                    {date_filter}
                     AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -536,8 +568,7 @@ class DataGenerator:
                 FROM logs l
                 JOIN caches c ON c.code = l.gc_code
                 WHERE l.user_name IS NOT NULL AND l.user_name <> ''
-                  AND {date_col} >= {prev_start}
-                  AND {date_col} < {prev_end}
+                  {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
@@ -555,8 +586,7 @@ class DataGenerator:
                     c.favorite_points
                   FROM caches c
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND {date_col} >= {prev_start}
-                    AND {date_col} < {prev_end}
+                    {date_filter}
                     AND {EXCLUDE_CACHE_WHERE}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -568,8 +598,7 @@ class DataGenerator:
                 SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
                 FROM caches c
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                  AND {date_col} >= {prev_start}
-                  AND {date_col} < {prev_end}
+                  {date_filter}
                   AND {EXCLUDE_CACHE_WHERE}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -587,8 +616,7 @@ class DataGenerator:
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND {date_col} >= {prev_start}
-                    AND {date_col} < {prev_end}
+                    {date_filter}
                     AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -603,8 +631,7 @@ class DataGenerator:
                 FROM caches c
                 JOIN logs l ON l.gc_code = c.code
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                  AND {date_col} >= {prev_start}
-                  AND {date_col} < {prev_end}
+                  {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -620,31 +647,36 @@ class DataGenerator:
         is_city_ranking: bool = False,
         limit: int = 30,
     ) -> Dict:
-        """Generate all rankings data."""
+        """Generate all rankings data with optimized trend calculation."""
         rankings = {}
 
         for rtype in ranking_types:
             rankings[rtype] = {}
             for trange in time_ranges:
                 logger.debug(f"Generating {rtype}/{trange} ranking...")
+                
+                # Get current period rankings
                 query = self.generate_ranking_query(rtype, trange, is_city_ranking, limit)
                 results = self.execute_query(query)
 
-                # Get previous period data for trend calculation (except for 'all' time range)
-                prev_scores = {}
-                if trange != "all":
-                    try:
-                        prev_query = self.generate_previous_period_query(rtype, trange, is_city_ranking)
-                        prev_results = self.execute_query(prev_query)
-                        prev_scores = {row["name"]: row["score"] or 0 for row in prev_results}
-                    except Exception as e:
-                        logger.warning(f"Failed to get previous period data for {rtype}/{trange}: {e}")
+                # Get previous period rankings once (not per-entry!)
+                prev_ranks = {}
+                try:
+                    prev_query = self.generate_previous_period_query(rtype, trange, is_city_ranking)
+                    prev_results = self.execute_query(prev_query)
+                    # Build name -> rank mapping from previous period
+                    for rank_idx, prev_row in enumerate(prev_results, 1):
+                        prev_ranks[prev_row["name"]] = rank_idx
+                    logger.debug(f"  Got {len(prev_results)} previous period entries for {rtype}/{trange}")
+                except Exception as e:
+                    logger.warning(f"Failed to get previous period data for {rtype}/{trange}: {e}")
 
-                # Add rank and calculate trend
+                # Add rank and calculate trend based on rank change
                 ranked_results = []
                 for i, row in enumerate(results, 1):
+                    current_rank = i
                     entry = {
-                        "rank": i,
+                        "rank": current_rank,
                         "name": row["name"],
                         "score": row["score"] or 0,
                     }
@@ -652,16 +684,11 @@ class DataGenerator:
                     if is_city_ranking:
                         entry["subtitle"] = row.get("subtitle", "")
 
-                    # Calculate trend
-                    if trange == "all":
-                        entry["trend"] = "flat"
-                        entry["trendDelta"] = 0
-                    else:
-                        current_score = entry["score"]
-                        previous_score = prev_scores.get(entry["name"], 0)
-                        trend, trend_delta = self.calculate_trend(current_score, previous_score)
-                        entry["trend"] = trend
-                        entry["trendDelta"] = trend_delta
+                    # Calculate trend based on rank difference
+                    previous_rank = prev_ranks.get(entry["name"], 0)  # 0 means not in previous rankings
+                    trend, trend_delta = self.calculate_trend(current_rank, previous_rank)
+                    entry["trend"] = trend
+                    entry["trendDelta"] = trend_delta
 
                     ranked_results.append(entry)
 

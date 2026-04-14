@@ -647,7 +647,7 @@ class DataGenerator:
         is_city_ranking: bool = False,
         limit: int = 30,
     ) -> Dict:
-        """Generate all rankings data with optimized trend calculation."""
+        """Generate all rankings data with optimized trend calculation and tied rank support."""
         rankings = {}
 
         for rtype in ranking_types:
@@ -655,9 +655,12 @@ class DataGenerator:
             for trange in time_ranges:
                 logger.debug(f"Generating {rtype}/{trange} ranking...")
                 
-                # Get current period rankings
-                query = self.generate_ranking_query(rtype, trange, is_city_ranking, limit)
+                # Get current period rankings (fetch more to handle ties at the boundary)
+                query = self.generate_ranking_query(rtype, trange, is_city_ranking, limit=limit * 2)
                 results = self.execute_query(query)
+
+                # Filter out zero-score entries
+                results = [r for r in results if (r["score"] or 0) > 0]
 
                 # Get previous period rankings once (not per-entry!)
                 prev_ranks = {}
@@ -671,27 +674,51 @@ class DataGenerator:
                 except Exception as e:
                     logger.warning(f"Failed to get previous period data for {rtype}/{trange}: {e}")
 
-                # Add rank and calculate trend based on rank change
+                # Calculate tied ranks and apply display limit rules
                 ranked_results = []
-                for i, row in enumerate(results, 1):
-                    current_rank = i
-                    entry = {
-                        "rank": current_rank,
-                        "name": row["name"],
-                        "score": row["score"] or 0,
-                    }
+                display_rank = 0  # The actual displayed rank number
+                prev_score = None
+                
+                for i, row in enumerate(results):
+                    score = row["score"] or 0
+                    
+                    # Calculate display rank with tie handling
+                    if i == 0 or score != prev_score:
+                        # New score group: advance display rank
+                        display_rank = i + 1
+                    # If same score as previous: keep same display_rank (ties)
+                    
+                    # Check if we should include this entry
+                    # Rule: Always include if within limit, OR if tied with last included entry
+                    should_include = len(ranked_results) < limit
+                    
+                    if not should_include and ranked_results:
+                        # Check if this entry is tied with the last included entry
+                        last_included_score = ranked_results[-1]["score"]
+                        if score == last_included_score:
+                            should_include = True
+                    
+                    if should_include:
+                        entry = {
+                            "rank": display_rank,  # Tied rank number
+                            "name": row["name"],
+                            "score": score,
+                        }
 
-                    if is_city_ranking:
-                        entry["subtitle"] = row.get("subtitle", "")
+                        if is_city_ranking:
+                            entry["subtitle"] = row.get("subtitle", "")
 
-                    # Calculate trend based on rank difference
-                    previous_rank = prev_ranks.get(entry["name"], 0)  # 0 means not in previous rankings
-                    trend, trend_delta = self.calculate_trend(current_rank, previous_rank)
-                    entry["trend"] = trend
-                    entry["trendDelta"] = trend_delta
+                        # Calculate trend based on rank difference
+                        previous_rank = prev_ranks.get(entry["name"], 0)  # 0 means not in previous rankings
+                        trend, trend_delta = self.calculate_trend(display_rank, previous_rank)
+                        entry["trend"] = trend
+                        entry["trendDelta"] = trend_delta
 
-                    ranked_results.append(entry)
+                        ranked_results.append(entry)
+                    
+                    prev_score = score
 
+                logger.debug(f"  Returning {len(ranked_results)} entries for {rtype}/{trange} (limit={limit})")
                 rankings[rtype][trange] = ranked_results
 
         return rankings

@@ -224,12 +224,16 @@ public/data/
 | `name` | string | 用户名 |
 | `score` | number | 分数（根据排名类型不同含义） |
 | `trend` | string | 趋势: `"up"` / `"down"` / `"flat"` |
-| `trendDelta` | number | 与上一周期相比的变化量 |
+| `trendDelta` | number | 与上一周期相比的**排名变化量** |
 
 **注意**:
 - 每个排行榜最多返回 **30 条**记录
-- 当 `timeRange === 'all'` 时，`trend` 固定为 `"flat"`, `trendDelta` 为 0
-- 其他情况需对比上一个周期计算趋势
+- **trend 基于**排名**变化计算**，而非分数变化
+  - `trend = "up"`: 排名上升（例如从第4名到第2名）
+  - `trend = "down"`: 排名下降（例如从第2名到第4名）
+  - `trend = "flat"`: 排名不变
+- `trendDelta`: 排名的绝对变化值（正数表示排名提升）
+- 新上榜的玩家（上一周期不在排行榜中）: `trend = "up"`, `trendDelta` = 当前排名
 
 #### `communityStats` 对象
 | 字段名 | 类型 | 说明 | 计算方式 |
@@ -650,23 +654,29 @@ SELECT COUNT(DISTINCT gc_code)::int AS total_found FROM logs;
 
 ## 趋势计算逻辑
 
-对于非 "all" 时间范围的排行榜，需要计算 `trend` 和 `trendDelta`:
+对于所有时间范围的排行榜，都需要计算 `trend` 和 `trendDelta`（基于**排名变化**）：
 
 ### 算法说明
 
 ```python
-def calculate_trend(current_score, previous_score):
+def calculate_trend(current_rank, previous_rank):
     """
-    current_score: 当前周期的分数
-    previous_score: 上一个周期的分数
+    current_rank: 当前周期的排名 (1-based)
+    previous_rank: 上一周期的排名 (1-based), 0 表示未上榜
     
     返回: (trend, trendDelta)
     """
-    delta = current_score - previous_score
+    if previous_rank == 0:
+        # 新上榜玩家
+        return ("up", current_rank)
+    
+    delta = previous_rank - current_rank
     
     if delta > 0:
-        return ("up", delta)
+        # 排名数字减小 = 排名上升 (例如: 4->2)
+        return ("up", abs(delta))
     elif delta < 0:
+        # 排名数字增大 = 排名下降 (例如: 2->4)
         return ("down", abs(delta))
     else:
         return ("flat", 0)
@@ -676,9 +686,18 @@ def calculate_trend(current_score, previous_score):
 
 | 当前周期 | 上一个周期 |
 |---------|-----------|
-| 30d (最近30天) | 前30-60天 |
-| ytd (今年) | 去年同期 |
-| all (所有时间) | 无（trend 固定为 "flat"）|
+| **30d** (最近30天) | 前 30-60 天 |
+| **ytd** (今年至今) | 去年全年（1月1日 至 12月31日）|
+| **all** (所有时间) | 截至去年年底的全部时间（12月31日及之前）|
+
+### 示例
+
+| 玩家 | 当前排名 | 上期排名 | trend | trendDelta | 说明 |
+|------|---------|---------|-------|------------|------|
+| A | 2 | 4 | `up` | 2 | 排名提升2位 |
+| B | 5 | 3 | `down` | 2 | 排名下降2位 |
+| C | 10 | 10 | `flat` | 0 | 排名不变 |
+| D | 1 | 0 | `up` | 1 | 新上榜 |
 
 ---
 
@@ -763,6 +782,27 @@ const response = await fetch(`/data/overview.json?t=${Date.now()}`);
 
 ---
 
-**文档版本**: 1.0.0  
-**最后更新**: 2026-04-14  
+**文档版本**: 1.1.0
+**最后更新**: 2026-04-14
 **适用项目**: Geodataing - 中国地理藏宝数据分析平台
+
+---
+
+## 更新日志
+
+### v1.1.0 (2026-04-14)
+
+**重大变更：趋势计算逻辑重构**
+
+1. **趋势计算基础变更**
+   - 从基于**分数变化**改为基于**排名变化**
+   - `trendDelta` 现在表示排名的绝对变化值
+   - 新增"新上榜"场景的处理逻辑
+
+2. **上一周期定义更新**
+   - `ytd`: 从"去年同期"改为"去年全年（1月1日-12月31日）"
+   - `all`: 从"无（固定flat）"改为"截至去年年底的全部时间"
+
+3. **性能优化**
+   - 趋势计算查询从 N+1 次优化为 2 次（每个时间范围组合）
+   - 查询次数减少约 96%

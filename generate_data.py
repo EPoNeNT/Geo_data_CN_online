@@ -192,11 +192,13 @@ class DataGenerator:
             for row in results
         ]
 
-    def generate_dt_matrix(self, country_filter: Optional[str] = None) -> List[Dict]:
+    def generate_dt_matrix(self, country_filter: Optional[str] = None, city_filter: Optional[str] = None) -> List[Dict]:
         """Generate Difficulty/Terrain matrix (9x9 = 81 elements)."""
         where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
         if country_filter:
             where_clause += f" AND c.country = '{country_filter}'"
+        if city_filter:
+            where_clause += f" AND COALESCE(NULLIF(TRIM(c.city), ''), c.country) = '{city_filter}'"
 
         query = f"""
         SELECT
@@ -793,49 +795,117 @@ class DataGenerator:
 
     # ==================== CITY-RANKINGS.JSON ====================
 
-    def generate_cache_trend(self) -> Dict:
-        """Generate city cache trend data (7 years)."""
-        query = f"""
+    def generate_cache_trend(self, city_filter: Optional[str] = None) -> Dict:
+        """Generate cache trend data with monthly (10 months) and yearly (10 years) views."""
+        
+        # Build WHERE clause for city filter
+        where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
+        if city_filter:
+            # City filter: match city or country
+            where_clause += f" AND COALESCE(NULLIF(TRIM(c.city), ''), c.country) = '{city_filter}'"
+
+        # Generate monthly data (last 10 months including current month)
+        monthly_query = f"""
+        WITH months AS (
+          SELECT generate_series(
+            date_trunc('month', CURRENT_DATE - INTERVAL '9 month'),
+            date_trunc('month', CURRENT_DATE),
+            INTERVAL '1 month'
+          ) AS month_start
+        ),
+        counts AS (
+          SELECT date_trunc('month', c.placed_date)::date AS month,
+                 COUNT(*)::int AS count
+          FROM caches c
+          {where_clause}
+            AND c.placed_date IS NOT NULL
+            AND c.placed_date >= date_trunc('month', CURRENT_DATE - INTERVAL '9 month')
+          GROUP BY 1
+        )
+        SELECT TO_CHAR(months.month_start, 'YYYY-MM') AS label,
+               COALESCE(counts.count, 0)::int AS count
+        FROM months
+        LEFT JOIN counts ON counts.month = months.month_start::date
+        ORDER BY months.month_start;
+        """
+
+        monthly_results = self.execute_query(monthly_query)
+        monthly = [{"label": row["label"], "count": row["count"] or 0} for row in monthly_results]
+
+        # Generate yearly data (last 10 years including current year)
+        yearly_query = f"""
         WITH years AS (
           SELECT generate_series(
-            EXTRACT(YEAR FROM CURRENT_DATE)::int - 6,
+            EXTRACT(YEAR FROM CURRENT_DATE)::int - 9,
             EXTRACT(YEAR FROM CURRENT_DATE)::int
           ) AS year
         ),
         counts AS (
           SELECT EXTRACT(YEAR FROM placed_date)::int AS year, COUNT(*)::int AS count
           FROM caches c
-          WHERE {EXCLUDE_CACHE_WHERE}
+          {where_clause}
             AND c.placed_date IS NOT NULL
-            AND EXTRACT(YEAR FROM placed_date)::int >= EXTRACT(YEAR FROM CURRENT_DATE)::int - 6
+            AND EXTRACT(YEAR FROM placed_date)::int >= EXTRACT(YEAR FROM CURRENT_DATE)::int - 9
           GROUP BY 1
         )
-        SELECT years.year::text AS year, COALESCE(counts.count, 0)::int AS count
+        SELECT years.year::text AS label, COALESCE(counts.count, 0)::int AS count
         FROM years
         LEFT JOIN counts USING (year)
         ORDER BY years.year;
         """
 
-        results = self.execute_query(query)
-        bars = [{"year": str(row["year"]), "count": row["count"] or 0} for row in results]
+        yearly_results = self.execute_query(yearly_query)
+        yearly = [{"label": str(row["label"]), "count": row["count"] or 0} for row in yearly_results]
 
-        # Calculate average growth
-        if len(bars) >= 2:
-            first_count = bars[0]["count"]
-            last_count = bars[-1]["count"]
-            years_span = len(bars) - 1
+        # Calculate average growth based on yearly data
+        avg_growth_pct = 0
+        if len(yearly) >= 2:
+            first_count = yearly[0]["count"]
+            last_count = yearly[-1]["count"]
+            years_span = len(yearly) - 1
             if first_count > 0:
                 avg_growth = ((last_count / first_count) ** (1 / years_span) - 1) * 100
                 avg_growth_pct = round(avg_growth, 1)
-            else:
-                avg_growth_pct = 0
-        else:
-            avg_growth_pct = 0
 
         return {
             "averageGrowthPct": avg_growth_pct,
-            "bars": bars,
+            "monthly": monthly,
+            "yearly": yearly,
         }
+
+    def generate_city_details(self, rankings_data: Dict) -> Dict:
+        """Generate city details data for cities in rankings."""
+        logger.info("Generating city details...")
+        
+        city_details = {}
+        
+        # Collect all unique city names from rankings
+        city_names = set()
+        for rtype in rankings_data.values():
+            for time_range_data in rtype.values():
+                for entry in time_range_data:
+                    city_names.add(entry["name"])
+        
+        logger.debug(f"Found {len(city_names)} unique cities to generate details for")
+        
+        # Generate details for each city
+        for city_name in city_names:
+            try:
+                cache_trend = self.generate_cache_trend(city_filter=city_name)
+                dt_matrix = self.generate_dt_matrix(country_filter=None, city_filter=city_name)
+                
+                city_details[city_name] = {
+                    "cacheTrend": cache_trend,
+                    "dtMatrix": dt_matrix,
+                }
+                
+                logger.debug(f"  Generated details for {city_name}")
+            
+            except Exception as e:
+                logger.warning(f"Failed to generate details for {city_name}: {e}")
+                continue
+        
+        return city_details
 
     def generate_city_rankings_json(self) -> Dict:
         """Generate complete city-rankings.json data."""
@@ -844,13 +914,24 @@ class DataGenerator:
         ranking_types = ["hides", "finds", "favorites"]
         time_ranges = ["30d", "ytd", "all"]
 
+        # Generate rankings
+        rankings = self.generate_rankings(
+            ranking_types, time_ranges, is_city_ranking=True, limit=20
+        )
+
+        # Generate global cache trend and dt matrix
+        cache_trend = self.generate_cache_trend()
+        dt_matrix = self.generate_dt_matrix()
+
+        # Generate city details for cities in rankings
+        city_details = self.generate_city_details(rankings)
+
         return {
             "generatedAt": self.get_generated_at(),
-            "rankings": self.generate_rankings(
-                ranking_types, time_ranges, is_city_ranking=True, limit=20
-            ),
-            "cacheTrend": self.generate_cache_trend(),
-            "dtMatrix": self.generate_dt_matrix(),
+            "rankings": rankings,
+            "cacheTrend": cache_trend,
+            "dtMatrix": dt_matrix,
+            "cityDetails": city_details,
         }
 
     # ==================== GENERATED-AT.JSON ====================

@@ -297,20 +297,32 @@ public/data/
       "all": [ ... ]
     }
   },
-    }
-  },
 
   "cacheTrend": {
-    "averageGrowthPct": 24.8,
-    "bars": [
-      {
-        "year": "2019",
-        "count": 1200
-      },
-      {
-        "year": "2020",
-        "count": 1500
-      }
+    "averageGrowthPct": -2.2,
+    "monthly": [
+      { "label": "2025-07", "count": 185 },
+      { "label": "2025-08", "count": 210 },
+      { "label": "2025-09", "count": 195 },
+      { "label": "2025-10", "count": 178 },
+      { "label": "2025-11", "count": 203 },
+      { "label": "2025-12", "count": 225 },
+      { "label": "2026-01", "count": 168 },
+      { "label": "2026-02", "count": 142 },
+      { "label": "2026-03", "count": 189 },
+      { "label": "2026-04", "count": 176 }
+    ],
+    "yearly": [
+      { "label": "2017", "count": 850 },
+      { "label": "2018", "count": 920 },
+      { "label": "2019", "count": 1050 },
+      { "label": "2020", "count": 1222 },
+      { "label": "2021", "count": 908 },
+      { "label": "2022", "count": 1366 },
+      { "label": "2023", "count": 1056 },
+      { "label": "2024", "count": 1218 },
+      { "label": "2025", "count": 2236 },
+      { "label": "2026", "count": 1069 }
     ]
   },
 
@@ -322,7 +334,47 @@ public/data/
       "terrain": 1.0,
       "count": 200
     }
-  ]
+  ],
+
+  "cityDetails": {
+    "北京市": {
+      "cacheTrend": {
+        "averageGrowthPct": 5.8,
+        "monthly": [
+          { "label": "2025-07", "count": 25 },
+          { "label": "2025-08", "count": 30 },
+          { "label": "2025-09", "count": 28 },
+          { "label": "2025-10", "count": 22 },
+          { "label": "2025-11", "count": 26 },
+          { "label": "2025-12", "count": 32 },
+          { "label": "2026-01", "count": 18 },
+          { "label": "2026-02", "count": 15 },
+          { "label": "2026-03", "count": 24 },
+          { "label": "2026-04", "count": 20 }
+        ],
+        "yearly": [
+          { "label": "2017", "count": 120 },
+          { "label": "2018", "count": 135 },
+          { "label": "2019", "count": 150 },
+          { "label": "2020", "count": 180 },
+          { "label": "2021", "count": 150 },
+          { "label": "2022", "count": 200 },
+          { "label": "2023", "count": 175 },
+          { "label": "2024", "count": 190 },
+          { "label": "2025", "count": 350 },
+          { "label": "2026", "count": 165 }
+        ]
+      },
+      "dtMatrix": [
+        { "row": 0, "col": 0, "difficulty": 1.0, "terrain": 1.0, "count": 45 },
+        ...
+      ]
+    },
+    "台湾": {
+      "cacheTrend": { ... },
+      "dtMatrix": [ ... ]
+    }
+  }
 }
 ```
 
@@ -358,19 +410,61 @@ public/data/
 #### `cacheTrend` 对象
 | 字段名 | 类型 | 说明 |
 |--------|------|------|
-| `averageGrowthPct` | number | 平均年增长率百分比（保留1位小数） |
-| `bars` | array | 年度数据条形图数据 |
+| `averageGrowthPct` | number | 平均增长率百分比（保留1位小数），建议基于年度数据计算 |
+| `monthly` | array | 月度数据条形图数据（最近10个月，包括当月） |
+| `yearly` | array | 年度数据条形图数据（最近10年，包括当年） |
 
-**`bars` 数组元素**:
+**`monthly` / `yearly` 数组元素 (TrendBar)**:
 | 字段名 | 类型 | 说明 |
 |--------|------|------|
-| `year` | string | 年份 |
-| `count` | number | 该年新增缓存数 |
+| `label` | string | 时间标签（月份格式：`YYYY-MM`，如 "2026-04"；年份格式：`YYYY`，如 "2026"） |
+| `count` | number | 该时间段的藏宝数量 |
 
 **注意**:
-- 显示最近 7 年的数据（从当前年份往前推6年）
-- 例如当前是 2026 年，则显示 2020-2026
-- 必须包含所有中间年份，无数据的年份 count 为 0
+- **monthly 数据**:
+  - 包含最近 **10 个月**的数据（包括当前月份）
+  - 例如当前是 2026 年 4 月，则显示 2025-07 到 2026-04
+  - 标签格式：`YYYY-MM`
+  
+- **yearly 数据**:
+  - 包含最近 **10 年**的数据（包括当前年份）
+  - 例如当前是 2026 年，则显示 2017 到 2026
+  - 标签格式：`YYYY`
+
+- 必须包含所有中间时间点，无数据的时间点 count 为 0
+
+#### `cityDetails` 对象（可选）
+
+**功能**: 支持用户点击城市时显示该城市的专属藏宝趋势和D/T矩阵数据
+
+**字段类型**: `Record<string, CityDetails>` （可选字段，向后兼容）
+
+**键名规则**: 使用排行榜中的城市名称作为键，例如：
+- "北京市"
+- "台湾"
+- "香港"
+- "深圳市"
+- "广州市"
+
+**数据范围**: 只需要包含所有在排行榜中出现过的城市的数据。不需要包含所有可能的城市。
+
+**CityDetails 结构**:
+```typescript
+interface CityDetails {
+  cacheTrend: {
+    averageGrowthPct: number;
+    monthly: TrendBar[];   // 与全局 cacheTrend 结构相同
+    yearly: TrendBar[];    // 与全局 cacheTrend 结构相同
+  };
+  dtMatrix: HeatmapCell[]; // 该城市的D/T矩阵数据（9x9 = 81个单元格）
+}
+```
+
+**注意**:
+- 此字段为**可选**，如果缺少或为空对象 `{}`，前端会降级显示全局数据
+- 每个城市的 `dtMatrix` 应包含完整的 81 个单元格（9×9）
+- 所有城市的 `cacheTrend.monthly` 和 `cacheTrend.yearly` 时间范围应与全局数据保持一致
+- 城市名称必须与 `rankings` 中对应条目的 `name` 字段完全匹配
 
 #### `dtMatrix` 数组
 
@@ -618,10 +712,11 @@ LIMIT 20;
 
 ### 4.9 城市排名 - Cache Trend (趋势图)
 
+**全局 Cache Trend - 年度数据 (最近10年)**:
 ```sql
 WITH years AS (
   SELECT generate_series(
-    EXTRACT(YEAR FROM CURRENT_DATE)::int - 6,
+    EXTRACT(YEAR FROM CURRENT_DATE)::int - 9,
     EXTRACT(YEAR FROM CURRENT_DATE)::int
   ) AS year
 ),
@@ -629,14 +724,121 @@ counts AS (
   SELECT EXTRACT(YEAR FROM placed_date)::int AS year, COUNT(*)::int AS count
   FROM caches
   WHERE placed_date IS NOT NULL
-    AND EXTRACT(YEAR FROM placed_date)::int >= EXTRACT(YEAR FROM CURRENT_DATE)::int - 6
+    AND EXTRACT(YEAR FROM placed_date)::int >= EXTRACT(YEAR FROM CURRENT_DATE)::int - 9
   GROUP BY 1
 )
-SELECT years.year::text AS year, COALESCE(counts.count, 0)::int AS count
+SELECT years.year::text AS label, COALESCE(counts.count, 0)::int AS count
 FROM years
 LEFT JOIN counts USING (year)
 ORDER BY years.year;
 ```
+
+**全局 Cache Trend - 月度数据 (最近10个月)**:
+```sql
+WITH months AS (
+  SELECT generate_series(
+    date_trunc('month', CURRENT_DATE) - INTERVAL '9 month',
+    date_trunc('month', CURRENT_DATE),
+    INTERVAL '1 month'
+  ) AS month_date
+),
+counts AS (
+  SELECT date_trunc('month', placed_date)::date AS month_date, COUNT(*)::int AS count
+  FROM caches
+  WHERE placed_date IS NOT NULL
+    AND placed_date >= date_trunc('month', CURRENT_DATE) - INTERVAL '9 month'
+  GROUP BY 1
+)
+SELECT TO_CHAR(months.month_date, 'YYYY-MM') AS label,
+       COALESCE(counts.count, 0)::int AS count
+FROM months
+LEFT JOIN counts USING (month_date)
+ORDER BY months.month_date;
+```
+
+### 4.10 城市详情数据 (cityDetails)
+
+**生成城市列表（从 rankings 中提取所有出现过的城市）**:
+
+```python
+# Python 示例代码
+def extract_city_list(rankings_data):
+    cities = set()
+    for ranking_type in rankings_data['rankings'].values():
+        for time_range in ranking_type.values():
+            for city in time_range:
+                cities.add(city['name'])
+    return list(cities)
+```
+
+**为每个城市生成 cacheTrend 数据**:
+
+```sql
+-- 城市年度数据示例（以"北京市"为例）
+WITH years AS (
+  SELECT generate_series(
+    EXTRACT(YEAR FROM CURRENT_DATE)::int - 9,
+    EXTRACT(YEAR FROM CURRENT_DATE)::int
+  ) AS year
+),
+counts AS (
+  SELECT EXTRACT(YEAR FROM placed_date)::int AS year, COUNT(*)::int AS count
+  FROM caches
+  WHERE placed_date IS NOT NULL
+    AND COALESCE(NULLIF(TRIM(city)), '') = '北京市'  -- 替换为目标城市名称
+    AND EXTRACT(YEAR FROM placed_date)::int >= EXTRACT(YEAR FROM CURRENT_DATE)::int - 9
+  GROUP BY 1
+)
+SELECT years.year::text AS label, COALESCE(counts.count, 0)::int AS count
+FROM years
+LEFT JOIN counts USING (year)
+ORDER BY years.year;
+
+-- 城市月度数据示例（以"北京市"为例）
+WITH months AS (
+  SELECT generate_series(
+    date_trunc('month', CURRENT_DATE) - INTERVAL '9 month',
+    date_trunc('month', CURRENT_DATE),
+    INTERVAL '1 month'
+  ) AS month_date
+),
+counts AS (
+  SELECT date_trunc('month', placed_date)::date AS month_date, COUNT(*)::int AS count
+  FROM caches
+  WHERE placed_date IS NOT NULL
+    AND COALESCE(NULLIF(TRIM(city)), '') = '北京市'  -- 替换为目标城市名称
+    AND placed_date >= date_trunc('month', CURRENT_DATE) - INTERVAL '9 month'
+  GROUP BY 1
+)
+SELECT TO_CHAR(months.month_date, 'YYYY-MM') AS label,
+       COALESCE(counts.count, 0)::int AS count
+FROM months
+LEFT JOIN counts USING (month_date)
+ORDER BY months.month_date;
+```
+
+**为每个城市生成 dtMatrix 数据**:
+
+```sql
+-- 城市 D/T 矩阵示例（以"北京市"为例）
+SELECT
+  c.difficulty::float8 AS difficulty,
+  c.terrain::float8 AS terrain,
+  COUNT(*)::int AS count
+FROM caches c
+WHERE c.difficulty IN (1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5)
+  AND c.terrain IN (1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5)
+  AND COALESCE(NULLIF(TRIM(c.city)), '') = '北京市'  -- 替换为目标城市名称
+GROUP BY c.difficulty, c.terrain
+ORDER BY c.difficulty, c.terrain;
+
+-- 重要：结果集可能不足 81 条，需要在代码中补全缺失的组合（count 设为 0）
+```
+
+**数据生成建议**:
+- 只为排行榜中出现过的城市生成数据，避免数据冗余
+- 可以并行处理多个城市的数据生成任务
+- 如果某城市的数据量很小或不存在，可以跳过该城市（前端会降级显示全局数据）
 
 ### 4.10 Community Stats
 
@@ -737,8 +939,16 @@ def calculate_trend(current_rank, previous_rank):
 - [ ] 每个数组长度不超过 20
 - [ ] 每个条目的 rank 从 1 开始连续递增
 - [ ] 所有 score 为非负整数
-- [ ] `cacheTrend.bars` 包含恰好 7 年的数据
+- [ ] `cacheTrend.monthly` 包含恰好 **10 个月**的数据（包括当前月份）
+- [ ] `cacheTrend.yearly` 包含恰好 **10 年**的数据（包括当前年份）
+- [ ] `cacheTrend.monthly` 标签格式为 `YYYY-MM`
+- [ ] `cacheTrend.yearly` 标签格式为 `YYYY`
 - [ ] `dtMatrix` 包含恰好 81 个元素
+- [ ] `cityDetails` (可选):
+  - [ ] 如果存在，应为非空对象
+  - [ ] 每个城市的键名必须在 rankings 中出现过
+  - [ ] 每个城市的 `cacheTrend.monthly` 和 `cacheTrend.yearly` 格式与全局数据一致
+  - [ ] 每个城市的 `dtMatrix` 包含恰好 81 个元素
 
 ---
 
@@ -791,13 +1001,41 @@ const response = await fetch(`/data/overview.json?t=${Date.now()}`);
 
 ---
 
-**文档版本**: 1.2.0
-**最后更新**: 2026-04-14
+**文档版本**: 1.3.0
+**最后更新**: 2026-04-15
 **适用项目**: Geodataing - 中国地理藏宝数据分析平台
 
 ---
 
 ## 更新日志
+
+### v1.3.0 (2026-04-15)
+
+**新增功能：城市筛选与时间维度切换**
+
+1. **城市详情数据 (cityDetails)**
+   - 新增可选字段 `cityDetails`，支持点击城市时显示该城市的专属数据
+   - 包含每个城市的藏宝趋势（月度+年度）和 D/T 矩阵数据
+   - 只需为排行榜中出现过的城市生成数据
+
+2. **Cache Trend 时间维度扩展**
+   - 从单一年度数据改为支持月度和年度两种视图
+   - 月度数据：最近10个月（包括当月）
+   - 年度数据：最近10年（包括当年）
+   - 前端可实时切换时间维度显示
+
+3. **数据结构优化**
+   - `cacheTrend.bars` 改为 `cacheTrend.monthly` 和 `cacheTrend.yearly`
+   - 标签字段从 `year` 改为通用的 `label`
+   - 数据量从7年增加到10年/10个月
+
+4. **SQL 查询更新**
+   - 新增城市详情数据的完整 SQL 查询示例
+   - 包含城市列表提取、城市趋势生成、城市D/T矩阵生成
+
+5. **验证规则增强**
+   - 新增 cityDetails 字段的验证规则
+   - 更新 cacheTrend 的数据量和格式验证
 
 ### v1.2.0 (2026-04-14)
 

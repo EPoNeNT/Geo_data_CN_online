@@ -205,6 +205,135 @@ class DatabaseManager:
                     logger.error(f"插入 logs 失败: {e}")
                     raise
 
+    def get_existing_logs_for_caches(self, gc_codes: List[str]) -> Dict[Tuple[str, str], dict]:
+        """查询指定 caches 的现有日志记录，返回 {(gc_code, user_name): record} 字典。"""
+        if not gc_codes:
+            return {}
+
+        self.cursor.execute(
+            """
+            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf
+            FROM logs
+            WHERE gc_code = ANY(%s)
+            """,
+            (gc_codes,),
+        )
+
+        existing = {}
+        for row in self.cursor.fetchall():
+            key = (row[0], row[1])
+            existing[key] = {
+                "visited": row[2],
+                "favorite_point_used": row[3],
+                "is_ftf": row[4],
+            }
+        return existing
+
+    def smart_upsert_logs(self, new_logs: List[dict]) -> Tuple[int, int]:
+        """
+        智能日志更新：比较新旧记录，决定插入或替换。
+        
+        返回: (inserted_count, updated_count)
+        
+        逻辑：
+        - 如果 (gc_code, user_name) 不存在于数据库 → INSERT
+        - 如果存在且所有字段完全相同 → 跳过（去重）
+        - 如果存在但有字段不同 → UPDATE（替换旧记录）
+        """
+        if not new_logs:
+            return (0, 0)
+
+        # 批量查询这些 cache 的现有日志
+        gc_codes = list(set(log["GCCode"] for log in new_logs))
+        existing_logs = self.get_existing_logs_for_caches(gc_codes)
+
+        to_insert = []
+        to_update = []
+
+        for log in new_logs:
+            gc_code = log["GCCode"]
+            user_name = log["UserName"]
+            key = (gc_code, user_name)
+
+            new_record = {
+                "visited": log["Visited"],
+                "favorite_point_used": log.get("FavoritePointUsed", False),
+                "is_ftf": log.get("IsFTF", False),
+            }
+
+            if key not in existing_logs:
+                # 新记录，需要插入
+                to_insert.append(log)
+            else:
+                # 已存在，比较字段
+                old_record = existing_logs[key]
+
+                # 比较所有关键字段
+                fields_match = (
+                    old_record["visited"] == new_record["visited"]
+                    and old_record["favorite_point_used"] == new_record["favorite_point_used"]
+                    and old_record["is_ftf"] == new_record["is_ftf"]
+                )
+
+                if not fields_match:
+                    # 字段有变化，需要更新
+                    to_update.append(log)
+
+        # 执行批量操作
+        inserted_count = 0
+        updated_count = 0
+
+        if to_insert:
+            self._batch_insert_logs(to_insert)
+            inserted_count = len(to_insert)
+
+        if to_update:
+            self._batch_update_logs(to_update)
+            updated_count = len(to_update)
+
+        return (inserted_count, updated_count)
+
+    def _batch_insert_logs(self, logs: List[dict]):
+        """执行批量 INSERT 操作。"""
+        execute_batch(
+            self.cursor,
+            """
+            INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            [
+                (
+                    log["GCCode"],
+                    log["UserName"],
+                    log["Visited"],
+                    log.get("FavoritePointUsed", False),
+                    log.get("IsFTF", False),
+                )
+                for log in logs
+            ],
+        )
+
+    def _batch_update_logs(self, logs: List[dict]):
+        """执行批量 UPDATE 操作，根据 (gc_code, user_name) 匹配并更新其他字段。"""
+        for log in logs:
+            self.cursor.execute(
+                """
+                UPDATE logs
+                SET visited = %s,
+                    favorite_point_used = %s,
+                    is_ftf = %s
+                WHERE gc_code = %s AND user_name = %s
+                """,
+                (
+                    log["Visited"],
+                    log.get("FavoritePointUsed", False),
+                    log.get("IsFTF", False),
+                    log["GCCode"],
+                    log["UserName"],
+                ),
+            )
+
     def update_cache_coordinates(self, code: str, lat: float, lng: float):
         """更新 cache 坐标。"""
         max_retries = 3
@@ -481,16 +610,16 @@ def crawl_cache_group(
 
         if (i + 1) % 30 == 0:
             if all_logs:
-                db.insert_logs(all_logs)
-                logger.info(f"{group_name} 组批量插入 {len(all_logs)} 条 logs")
+                inserted, updated = db.smart_upsert_logs(all_logs)
+                logger.info(f"{group_name} 组处理 {len(all_logs)} 条 logs: 新增 {inserted} 条, 更新 {updated} 条")
                 all_logs = []
             db.batch_update_logs_crawled_at(crawled_codes, today_str)
             crawled_codes = []
             db.commit()
 
     if all_logs:
-        db.insert_logs(all_logs)
-        logger.info(f"{group_name} 组批量插入 {len(all_logs)} 条 logs")
+        inserted, updated = db.smart_upsert_logs(all_logs)
+        logger.info(f"{group_name} 组处理 {len(all_logs)} 条 logs: 新增 {inserted} 条, 更新 {updated} 条")
     if crawled_codes:
         db.batch_update_logs_crawled_at(crawled_codes, today_str)
 

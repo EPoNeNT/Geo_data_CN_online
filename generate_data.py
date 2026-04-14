@@ -372,17 +372,16 @@ class DataGenerator:
         elif ranking_type == "finds":
             if is_city_ranking:
                 return f"""
-                SELECT name, subtitle, COUNT(DISTINCT user_name)::int AS score
+                SELECT name, subtitle, COUNT(*)::int AS score
                 FROM (
                   SELECT
                     COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
-                    c.country AS subtitle,
-                    l.user_name
+                    c.country AS subtitle
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                  AND l.visited {date_filter}
-                  AND {EXCLUDE_CACHE_JOIN}
+                    AND l.visited {date_filter}
+                    AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -842,7 +841,7 @@ class DataGenerator:
         """Generate complete city-rankings.json data."""
         logger.info("Generating city-rankings.json...")
 
-        ranking_types = ["hides", "finds", "favorites", "logs"]
+        ranking_types = ["hides", "finds", "favorites"]
         time_ranges = ["30d", "ytd", "all"]
 
         return {

@@ -284,23 +284,19 @@ public/data/
       "ytd": [ ... ],
       "all": [ ... ]
     },
-    
+
     "finds": {
       "30d": [ ... ],
       "ytd": [ ... ],
       "all": [ ... ]
     },
-    
+
     "favorites": {
       "30d": [ ... ],
       "ytd": [ ... ],
       "all": [ ... ]
-    },
-    
-    "logs": {
-      "30d": [ ... ],
-      "ytd": [ ... ],
-      "all": [ ... ]
+    }
+  },
     }
   },
 
@@ -334,7 +330,12 @@ public/data/
 
 #### `rankings` 对象结构
 
-与玩家排行榜相同的第一层和第二层 key。
+**第一层 key** (排名类型):
+- `hides`: 藏宝排行（按城市分组 COUNT caches）
+- **`finds`: 寻宝排行**（该城市的所有 cache 在选定时间段内获得的 logs 数的总和）
+- `favorites`: FP 数排行（按城市分组 SUM favorite_points）
+
+**注意**: 城市排行榜**不包含** `logs` 排行类型（与玩家排行榜不同）
 
 #### 城市排行榜条目对象
 | 字段名 | 类型 | 说明 |
@@ -575,7 +576,7 @@ LIMIT 30;
 
 ```sql
 -- Hides (藏宝排行)
-SELECT 
+SELECT
   COALESCE(NULLIF(TRIM(city), ''), country) AS name,
   country AS subtitle,
   COUNT(*)::int AS score
@@ -586,11 +587,11 @@ GROUP BY name, subtitle
 ORDER BY score DESC, name ASC
 LIMIT 20;
 
--- Finds (寻宝排行) - 需要 JOIN logs 表
-SELECT 
+-- Finds (寻宝排行) - 该城市的所有 cache 获得的 logs 数的总和
+SELECT
   COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
   c.country AS subtitle,
-  COUNT(DISTINCT l.user_name)::int AS score
+  COUNT(*)::int AS score
 FROM logs l
 JOIN caches c ON c.code = l.gc_code
 WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
@@ -601,30 +602,19 @@ LIMIT 20;
 
 -- Favorites (FP 排行)
 SELECT
-  COALESCE(NULLIF(TRIM(c.city)), c.country) AS name,
+  COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
   c.country AS subtitle,
   COALESCE(SUM(c.favorite_points), 0)::int AS score
 FROM caches c
-WHERE COALESCE(NULLIF(TRIM(c.city)), c.country) IS NOT NULL
+WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
   AND c.owner_username IS NOT NULL AND c.owner_username <> ''
   AND c.placed_date >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整
 GROUP BY name, subtitle
 ORDER BY score DESC, name ASC
 LIMIT 20;
-
--- 获得Logs数排行 - 统计该城市藏宝被其他玩家log的总次数
-SELECT
-  COALESCE(NULLIF(TRIM(c.city)), c.country) AS name,
-  c.country AS subtitle,
-  COUNT(l.*)::int AS score
-FROM caches c
-JOIN logs l ON l.gc_code = c.code
-WHERE COALESCE(NULLIF(TRIM(c.city)), c.country) IS NOT NULL
-  AND l.visited >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整，筛选的是log的visited日期
-GROUP BY name, subtitle
-ORDER BY score DESC, name ASC
-LIMIT 20;
 ```
+
+**注意**: 城市排行榜只包含 **3 种类型**（hides, finds, favorites），不包含 logs 类型。
 
 ### 4.9 城市排名 - Cache Trend (趋势图)
 
@@ -743,7 +733,7 @@ def calculate_trend(current_rank, previous_rank):
 - [ ] `communityStats.foundCacheCoveragePct` 在 0-100 范围内
 
 ### city-rankings.json
-- [ ] `rankings` 包含 4 种类型 × 3 种时间范围 = 12 个数组
+- [ ] `rankings` 包含 **3 种类型** (hides, finds, favorites) × 3 种时间范围 = 9 个数组
 - [ ] 每个数组长度不超过 20
 - [ ] 每个条目的 rank 从 1 开始连续递增
 - [ ] 所有 score 为非负整数

@@ -419,8 +419,91 @@ class DataGenerator:
                     c.country AS subtitle
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
+                  WHERE COALESCE(NULLIF(TRIM(c.city)), c.country) IS NOT NULL
+                  AND l.visited {date_filter}
+                  AND {EXCLUDE_CACHE_JOIN}
+                ) AS sub
+                GROUP BY name, subtitle
+                ORDER BY score DESC, name ASC
+                LIMIT {limit};
+                """
+            else:
+                return f"""
+                SELECT
+                  c.owner_username AS name,
+                  COUNT(l.*)::int AS score
+                FROM caches c
+                JOIN logs l ON l.gc_code = c.code
+                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND l.visited {date_filter}
+                  AND {EXCLUDE_CACHE_JOIN}
+                GROUP BY c.owner_username
+                ORDER BY score DESC, c.owner_username ASC
+                LIMIT {limit};
+                """
+
+        raise ValueError(f"Unknown ranking type: {ranking_type}")
+
+    def generate_previous_period_query(
+        self,
+        ranking_type: str,
+        time_range: str,
+        is_city_ranking: bool = False,
+        limit: int = 999999,
+    ) -> str:
+        """Generate SQL query for previous period (for trend calculation)."""
+
+        # Previous period date filter
+        if time_range == "30d":
+            prev_date_filter = ">= CURRENT_DATE - INTERVAL '60 day' AND < CURRENT_DATE - INTERVAL '30 day'"
+        elif time_range == "ytd":
+            prev_date_filter = ">= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date AND < date_trunc('year', CURRENT_DATE)::date"
+        else:
+            raise ValueError("Cannot generate previous period query for 'all' time range")
+
+        # Reuse the same query structure but with previous period filter
+        if ranking_type == "hides":
+            if is_city_ranking:
+                return f"""
+                SELECT name, subtitle, COUNT(*)::int AS score
+                FROM (
+                  SELECT
+                    COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
+                    c.country AS subtitle
+                  FROM caches c
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND l.visited {date_filter}
+                    AND c.placed_date {prev_date_filter}
+                    AND {EXCLUDE_CACHE_WHERE}
+                ) AS sub
+                GROUP BY name, subtitle
+                ORDER BY score DESC, name ASC
+                LIMIT {limit};
+                """
+            else:
+                return f"""
+                SELECT owner_username AS name, COUNT(*)::int AS score
+                FROM caches c
+                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND c.placed_date {prev_date_filter}
+                  AND {EXCLUDE_CACHE_WHERE}
+                GROUP BY c.owner_username
+                ORDER BY score DESC, c.owner_username ASC
+                LIMIT {limit};
+                """
+
+        elif ranking_type == "finds":
+            if is_city_ranking:
+                return f"""
+                SELECT name, subtitle, COUNT(DISTINCT user_name)::int AS score
+                FROM (
+                  SELECT
+                    COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
+                    c.country AS subtitle,
+                    l.user_name
+                  FROM logs l
+                  JOIN caches c ON c.code = l.gc_code
+                  WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
+                    AND l.visited {prev_date_filter}
                     AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -429,14 +512,77 @@ class DataGenerator:
                 """
             else:
                 return f"""
-                SELECT user_name AS name, COUNT(*)::int AS score
+                SELECT user_name AS name, COUNT(DISTINCT gc_code)::int AS score
                 FROM logs l
                 JOIN caches c ON c.code = l.gc_code
                 WHERE l.user_name IS NOT NULL AND l.user_name <> ''
-                  AND l.visited {date_filter}
+                  AND l.visited {prev_date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
+                LIMIT {limit};
+                """
+
+        elif ranking_type == "favorites":
+            if is_city_ranking:
+                return f"""
+                SELECT name, subtitle, COALESCE(SUM(favorite_points), 0)::int AS score
+                FROM (
+                  SELECT
+                    COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
+                    c.country AS subtitle,
+                    c.favorite_points
+                  FROM caches c
+                  WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
+                    AND c.placed_date {prev_date_filter}
+                    AND {EXCLUDE_CACHE_WHERE}
+                ) AS sub
+                GROUP BY name, subtitle
+                ORDER BY score DESC, name ASC
+                LIMIT {limit};
+                """
+            else:
+                return f"""
+                SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
+                FROM caches c
+                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND c.placed_date {prev_date_filter}
+                  AND {EXCLUDE_CACHE_WHERE}
+                GROUP BY c.owner_username
+                ORDER BY score DESC, c.owner_username ASC
+                LIMIT {limit};
+                """
+
+        elif ranking_type == "logs":
+            if is_city_ranking:
+                return f"""
+                SELECT name, subtitle, COUNT(*)::int AS score
+                FROM (
+                  SELECT
+                    COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
+                    c.country AS subtitle
+                  FROM logs l
+                  JOIN caches c ON c.code = l.gc_code
+                  WHERE COALESCE(NULLIF(TRIM(c.city)), c.country) IS NOT NULL
+                    AND l.visited {prev_date_filter}
+                    AND {EXCLUDE_CACHE_JOIN}
+                ) AS sub
+                GROUP BY name, subtitle
+                ORDER BY score DESC, name ASC
+                LIMIT {limit};
+                """
+            else:
+                return f"""
+                SELECT
+                  c.owner_username AS name,
+                  COUNT(l.*)::int AS score
+                FROM caches c
+                JOIN logs l ON l.gc_code = c.code
+                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND l.visited {prev_date_filter}
+                  AND {EXCLUDE_CACHE_JOIN}
+                GROUP BY c.owner_username
+                ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
                 """
 
@@ -459,6 +605,16 @@ class DataGenerator:
                 query = self.generate_ranking_query(rtype, trange, is_city_ranking, limit)
                 results = self.execute_query(query)
 
+                # Get previous period data for trend calculation (except for 'all' time range)
+                prev_scores = {}
+                if trange != "all":
+                    try:
+                        prev_query = self.generate_previous_period_query(rtype, trange, is_city_ranking)
+                        prev_results = self.execute_query(prev_query)
+                        prev_scores = {row["name"]: row["score"] or 0 for row in prev_results}
+                    except Exception as e:
+                        logger.warning(f"Failed to get previous period data for {rtype}/{trange}: {e}")
+
                 # Add rank and calculate trend
                 ranked_results = []
                 for i, row in enumerate(results, 1):
@@ -471,18 +627,16 @@ class DataGenerator:
                     if is_city_ranking:
                         entry["subtitle"] = row.get("subtitle", "")
 
-                    # Calculate trend (except for 'all' time range)
-                    if trange != "all":
-                        # Get previous period score
-                        prev_query = self.generate_ranking_query(
-                            rtype, trange, is_city_ranking, limit=999999
-                        )
-                        # This is simplified - in production you'd want proper previous period logic
+                    # Calculate trend
+                    if trange == "all":
                         entry["trend"] = "flat"
                         entry["trendDelta"] = 0
                     else:
-                        entry["trend"] = "flat"
-                        entry["trendDelta"] = 0
+                        current_score = entry["score"]
+                        previous_score = prev_scores.get(entry["name"], 0)
+                        trend, trend_delta = self.calculate_trend(current_score, previous_score)
+                        entry["trend"] = trend
+                        entry["trendDelta"] = trend_delta
 
                     ranked_results.append(entry)
 

@@ -16,6 +16,12 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from runtime_utils import require_env, setup_logging
@@ -359,8 +365,8 @@ class DataGenerator:
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND l.visited {date_filter}
-                    AND {EXCLUDE_CACHE_JOIN}
+                  AND l.visited {date_filter}
+                  AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -419,7 +425,7 @@ class DataGenerator:
                     c.country AS subtitle
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
-                  WHERE COALESCE(NULLIF(TRIM(c.city)), c.country) IS NOT NULL
+                  WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                   AND l.visited {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
@@ -453,11 +459,22 @@ class DataGenerator:
     ) -> str:
         """Generate SQL query for previous period (for trend calculation)."""
 
-        # Previous period date filter
+        # Determine date column and table alias based on ranking type
+        # hides/favorites use caches.placed_date, finds/logs use logs.visited
+        if ranking_type in ("hides", "favorites"):
+            date_col = "c.placed_date"
+            exclude_clause = "EXCLUDE_CACHE_WHERE"
+        else:
+            date_col = "l.visited"
+            exclude_clause = "EXCLUDE_CACHE_JOIN"
+
+        # Previous period date filter with proper column name
         if time_range == "30d":
-            prev_date_filter = ">= CURRENT_DATE - INTERVAL '60 day' AND < CURRENT_DATE - INTERVAL '30 day'"
+            prev_start = "CURRENT_DATE - INTERVAL '60 day'"
+            prev_end = "CURRENT_DATE - INTERVAL '30 day'"
         elif time_range == "ytd":
-            prev_date_filter = ">= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date AND < date_trunc('year', CURRENT_DATE)::date"
+            prev_start = "date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date"
+            prev_end = "date_trunc('year', CURRENT_DATE)::date"
         else:
             raise ValueError("Cannot generate previous period query for 'all' time range")
 
@@ -472,7 +489,8 @@ class DataGenerator:
                     c.country AS subtitle
                   FROM caches c
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND c.placed_date {prev_date_filter}
+                    AND {date_col} >= {prev_start}
+                    AND {date_col} < {prev_end}
                     AND {EXCLUDE_CACHE_WHERE}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -484,7 +502,8 @@ class DataGenerator:
                 SELECT owner_username AS name, COUNT(*)::int AS score
                 FROM caches c
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                  AND c.placed_date {prev_date_filter}
+                  AND {date_col} >= {prev_start}
+                  AND {date_col} < {prev_end}
                   AND {EXCLUDE_CACHE_WHERE}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -503,7 +522,8 @@ class DataGenerator:
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND l.visited {prev_date_filter}
+                    AND {date_col} >= {prev_start}
+                    AND {date_col} < {prev_end}
                     AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -516,7 +536,8 @@ class DataGenerator:
                 FROM logs l
                 JOIN caches c ON c.code = l.gc_code
                 WHERE l.user_name IS NOT NULL AND l.user_name <> ''
-                  AND l.visited {prev_date_filter}
+                  AND {date_col} >= {prev_start}
+                  AND {date_col} < {prev_end}
                   AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
@@ -534,7 +555,8 @@ class DataGenerator:
                     c.favorite_points
                   FROM caches c
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND c.placed_date {prev_date_filter}
+                    AND {date_col} >= {prev_start}
+                    AND {date_col} < {prev_end}
                     AND {EXCLUDE_CACHE_WHERE}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -546,7 +568,8 @@ class DataGenerator:
                 SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
                 FROM caches c
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                  AND c.placed_date {prev_date_filter}
+                  AND {date_col} >= {prev_start}
+                  AND {date_col} < {prev_end}
                   AND {EXCLUDE_CACHE_WHERE}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -563,8 +586,9 @@ class DataGenerator:
                     c.country AS subtitle
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
-                  WHERE COALESCE(NULLIF(TRIM(c.city)), c.country) IS NOT NULL
-                    AND l.visited {prev_date_filter}
+                  WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
+                    AND {date_col} >= {prev_start}
+                    AND {date_col} < {prev_end}
                     AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -579,7 +603,8 @@ class DataGenerator:
                 FROM caches c
                 JOIN logs l ON l.gc_code = c.code
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                  AND l.visited {prev_date_filter}
+                  AND {date_col} >= {prev_start}
+                  AND {date_col} < {prev_end}
                   AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC

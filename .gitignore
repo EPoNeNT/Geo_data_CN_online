@@ -3,3 +3,4 @@ seed_map_cities_once.py
 test/
 public/
 __pycache__/
+.env

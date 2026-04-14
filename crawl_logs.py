@@ -268,11 +268,20 @@ class DatabaseManager:
                 # 已存在，比较字段
                 old_record = existing_logs[key]
 
+                # 标准化 visited 字段为字符串进行比较
+                db_visited = old_record["visited"]
+                if hasattr(db_visited, "isoformat"):
+                    db_visited_str = db_visited.isoformat()[:10]
+                else:
+                    db_visited_str = str(db_visited)[:10]
+
+                api_visited_str = str(new_record["visited"])[:10]
+
                 # 比较所有关键字段
                 fields_match = (
-                    old_record["visited"] == new_record["visited"]
-                    and old_record["favorite_point_used"] == new_record["favorite_point_used"]
-                    and old_record["is_ftf"] == new_record["is_ftf"]
+                    db_visited_str == api_visited_str
+                    and bool(old_record["favorite_point_used"]) == bool(new_record["favorite_point_used"])
+                    and bool(old_record["is_ftf"]) == bool(new_record["is_ftf"])
                 )
 
                 if not fields_match:

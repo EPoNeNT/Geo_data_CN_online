@@ -120,6 +120,34 @@ jobs:
         env:
           LOG_TO_FILE: '1'
 
+      - name: Setup SSH deploy key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GEODATAING_DEPLOY_KEY }}" > ~/.ssh/geodataing_deploy
+          chmod 600 ~/.ssh/geodataing_deploy
+          cat >> ~/.ssh/config << 'EOF'
+          Host github.com
+            IdentityFile ~/.ssh/geodataing_deploy
+            StrictHostKeyChecking no
+          EOF
+
+      - name: Push to Geodataing repository
+        run: |
+          git clone git@github.com:EPoNeNT/Geodataing.git /tmp/Geodataing
+          mkdir -p /tmp/Geodataing/public/data
+          cp public/data/*.json /tmp/Geodataing/public/data/
+          cd /tmp/Geodataing
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "auto-update: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            git push origin master
+            echo "Pushed to Geodataing successfully"
+          else
+            echo "No changes to push"
+          fi
+
       - name: Upload generated data
         uses: actions/upload-artifact@v4
         with:

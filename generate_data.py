@@ -58,6 +58,11 @@ EXCLUDE_CACHE_WHERE = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
 EXCLUDE_CACHE_JOIN = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
 
 
+def sql_literal(value: str) -> str:
+    """Return a SQL string literal for trusted generator filters."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 class DataGenerator:
     """Generate static JSON data files from database."""
 
@@ -106,8 +111,9 @@ class DataGenerator:
     def generate_summary_metrics(self, country_filter: Optional[str] = None) -> Dict:
         """Generate summary metrics for a region or overall."""
         if country_filter:
-            cache_where = f"WHERE c.cache_status != 2 AND c.geocache_type NOT IN (6, 13) AND c.country = '{country_filter}'"
-            log_where = f"WHERE c2.cache_status != 2 AND c2.geocache_type NOT IN (6, 13) AND c2.country = '{country_filter}'"
+            country_value = sql_literal(country_filter)
+            cache_where = f"WHERE c.cache_status != 2 AND c.geocache_type NOT IN (6, 13) AND c.country = {country_value}"
+            log_where = f"WHERE c2.cache_status != 2 AND c2.geocache_type NOT IN (6, 13) AND c2.country = {country_value}"
         else:
             cache_where = "WHERE c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
             log_where = "WHERE c2.cache_status != 2 AND c2.geocache_type NOT IN (6, 13)"
@@ -147,7 +153,7 @@ class DataGenerator:
         """Generate yearly trend data."""
         where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
         if country_filter:
-            where_clause += f" AND c.country = '{country_filter}'"
+            where_clause += f" AND c.country = {sql_literal(country_filter)}"
 
         query = f"""
         WITH years AS (
@@ -196,9 +202,9 @@ class DataGenerator:
         """Generate Difficulty/Terrain matrix (9x9 = 81 elements)."""
         where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
         if country_filter:
-            where_clause += f" AND c.country = '{country_filter}'"
+            where_clause += f" AND c.country = {sql_literal(country_filter)}"
         if city_filter:
-            where_clause += f" AND COALESCE(NULLIF(TRIM(c.city), ''), c.country) = '{city_filter}'"
+            where_clause += f" AND COALESCE(NULLIF(TRIM(c.city), ''), c.country) = {sql_literal(city_filter)}"
 
         query = f"""
         SELECT
@@ -291,7 +297,7 @@ class DataGenerator:
 
     # ==================== PLAYER-RANKINGS.JSON ====================
 
-    def calculate_trend(self, current_rank: int, previous_rank: int) -> Tuple[str, int]:
+    def calculate_trend(self, current_rank: int, previous_rank: int) -> Tuple[str, Optional[int]]:
         """Calculate trend direction and delta based on rank change.
 
         Args:
@@ -301,11 +307,11 @@ class DataGenerator:
         Returns:
             (trend, trendDelta) where:
             - trend: "up", "down", or "flat"
-            - trendDelta: absolute rank change (positive means improved)
+            - trendDelta: absolute rank change, or None when previous score was zero/not ranked
         """
         if previous_rank == 0:
             # New entry in rankings (was not in previous period)
-            return ("up", current_rank)
+            return ("up", None)
 
         delta = previous_rank - current_rank
         if delta > 0:
@@ -316,6 +322,21 @@ class DataGenerator:
             return ("down", abs(delta))
         else:
             return ("flat", 0)
+
+    def build_rank_lookup(self, rows: List[Dict]) -> Dict[str, int]:
+        """Build name-to-rank mapping using the same tied rank rule as output."""
+        ranks = {}
+        display_rank = 0
+        prev_score = None
+
+        for index, row in enumerate(rows):
+            score = row["score"] or 0
+            if index == 0 or score != prev_score:
+                display_rank = index + 1
+            ranks[row["name"]] = display_rank
+            prev_score = score
+
+        return ranks
 
     def generate_ranking_query(
         self,
@@ -402,6 +423,23 @@ class DataGenerator:
                 LIMIT {limit};
                 """
 
+        elif ranking_type == "ftf":
+            if is_city_ranking:
+                raise ValueError("FTF ranking is only supported for player rankings")
+
+            return f"""
+            SELECT l.user_name AS name, COUNT(*)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND l.is_ftf IS TRUE
+              AND l.visited {date_filter}
+              AND {EXCLUDE_CACHE_JOIN}
+            GROUP BY l.user_name
+            ORDER BY score DESC, l.user_name ASC
+            LIMIT {limit};
+            """
+
         elif ranking_type == "favorites":
             if is_city_ranking:
                 return f"""
@@ -458,6 +496,8 @@ class DataGenerator:
                 FROM caches c
                 JOIN logs l ON l.gc_code = c.code
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND l.user_name IS NOT NULL
+                  AND LOWER(l.user_name) <> LOWER(c.owner_username)
                   AND l.visited {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY c.owner_username
@@ -547,12 +587,11 @@ class DataGenerator:
         elif ranking_type == "finds":
             if is_city_ranking:
                 return f"""
-                SELECT name, subtitle, COUNT(DISTINCT user_name)::int AS score
+                SELECT name, subtitle, COUNT(*)::int AS score
                 FROM (
                   SELECT
                     COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
-                    c.country AS subtitle,
-                    l.user_name
+                    c.country AS subtitle
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
@@ -575,6 +614,23 @@ class DataGenerator:
                 ORDER BY score DESC, l.user_name ASC
                 LIMIT {limit};
                 """
+
+        elif ranking_type == "ftf":
+            if is_city_ranking:
+                raise ValueError("FTF ranking is only supported for player rankings")
+
+            return f"""
+            SELECT l.user_name AS name, COUNT(*)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND l.is_ftf IS TRUE
+              {date_filter}
+              AND {EXCLUDE_CACHE_JOIN}
+            GROUP BY l.user_name
+            ORDER BY score DESC, l.user_name ASC
+            LIMIT {limit};
+            """
 
         elif ranking_type == "favorites":
             if is_city_ranking:
@@ -632,6 +688,8 @@ class DataGenerator:
                 FROM caches c
                 JOIN logs l ON l.gc_code = c.code
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND l.user_name IS NOT NULL
+                  AND LOWER(l.user_name) <> LOWER(c.owner_username)
                   {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY c.owner_username
@@ -668,9 +726,8 @@ class DataGenerator:
                 try:
                     prev_query = self.generate_previous_period_query(rtype, trange, is_city_ranking)
                     prev_results = self.execute_query(prev_query)
-                    # Build name -> rank mapping from previous period
-                    for rank_idx, prev_row in enumerate(prev_results, 1):
-                        prev_ranks[prev_row["name"]] = rank_idx
+                    prev_results = [r for r in prev_results if (r["score"] or 0) > 0]
+                    prev_ranks = self.build_rank_lookup(prev_results)
                     logger.debug(f"  Got {len(prev_results)} previous period entries for {rtype}/{trange}")
                 except Exception as e:
                     logger.warning(f"Failed to get previous period data for {rtype}/{trange}: {e}")
@@ -784,7 +841,7 @@ class DataGenerator:
         """Generate complete player-rankings.json data."""
         logger.info("Generating player-rankings.json...")
 
-        ranking_types = ["hides", "finds", "favorites", "logs"]
+        ranking_types = ["finds", "ftf", "hides", "logs", "favorites"]
         time_ranges = ["30d", "ytd", "all"]
 
         return {
@@ -802,7 +859,7 @@ class DataGenerator:
         where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
         if city_filter:
             # City filter: match city or country
-            where_clause += f" AND COALESCE(NULLIF(TRIM(c.city), ''), c.country) = '{city_filter}'"
+            where_clause += f" AND COALESCE(NULLIF(TRIM(c.city), ''), c.country) = {sql_literal(city_filter)}"
 
         # Generate monthly data (last 10 months including current month)
         monthly_query = f"""

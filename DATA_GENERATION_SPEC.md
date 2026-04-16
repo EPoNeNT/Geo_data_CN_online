@@ -160,7 +160,7 @@ public/data/
   "generatedAt": "2026-04-14T00:00:00.000Z",
 
   "rankings": {
-    "hides": {
+    "finds": {
       "30d": [
         {
           "rank": 1,
@@ -174,19 +174,25 @@ public/data/
       "all": [ ... ]
     },
     
-    "finds": {
+    "ftf": {
       "30d": [ ... ],
       "ytd": [ ... ],
       "all": [ ... ]
     },
     
-    "favorites": {
+    "hides": {
       "30d": [ ... ],
       "ytd": [ ... ],
       "all": [ ... ]
     },
     
     "logs": {
+      "30d": [ ... ],
+      "ytd": [ ... ],
+      "all": [ ... ]
+    },
+
+    "favorites": {
       "30d": [ ... ],
       "ytd": [ ... ],
       "all": [ ... ]
@@ -207,10 +213,11 @@ public/data/
 #### `rankings` 对象结构
 
 **第一层 key** (排名类型):
-- `hides`: 藏宝排行（按 owner_username 分组 COUNT）
 - `finds`: 寻宝排行（按 logs.user_name 去重 gc_code 计数）
-- `favorites`: FP 数排行（按 owner_username 分组 SUM favorite_points）
+- `ftf`: FTF 排行（按 logs.user_name 分组统计 `is_ftf = true` 的数量）
+- `hides`: 藏宝排行（按 owner_username 分组 COUNT）
 - **`logs`: 获得Logs数排行**（统计玩家所藏的宝被其他玩家log的总次数）
+- `favorites`: 获得FP数排行（按 owner_username 分组 SUM favorite_points）
 
 **第二层 key** (时间范围):
 - `30d`: 最近 30 天
@@ -224,7 +231,7 @@ public/data/
 | `name` | string | 用户名/城市名 |
 | `score` | number | 分数（根据排名类型不同含义） |
 | `trend` | string | 趋势: `"up"` / `"down"` / `"flat"` |
-| `trendDelta` | number | 与上一周期相比的**排名变化量** |
+| `trendDelta` | number \| null | 与上一周期相比的**排名变化量**；上一周期未上榜或分数为0时为 `null` |
 
 **注意**:
 - 每个排行榜默认返回 **30 条**记录
@@ -247,7 +254,7 @@ public/data/
   - `trend = "down"`: 排名下降（例如从第2名到第4名）
   - `trend = "flat"`: 排名不变
 - `trendDelta`: 排名的绝对变化值（正数表示排名提升）
-- 新上榜的玩家/城市（上一周期不在排行榜中）: `trend = "up"`, `trendDelta` = 当前排名
+- 新上榜或上一周期分数为0的玩家/城市: `trend = "up"`, `trendDelta = null`，前端只显示上升箭头，不显示排名变化数值
 
 #### `communityStats` 对象
 | 字段名 | 类型 | 说明 | 计算方式 |
@@ -397,7 +404,7 @@ public/data/
 | `subtitle` | string | 国家/地区名称 |
 | `score` | number | 分数 |
 | `trend` | string | 趋势: `"up"` / `"down"` / `"flat"` |
-| `trendDelta` | number | 与上一周期相比的**排名变化量** |
+| `trendDelta` | number \| null | 与上一周期相比的**排名变化量**；上一周期未上榜或分数为0时为 `null` |
 
 **注意**:
 - 每个排行榜默认返回 **20 条**记录
@@ -568,7 +575,57 @@ ORDER BY c.difficulty, c.terrain;
 
 **重要**: 结果集可能不足 81 条，需要在代码中补全缺失的组合（count 设为 0）。
 
-### 4.4 玩家排行榜 - Hides (藏宝排行)
+### 4.4 玩家排行榜 - Finds (寻宝排行)
+
+```sql
+-- 30天版本
+SELECT user_name AS name, COUNT(DISTINCT gc_code)::int AS score
+FROM logs
+WHERE user_name IS NOT NULL AND user_name <> ''
+  AND visited >= CURRENT_DATE - INTERVAL '30 day'
+GROUP BY user_name
+ORDER BY score DESC, user_name ASC
+LIMIT 30;
+
+-- YTD 和 All 类似，修改日期条件即可
+```
+
+### 4.5 玩家排行榜 - FTF排行
+
+**说明**: 统计 `logs.is_ftf = true` 的数量，按 `logs.user_name` 分组。时间筛选使用 `logs.visited`。
+
+```sql
+-- 30天版本
+SELECT user_name AS name, COUNT(*)::int AS score
+FROM logs
+WHERE user_name IS NOT NULL AND user_name <> ''
+  AND is_ftf IS TRUE
+  AND visited >= CURRENT_DATE - INTERVAL '30 day'
+GROUP BY user_name
+ORDER BY score DESC, user_name ASC
+LIMIT 30;
+
+-- YTD 版本
+SELECT user_name AS name, COUNT(*)::int AS score
+FROM logs
+WHERE user_name IS NOT NULL AND user_name <> ''
+  AND is_ftf IS TRUE
+  AND visited >= date_trunc('year', CURRENT_DATE)::date
+GROUP BY user_name
+ORDER BY score DESC, user_name ASC
+LIMIT 30;
+
+-- 所有时间版本
+SELECT user_name AS name, COUNT(*)::int AS score
+FROM logs
+WHERE user_name IS NOT NULL AND user_name <> ''
+  AND is_ftf IS TRUE
+GROUP BY user_name
+ORDER BY score DESC, user_name ASC
+LIMIT 30;
+```
+
+### 4.6 玩家排行榜 - Hides (藏宝排行)
 
 ```sql
 -- 30天版本
@@ -598,33 +655,6 @@ ORDER BY score DESC, owner_username ASC
 LIMIT 30;
 ```
 
-### 4.5 玩家排行榜 - Finds (寻宝排行)
-
-```sql
--- 30天版本
-SELECT user_name AS name, COUNT(DISTINCT gc_code)::int AS score
-FROM logs
-WHERE user_name IS NOT NULL AND user_name <> ''
-  AND visited >= CURRENT_DATE - INTERVAL '30 day'
-GROUP BY user_name
-ORDER BY score DESC, user_name ASC
-LIMIT 30;
-
--- YTD 和 All 类似，修改日期条件即可
-```
-
-### 4.6 玩家排行榜 - Favorites (FP 排行)
-
-```sql
-SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
-FROM caches
-WHERE owner_username IS NOT NULL AND owner_username <> ''
-  AND placed_date >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整
-GROUP BY owner_username
-ORDER BY score DESC, owner_username ASC
-LIMIT 30;
-```
-
 ### 4.7 玩家排行榜 - 获得Logs数排行
 
 **说明**: 统计每个玩家所藏的宝被其他玩家log的总次数。时间筛选的是这些log的visited日期，而不是cache的放置日期。
@@ -637,6 +667,8 @@ SELECT
 FROM caches c
 JOIN logs l ON l.gc_code = c.code
 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+  AND l.user_name IS NOT NULL
+  AND LOWER(l.user_name) <> LOWER(c.owner_username)
   AND l.visited >= CURRENT_DATE - INTERVAL '30 day'
 GROUP BY c.owner_username
 ORDER BY score DESC, c.owner_username ASC
@@ -649,6 +681,8 @@ SELECT
 FROM caches c
 JOIN logs l ON l.gc_code = c.code
 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+  AND l.user_name IS NOT NULL
+  AND LOWER(l.user_name) <> LOWER(c.owner_username)
   AND l.visited >= date_trunc('year', CURRENT_DATE)::date
 GROUP BY c.owner_username
 ORDER BY score DESC, c.owner_username ASC
@@ -661,12 +695,26 @@ SELECT
 FROM caches c
 JOIN logs l ON l.gc_code = c.code
 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+  AND l.user_name IS NOT NULL
+  AND LOWER(l.user_name) <> LOWER(c.owner_username)
 GROUP BY c.owner_username
 ORDER BY score DESC, c.owner_username ASC
 LIMIT 30;
 ```
 
-### 4.8 城市排行榜
+### 4.8 玩家排行榜 - Favorites (获得FP数排行)
+
+```sql
+SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
+FROM caches
+WHERE owner_username IS NOT NULL AND owner_username <> ''
+  AND placed_date >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整
+GROUP BY owner_username
+ORDER BY score DESC, owner_username ASC
+LIMIT 30;
+```
+
+### 4.9 城市排行榜
 
 ```sql
 -- Hides (藏宝排行)
@@ -710,7 +758,7 @@ LIMIT 20;
 
 **注意**: 城市排行榜只包含 **3 种类型**（hides, finds, favorites），不包含 logs 类型。
 
-### 4.9 城市排名 - Cache Trend (趋势图)
+### 4.10 城市排名 - Cache Trend (趋势图)
 
 **全局 Cache Trend - 年度数据 (最近10年)**:
 ```sql
@@ -756,7 +804,7 @@ LEFT JOIN counts USING (month_date)
 ORDER BY months.month_date;
 ```
 
-### 4.10 城市详情数据 (cityDetails)
+### 4.11 城市详情数据 (cityDetails)
 
 **生成城市列表（从 rankings 中提取所有出现过的城市）**:
 
@@ -840,7 +888,7 @@ ORDER BY c.difficulty, c.terrain;
 - 可以并行处理多个城市的数据生成任务
 - 如果某城市的数据量很小或不存在，可以跳过该城市（前端会降级显示全局数据）
 
-### 4.10 Community Stats
+### 4.12 Community Stats
 
 ```sql
 -- 活跃玩家数（近30天）
@@ -878,8 +926,8 @@ def calculate_trend(current_rank, previous_rank):
     返回: (trend, trendDelta)
     """
     if previous_rank == 0:
-        # 新上榜玩家
-        return ("up", current_rank)
+        # 新上榜或上一周期分数为0，只显示上升箭头
+        return ("up", None)
     
     delta = previous_rank - current_rank
     
@@ -908,7 +956,7 @@ def calculate_trend(current_rank, previous_rank):
 | A | 2 | 4 | `up` | 2 | 排名提升2位 |
 | B | 5 | 3 | `down` | 2 | 排名下降2位 |
 | C | 10 | 10 | `flat` | 0 | 排名不变 |
-| D | 1 | 0 | `up` | 1 | 新上榜 |
+| D | 1 | 0 | `up` | `null` | 新上榜或上一周期分数为0，只显示上升箭头 |
 
 ---
 
@@ -926,11 +974,12 @@ def calculate_trend(current_rank, previous_rank):
 - [ ] 所有 percentage 字段在 0-100 范围内
 
 ### player-rankings.json
-- [ ] `rankings` 包含 4 种类型 × 3 种时间范围 = 12 个数组
+- [ ] `rankings` 包含 5 种类型 (finds, ftf, hides, logs, favorites) × 3 种时间范围 = 15 个数组
 - [ ] 每个数组长度不超过 30
 - [ ] 每个条目的 rank 从 1 开始连续递增
 - [ ] 所有 score 为非负整数
 - [ ] trend 只能是 "up"、"down"、"flat" 之一
+- [ ] `trendDelta` 为非负整数或 `null`；当上一周期未上榜或分数为0时应为 `null`
 - [ ] `communityStats.activePlayersGrowthPct` 可以是负数（表示下降）
 - [ ] `communityStats.foundCacheCoveragePct` 在 0-100 范围内
 
@@ -939,6 +988,7 @@ def calculate_trend(current_rank, previous_rank):
 - [ ] 每个数组长度不超过 20
 - [ ] 每个条目的 rank 从 1 开始连续递增
 - [ ] 所有 score 为非负整数
+- [ ] `trendDelta` 为非负整数或 `null`；当上一周期未上榜或分数为0时应为 `null`
 - [ ] `cacheTrend.monthly` 包含恰好 **10 个月**的数据（包括当前月份）
 - [ ] `cacheTrend.yearly` 包含恰好 **10 年**的数据（包括当前年份）
 - [ ] `cacheTrend.monthly` 标签格式为 `YYYY-MM`
@@ -1001,13 +1051,22 @@ const response = await fetch(`/data/overview.json?t=${Date.now()}`);
 
 ---
 
-**文档版本**: 1.3.0
-**最后更新**: 2026-04-15
+**文档版本**: 1.3.1
+**最后更新**: 2026-04-16
 **适用项目**: Geodataing - 中国地理藏宝数据分析平台
 
 ---
 
 ## 更新日志
+
+### v1.3.1 (2026-04-16)
+
+**趋势展示数据结构调整**
+
+1. **新上榜/上一周期为0的趋势处理**
+   - `trendDelta` 类型从 `number` 扩展为 `number | null`
+   - 当上一周期未上榜或分数为0时，返回 `trend = "up"` 且 `trendDelta = null`
+   - 前端应只显示上升箭头，不显示排名变化数值
 
 ### v1.3.0 (2026-04-15)
 

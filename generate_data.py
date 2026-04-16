@@ -375,7 +375,7 @@ class DataGenerator:
         previous: bool = False,
     ) -> str:
         """Generate player count query for rankingStats without leaderboard limits."""
-        date_col = "c.placed_date" if ranking_type in ("hides", "favorites") else "l.visited"
+        date_col = "c.placed_date" if ranking_type == "hides" else "l.visited"
         date_condition = self.generate_ranking_stats_date_condition(
             time_range,
             date_col,
@@ -448,13 +448,15 @@ class DataGenerator:
             return f"""
             SELECT COUNT(*)::int AS player_count
             FROM (
-              SELECT c.owner_username AS name, COALESCE(SUM(c.favorite_points), 0)::int AS score
+              SELECT c.owner_username AS name, COUNT(l.*)::int AS score
               FROM caches c
+              JOIN logs l ON l.gc_code = c.code
               WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                AND l.favorite_point_used IS TRUE
                 AND {date_condition}
-                AND {EXCLUDE_CACHE_WHERE}
+                AND {EXCLUDE_CACHE_JOIN}
               GROUP BY c.owner_username
-              HAVING COALESCE(SUM(c.favorite_points), 0) > 0
+              HAVING COUNT(l.*) > 0
             ) ranked;
             """
 
@@ -565,16 +567,17 @@ class DataGenerator:
         elif ranking_type == "favorites":
             if is_city_ranking:
                 return f"""
-                SELECT name, subtitle, COALESCE(SUM(favorite_points), 0)::int AS score
+                SELECT name, subtitle, COUNT(*)::int AS score
                 FROM (
                   SELECT
                     COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
-                    c.country AS subtitle,
-                    c.favorite_points
-                  FROM caches c
+                    c.country AS subtitle
+                  FROM logs l
+                  JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND c.placed_date {date_filter}
-                    AND {EXCLUDE_CACHE_WHERE}
+                    AND l.favorite_point_used IS TRUE
+                    AND l.visited {date_filter}
+                    AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -582,11 +585,13 @@ class DataGenerator:
                 """
             else:
                 return f"""
-                SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
+                SELECT c.owner_username AS name, COUNT(l.*)::int AS score
                 FROM caches c
+                JOIN logs l ON l.gc_code = c.code
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                  AND c.placed_date {date_filter}
-                  AND {EXCLUDE_CACHE_WHERE}
+                  AND l.favorite_point_used IS TRUE
+                  AND l.visited {date_filter}
+                  AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -644,9 +649,12 @@ class DataGenerator:
         - all: All time up to end of last year (Dec 31)
         """
 
-        # Determine date column and table alias based on ranking type
-        # hides/favorites use caches.placed_date, finds/logs use logs.visited
-        if ranking_type in ("hides", "favorites"):
+        # Determine date column and table alias based on ranking type.
+        # City favorites count favorite logs by visited date.
+        if ranking_type == "favorites":
+            date_col = "l.visited"
+            exclude_clause = "EXCLUDE_CACHE_JOIN"
+        elif ranking_type == "hides":
             date_col = "c.placed_date"
             exclude_clause = "EXCLUDE_CACHE_WHERE"
         else:
@@ -757,16 +765,17 @@ class DataGenerator:
         elif ranking_type == "favorites":
             if is_city_ranking:
                 return f"""
-                SELECT name, subtitle, COALESCE(SUM(favorite_points), 0)::int AS score
+                SELECT name, subtitle, COUNT(*)::int AS score
                 FROM (
                   SELECT
                     COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
-                    c.country AS subtitle,
-                    c.favorite_points
-                  FROM caches c
+                    c.country AS subtitle
+                  FROM logs l
+                  JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
+                    AND l.favorite_point_used IS TRUE
                     {date_filter}
-                    AND {EXCLUDE_CACHE_WHERE}
+                    AND {EXCLUDE_CACHE_JOIN}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -774,11 +783,13 @@ class DataGenerator:
                 """
             else:
                 return f"""
-                SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
+                SELECT c.owner_username AS name, COUNT(l.*)::int AS score
                 FROM caches c
+                JOIN logs l ON l.gc_code = c.code
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                  AND l.favorite_point_used IS TRUE
                   {date_filter}
-                  AND {EXCLUDE_CACHE_WHERE}
+                  AND {EXCLUDE_CACHE_JOIN}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};

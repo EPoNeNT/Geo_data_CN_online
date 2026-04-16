@@ -232,7 +232,7 @@ public/data/
 - `ftf`: FTF 排行（按 logs.user_name 分组统计 `is_ftf = true` 的数量）
 - `hides`: 藏宝排行（按 owner_username 分组 COUNT）
 - **`logs`: 获得Logs数排行**（统计玩家所藏的宝被其他玩家log的总次数）
-- `favorites`: 获得FP数排行（按 owner_username 分组 SUM favorite_points）
+- `favorites`: 获得FP数排行（玩家所藏 cache 在选定时间段内获得的 FP 数，按 `logs.favorite_point_used = true` 且 `logs.visited` 筛选）
 
 **第二层 key** (时间范围):
 - `30d`: 最近 30 天
@@ -285,7 +285,7 @@ public/data/
 - `ftf`: 当前时间范围内 FTF 数大于0的玩家数。
 - `hides`: 当前时间范围内藏宝数大于0的玩家数。
 - `logs`: 当前时间范围内“所藏宝获得 logs 数”大于0的玩家数。
-- `favorites`: 当前时间范围内获得 FP 数大于0的玩家数。
+- `favorites`: 当前时间范围内所藏 cache 获得 FP 数大于0的玩家数。
 - `30d` 的上一周期为前 30-60 天；`ytd` 的上一周期为去年同期；`all` 的上一周期为截至去年年底的全部时间。
 
 #### `communityStats` 对象
@@ -424,7 +424,7 @@ public/data/
 **第一层 key** (排名类型):
 - `hides`: 藏宝排行（按城市分组 COUNT caches）
 - **`finds`: 寻宝排行**（该城市的所有 cache 在选定时间段内获得的 logs 数的总和）
-- `favorites`: FP 数排行（按城市分组 SUM favorite_points）
+- `favorites`: FP 数排行（该城市所有 cache 在选定时间段内获得的 FP 数，按 `logs.favorite_point_used = true` 且 `logs.visited` 筛选）
 
 **注意**: 城市排行榜**不包含** `logs` 排行类型（与玩家排行榜不同）
 
@@ -826,12 +826,16 @@ LIMIT 50;
 ### 4.8 玩家排行榜 - Favorites (获得FP数排行)
 
 ```sql
-SELECT owner_username AS name, COALESCE(SUM(favorite_points), 0)::int AS score
-FROM caches
-WHERE owner_username IS NOT NULL AND owner_username <> ''
-  AND placed_date >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整
-GROUP BY owner_username
-ORDER BY score DESC, owner_username ASC
+SELECT
+  c.owner_username AS name,
+  COUNT(l.*)::int AS score
+FROM caches c
+JOIN logs l ON l.gc_code = c.code
+WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+  AND l.favorite_point_used IS TRUE
+  AND l.visited >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整
+GROUP BY c.owner_username
+ORDER BY score DESC, c.owner_username ASC
 LIMIT 50;
 ```
 
@@ -896,11 +900,12 @@ LIMIT 20;
 SELECT
   COALESCE(NULLIF(TRIM(c.city), ''), c.country) AS name,
   c.country AS subtitle,
-  COALESCE(SUM(c.favorite_points), 0)::int AS score
-FROM caches c
+  COUNT(*)::int AS score
+FROM logs l
+JOIN caches c ON c.code = l.gc_code
 WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-  AND c.owner_username IS NOT NULL AND c.owner_username <> ''
-  AND c.placed_date >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整
+  AND l.favorite_point_used IS TRUE
+  AND l.visited >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整
 GROUP BY name, subtitle
 ORDER BY score DESC, name ASC
 LIMIT 20;

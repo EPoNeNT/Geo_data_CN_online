@@ -12,7 +12,9 @@ Output files:
 """
 import json
 import os
+import re
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runtime_utils import require_env, setup_logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import requests
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -56,11 +59,35 @@ DT_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 # Exclusion filters for caches
 EXCLUDE_CACHE_WHERE = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
 EXCLUDE_CACHE_JOIN = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
+DEFAULT_AVATAR_URL = "https://www.geocaching.com/images/default_avatar.png"
+AVATAR_PROFILE_URL = "https://www.geocaching.com/p/default.aspx"
+AVATAR_MAX_RETRIES = int(os.getenv("AVATAR_MAX_RETRIES", "3"))
+AVATAR_FETCH_DELAY_SECONDS = float(os.getenv("AVATAR_FETCH_DELAY_SECONDS", "0.4"))
+AVATAR_REQUEST_TIMEOUT_SECONDS = int(os.getenv("AVATAR_REQUEST_TIMEOUT_SECONDS", "15"))
+AVATAR_URL_PATTERNS = [
+    re.compile(
+        r"profile-image-wrapper.*?url\('(https://img\.geocaching\.com/user/square250/.*?\.(?:jpg|png))'\)",
+        re.DOTALL | re.IGNORECASE,
+    ),
+    re.compile(
+        r"https://img\.geocaching\.com/user/square250/[a-f0-9\-]+\.(?:jpg|png)",
+        re.IGNORECASE,
+    ),
+]
+REAL_AVATAR_URL_PATTERN = re.compile(
+    r"^https://img\.geocaching\.com/user/square250/.+\.(?:jpg|png)(?:\?.*)?$",
+    re.IGNORECASE,
+)
 
 
 def sql_literal(value: str) -> str:
     """Return a SQL string literal for trusted generator filters."""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def is_real_avatar_url(value: Optional[str]) -> bool:
+    """Return True only for real Geocaching square avatar image URLs."""
+    return bool(value and REAL_AVATAR_URL_PATTERN.match(value))
 
 
 class DataGenerator:
@@ -97,6 +124,166 @@ class DataGenerator:
         except Exception as e:
             logger.error(f"Query execution failed: {e}")
             raise
+
+    def execute_write(self, query: str, params: tuple = None):
+        """Execute a write query and commit it."""
+        try:
+            self.cursor.execute(query, params)
+            self.conn.commit()
+        except Exception as e:
+            if self.conn:
+                self.conn.rollback()
+            logger.error(f"Write execution failed: {e}")
+            raise
+
+    def ensure_user_avatar_table(self):
+        """Ensure the user avatar cache table exists."""
+        query = """
+        CREATE TABLE IF NOT EXISTS user_avatars (
+          user_name TEXT PRIMARY KEY,
+          avatar_url TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+        self.execute_write(query)
+
+    def get_cached_avatar_urls(self, user_names: List[str]) -> Dict[str, str]:
+        """Return avatar URLs already stored for the given users."""
+        unique_names = sorted({name for name in user_names if name})
+        if not unique_names:
+            return {}
+
+        self.ensure_user_avatar_table()
+        query = """
+        SELECT user_name, avatar_url
+        FROM user_avatars
+        WHERE user_name = ANY(%s)
+          AND avatar_url <> %s
+          AND avatar_url LIKE %s;
+        """
+        rows = self.execute_query(
+            query,
+            (unique_names, DEFAULT_AVATAR_URL, "https://img.geocaching.com/user/square250/%"),
+        )
+        return {
+            row["user_name"]: row["avatar_url"]
+            for row in rows
+            if is_real_avatar_url(row.get("avatar_url"))
+        }
+
+    def upsert_avatar_urls(self, avatar_urls: Dict[str, str]):
+        """Store fetched avatar URLs in the cache table."""
+        avatar_urls = {
+            user_name: avatar_url
+            for user_name, avatar_url in avatar_urls.items()
+            if is_real_avatar_url(avatar_url)
+        }
+        if not avatar_urls:
+            return
+
+        self.ensure_user_avatar_table()
+        query = """
+        INSERT INTO user_avatars (user_name, avatar_url)
+        VALUES (%s, %s)
+        ON CONFLICT (user_name) DO UPDATE
+        SET avatar_url = EXCLUDED.avatar_url,
+            updated_at = NOW();
+        """
+        try:
+            self.cursor.executemany(query, sorted(avatar_urls.items()))
+            self.conn.commit()
+        except Exception as e:
+            if self.conn:
+                self.conn.rollback()
+            logger.error(f"Avatar URL upsert failed: {e}")
+            raise
+
+    def build_avatar_session(self) -> requests.Session:
+        """Create a requests session for avatar profile pages."""
+        session = requests.Session()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        }
+        cookie = os.getenv("GEOCACHING_COOKIE") or os.getenv("GEOCACHING_COOKIES")
+        if cookie:
+            headers["Cookie"] = cookie
+        session.headers.update(headers)
+        return session
+
+    def parse_avatar_url(self, html: str) -> str:
+        """Extract an avatar URL from a Geocaching profile page."""
+        for pattern in AVATAR_URL_PATTERNS:
+            match = pattern.search(html or "")
+            if match:
+                return match.group(1) if match.groups() else match.group(0)
+        return DEFAULT_AVATAR_URL
+
+    def fetch_avatar_url(self, user_name: str, session: Optional[requests.Session] = None) -> str:
+        """Fetch one user's avatar URL from their Geocaching profile."""
+        active_session = session or self.build_avatar_session()
+
+        for attempt in range(AVATAR_MAX_RETRIES):
+            try:
+                if attempt > 0:
+                    time.sleep(2)
+
+                response = active_session.get(
+                    AVATAR_PROFILE_URL,
+                    params={"u": user_name},
+                    timeout=AVATAR_REQUEST_TIMEOUT_SECONDS,
+                )
+                if response.status_code == 200:
+                    return self.parse_avatar_url(response.text)
+
+                logger.warning(
+                    f"Avatar request for {user_name} returned HTTP {response.status_code}"
+                )
+            except Exception as e:
+                logger.warning(f"Avatar request for {user_name} failed: {e}")
+
+        return DEFAULT_AVATAR_URL
+
+    def resolve_avatar_urls(self, user_names: List[str]) -> Dict[str, str]:
+        """Load cached avatar URLs and fetch missing users."""
+        unique_names = sorted({name for name in user_names if name})
+        if not unique_names:
+            return {}
+
+        cached_urls = self.get_cached_avatar_urls(unique_names)
+        missing_names = [name for name in unique_names if name not in cached_urls]
+
+        fetched_urls = {}
+        if missing_names:
+            logger.info(f"Fetching avatars for {len(missing_names)} uncached users...")
+            with self.build_avatar_session() as session:
+                for index, name in enumerate(missing_names, start=1):
+                    fetched_urls[name] = self.fetch_avatar_url(name, session=session)
+                    if index < len(missing_names) and AVATAR_FETCH_DELAY_SECONDS > 0:
+                        time.sleep(AVATAR_FETCH_DELAY_SECONDS)
+
+            self.upsert_avatar_urls(fetched_urls)
+
+        return {name: cached_urls.get(name) or fetched_urls.get(name, DEFAULT_AVATAR_URL) for name in unique_names}
+
+    def add_avatar_urls_to_rankings(self, rankings: Dict) -> Dict:
+        """Attach avatarUrl to all player ranking entries."""
+        user_names = []
+        for ranking_type in rankings.values():
+            for entries in ranking_type.values():
+                user_names.extend(entry["name"] for entry in entries if entry.get("name"))
+
+        avatar_urls = self.resolve_avatar_urls(user_names)
+        for ranking_type in rankings.values():
+            for entries in ranking_type.values():
+                for entry in entries:
+                    entry["avatarUrl"] = avatar_urls.get(entry.get("name"), DEFAULT_AVATAR_URL)
+
+        return rankings
 
     def ensure_output_dir(self):
         """Ensure output directory exists."""
@@ -1003,10 +1190,12 @@ class DataGenerator:
 
         ranking_types = ["finds", "ftf", "hides", "logs", "favorites"]
         time_ranges = ["30d", "ytd", "all"]
+        rankings = self.generate_rankings(ranking_types, time_ranges, limit=50)
+        self.add_avatar_urls_to_rankings(rankings)
 
         return {
             "generatedAt": self.get_generated_at(),
-            "rankings": self.generate_rankings(ranking_types, time_ranges, limit=50),
+            "rankings": rankings,
             "rankingStats": self.generate_ranking_stats(ranking_types, time_ranges),
             "communityStats": self.generate_community_stats(),
         }

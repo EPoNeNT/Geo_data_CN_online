@@ -1134,7 +1134,7 @@ class DataGenerator:
 
         # Generate rankings
         rankings = self.generate_rankings(
-            ranking_types, time_ranges, is_city_ranking=True, limit=20
+            ranking_types, time_ranges, is_city_ranking=True, limit=30
         )
 
         # Generate global cache trend and dt matrix

@@ -4,3 +4,4 @@ test/
 public/
 __pycache__/
 .env
+DATA_GENERATION_SPEC.md

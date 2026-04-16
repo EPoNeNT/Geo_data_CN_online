@@ -199,6 +199,21 @@ public/data/
     }
   },
 
+  "rankingStats": {
+    "finds": {
+      "30d": {
+        "playerCount": 12842,
+        "playerCountGrowthPct": 12.4
+      },
+      "ytd": { "playerCount": 23500, "playerCountGrowthPct": 8.1 },
+      "all": { "playerCount": 68000, "playerCountGrowthPct": 6.5 }
+    },
+    "ftf": { "30d": { ... }, "ytd": { ... }, "all": { ... } },
+    "hides": { "30d": { ... }, "ytd": { ... }, "all": { ... } },
+    "logs": { "30d": { ... }, "ytd": { ... }, "all": { ... } },
+    "favorites": { "30d": { ... }, "ytd": { ... }, "all": { ... } }
+  },
+
   "communityStats": {
     "activePlayers": 12842,
     "activePlayersGrowthPct": 12.4,
@@ -234,7 +249,7 @@ public/data/
 | `trendDelta` | number \| null | 与上一周期相比的**排名变化量**；上一周期未上榜或分数为0时为 `null` |
 
 **注意**:
-- 每个排行榜默认返回 **30 条**记录
+- 每个排行榜默认返回 **50 条**记录
 - **不显示分数为0的记录**
 - **并列排名规则**:
   - 分数相同的条目显示相同的排名序号
@@ -246,15 +261,32 @@ public/data/
   - 排名=3: 铜色 (`text-amber-600`)
   - 并列情况: 如果有多个第2名，都显示银色；如果有多个第3名，都显示铜色
 - **超限显示规则**:
-  - 正常情况下最多显示30条
-  - 如果因为并列导致第30名附近有同分的情况，则将所有同分的条目全部显示
-  - **示例**: 第29名(50分), 第29名(50分), 第29名(50分) → 显示31条记录
+  - 正常情况下最多显示50条
+  - 如果因为并列导致第50名附近有同分的情况，则将所有同分的条目全部显示
+  - **示例**: 第49名(50分), 第49名(50分), 第49名(50分) → 显示51条记录
 - **trend 基于**排名**变化计算**，而非分数变化
   - `trend = "up"`: 排名上升（例如从第4名到第2名）
   - `trend = "down"`: 排名下降（例如从第2名到第4名）
   - `trend = "flat"`: 排名不变
 - `trendDelta`: 排名的绝对变化值（正数表示排名提升）
 - 新上榜或上一周期分数为0的玩家/城市: `trend = "up"`, `trendDelta = null`，前端只显示上升箭头，不显示排名变化数值
+
+#### `rankingStats` 对象
+
+`rankingStats` 与 `rankings` 具有相同的 5×3 第一层/第二层 key 结构，用于排行榜右侧的“当前筛选玩家”卡片。
+
+| 字段名 | 类型 | 说明 |
+|--------|------|------|
+| `playerCount` | number | 当前排名类型和时间范围下，分数大于0的玩家总数 |
+| `playerCountGrowthPct` | number | 与上一个周期相比的玩家总数增长百分比，可为负数 |
+
+**统计口径**:
+- `finds`: 当前时间范围内寻宝数大于0的玩家数。
+- `ftf`: 当前时间范围内 FTF 数大于0的玩家数。
+- `hides`: 当前时间范围内藏宝数大于0的玩家数。
+- `logs`: 当前时间范围内“所藏宝获得 logs 数”大于0的玩家数。
+- `favorites`: 当前时间范围内获得 FP 数大于0的玩家数。
+- `30d` 的上一周期为前 30-60 天；`ytd` 的上一周期为去年同期；`all` 的上一周期为截至去年年底的全部时间。
 
 #### `communityStats` 对象
 | 字段名 | 类型 | 说明 | 计算方式 |
@@ -517,6 +549,11 @@ interface CityDetails {
 }
 ```
 
+### Chart 字段说明
+
+- `chart.monthly` 固定返回最近 10 个月，`label` 使用 `YYYY-MM` 格式；前端展示为英文月份缩写换行年份，例如 `Jan` / `2026`。
+- `chart.yearly` 固定返回最近 10 年，`label` 使用 `YYYY` 年份格式。
+
 | 字段名 | 类型 | 说明 |
 |--------|------|------|
 | `totalFinds` | number | 用户总寻宝数 |
@@ -669,7 +706,7 @@ WHERE user_name IS NOT NULL AND user_name <> ''
   AND visited >= CURRENT_DATE - INTERVAL '30 day'
 GROUP BY user_name
 ORDER BY score DESC, user_name ASC
-LIMIT 30;
+LIMIT 50;
 
 -- YTD 和 All 类似，修改日期条件即可
 ```
@@ -687,7 +724,7 @@ WHERE user_name IS NOT NULL AND user_name <> ''
   AND visited >= CURRENT_DATE - INTERVAL '30 day'
 GROUP BY user_name
 ORDER BY score DESC, user_name ASC
-LIMIT 30;
+LIMIT 50;
 
 -- YTD 版本
 SELECT user_name AS name, COUNT(*)::int AS score
@@ -697,7 +734,7 @@ WHERE user_name IS NOT NULL AND user_name <> ''
   AND visited >= date_trunc('year', CURRENT_DATE)::date
 GROUP BY user_name
 ORDER BY score DESC, user_name ASC
-LIMIT 30;
+LIMIT 50;
 
 -- 所有时间版本
 SELECT user_name AS name, COUNT(*)::int AS score
@@ -706,7 +743,7 @@ WHERE user_name IS NOT NULL AND user_name <> ''
   AND is_ftf IS TRUE
 GROUP BY user_name
 ORDER BY score DESC, user_name ASC
-LIMIT 30;
+LIMIT 50;
 ```
 
 ### 4.6 玩家排行榜 - Hides (藏宝排行)
@@ -719,7 +756,7 @@ WHERE owner_username IS NOT NULL AND owner_username <> ''
   AND placed_date >= CURRENT_DATE - INTERVAL '30 day'
 GROUP BY owner_username
 ORDER BY score DESC, owner_username ASC
-LIMIT 30;
+LIMIT 50;
 
 -- YTD 版本
 SELECT owner_username AS name, COUNT(*)::int AS score
@@ -728,7 +765,7 @@ WHERE owner_username IS NOT NULL AND owner_username <> ''
   AND placed_date >= date_trunc('year', CURRENT_DATE)::date
 GROUP BY owner_username
 ORDER BY score DESC, owner_username ASC
-LIMIT 30;
+LIMIT 50;
 
 -- 所有时间版本
 SELECT owner_username AS name, COUNT(*)::int AS score
@@ -736,7 +773,7 @@ FROM caches
 WHERE owner_username IS NOT NULL AND owner_username <> ''
 GROUP BY owner_username
 ORDER BY score DESC, owner_username ASC
-LIMIT 30;
+LIMIT 50;
 ```
 
 ### 4.7 玩家排行榜 - 获得Logs数排行
@@ -756,7 +793,7 @@ WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
   AND l.visited >= CURRENT_DATE - INTERVAL '30 day'
 GROUP BY c.owner_username
 ORDER BY score DESC, c.owner_username ASC
-LIMIT 30;
+LIMIT 50;
 
 -- YTD 版本
 SELECT
@@ -770,7 +807,7 @@ WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
   AND l.visited >= date_trunc('year', CURRENT_DATE)::date
 GROUP BY c.owner_username
 ORDER BY score DESC, c.owner_username ASC
-LIMIT 30;
+LIMIT 50;
 
 -- 所有时间版本
 SELECT
@@ -783,7 +820,7 @@ WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
   AND LOWER(l.user_name) <> LOWER(c.owner_username)
 GROUP BY c.owner_username
 ORDER BY score DESC, c.owner_username ASC
-LIMIT 30;
+LIMIT 50;
 ```
 
 ### 4.8 玩家排行榜 - Favorites (获得FP数排行)
@@ -795,10 +832,39 @@ WHERE owner_username IS NOT NULL AND owner_username <> ''
   AND placed_date >= CURRENT_DATE - INTERVAL '30 day'  -- 根据时间范围调整
 GROUP BY owner_username
 ORDER BY score DESC, owner_username ASC
-LIMIT 30;
+LIMIT 50;
 ```
 
-### 4.9 城市排行榜
+### 4.9 玩家排行榜 - rankingStats 统计
+
+每个玩家排行榜类型和时间范围都需要额外生成 `rankingStats[type][range]`。统计逻辑与对应排行榜的 `score` 口径一致，但不加 `LIMIT`，而是统计 `score > 0` 的玩家总数。
+
+```sql
+-- 示例：finds / 30d 的 playerCount
+SELECT COUNT(*)::int AS player_count
+FROM (
+  SELECT user_name AS name, COUNT(DISTINCT gc_code)::int AS score
+  FROM logs
+  WHERE user_name IS NOT NULL AND user_name <> ''
+    AND visited >= CURRENT_DATE - INTERVAL '30 day'
+  GROUP BY user_name
+  HAVING COUNT(DISTINCT gc_code) > 0
+) ranked;
+
+-- 示例：finds / 30d 的上一周期 playerCount，用于计算 playerCountGrowthPct
+SELECT COUNT(*)::int AS previous_player_count
+FROM (
+  SELECT user_name AS name, COUNT(DISTINCT gc_code)::int AS score
+  FROM logs
+  WHERE user_name IS NOT NULL AND user_name <> ''
+    AND visited >= CURRENT_DATE - INTERVAL '60 day'
+    AND visited < CURRENT_DATE - INTERVAL '30 day'
+  GROUP BY user_name
+  HAVING COUNT(DISTINCT gc_code) > 0
+) ranked;
+```
+
+### 4.10 城市排行榜
 
 ```sql
 -- Hides (藏宝排行)
@@ -842,7 +908,7 @@ LIMIT 20;
 
 **注意**: 城市排行榜只包含 **3 种类型**（hides, finds, favorites），不包含 logs 类型。
 
-### 4.10 城市排名 - Cache Trend (趋势图)
+### 4.11 城市排名 - Cache Trend (趋势图)
 
 **全局 Cache Trend - 年度数据 (最近10年)**:
 ```sql
@@ -888,7 +954,7 @@ LEFT JOIN counts USING (month_date)
 ORDER BY months.month_date;
 ```
 
-### 4.11 城市详情数据 (cityDetails)
+### 4.12 城市详情数据 (cityDetails)
 
 **生成城市列表（从 rankings 中提取所有出现过的城市）**:
 
@@ -972,7 +1038,7 @@ ORDER BY c.difficulty, c.terrain;
 - 可以并行处理多个城市的数据生成任务
 - 如果某城市的数据量很小或不存在，可以跳过该城市（前端会降级显示全局数据）
 
-### 4.12 Community Stats
+### 4.13 Community Stats
 
 ```sql
 -- 活跃玩家数（近30天）
@@ -1059,11 +1125,14 @@ def calculate_trend(current_rank, previous_rank):
 
 ### player-rankings.json
 - [ ] `rankings` 包含 5 种类型 (finds, ftf, hides, logs, favorites) × 3 种时间范围 = 15 个数组
-- [ ] 每个数组长度不超过 30
+- [ ] 每个数组长度不超过 50，除非第50名附近有并列同分
 - [ ] 每个条目的 rank 从 1 开始连续递增
 - [ ] 所有 score 为非负整数
 - [ ] trend 只能是 "up"、"down"、"flat" 之一
 - [ ] `trendDelta` 为非负整数或 `null`；当上一周期未上榜或分数为0时应为 `null`
+- [ ] `rankingStats` 包含 5 种类型 (finds, ftf, hides, logs, favorites) × 3 种时间范围 = 15 个对象
+- [ ] 每个 `rankingStats[type][range].playerCount` 为非负整数
+- [ ] 每个 `rankingStats[type][range].playerCountGrowthPct` 为数字，允许为负数
 - [ ] `communityStats.activePlayersGrowthPct` 可以是负数（表示下降）
 - [ ] `communityStats.foundCacheCoveragePct` 在 0-100 范围内
 

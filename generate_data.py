@@ -338,6 +338,128 @@ class DataGenerator:
 
         return ranks
 
+    def generate_ranking_stats_date_condition(
+        self,
+        time_range: str,
+        date_col: str,
+        previous: bool = False,
+    ) -> str:
+        """Generate date condition for rankingStats counts."""
+        if not previous:
+            if time_range == "30d":
+                return f"{date_col} >= CURRENT_DATE - INTERVAL '30 day'"
+            if time_range == "ytd":
+                return f"{date_col} >= date_trunc('year', CURRENT_DATE)::date"
+            if time_range == "all":
+                return f"{date_col} IS NOT NULL"
+            raise ValueError(f"Unknown time range: {time_range}")
+
+        if time_range == "30d":
+            return (
+                f"{date_col} >= CURRENT_DATE - INTERVAL '60 day' "
+                f"AND {date_col} < CURRENT_DATE - INTERVAL '30 day'"
+            )
+        if time_range == "ytd":
+            return (
+                f"{date_col} >= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date "
+                f"AND {date_col} < ((CURRENT_DATE - INTERVAL '1 year')::date + INTERVAL '1 day')"
+            )
+        if time_range == "all":
+            return f"{date_col} < date_trunc('year', CURRENT_DATE)::date"
+        raise ValueError(f"Unknown time range: {time_range}")
+
+    def generate_ranking_count_query(
+        self,
+        ranking_type: str,
+        time_range: str,
+        previous: bool = False,
+    ) -> str:
+        """Generate player count query for rankingStats without leaderboard limits."""
+        date_col = "c.placed_date" if ranking_type in ("hides", "favorites") else "l.visited"
+        date_condition = self.generate_ranking_stats_date_condition(
+            time_range,
+            date_col,
+            previous=previous,
+        )
+
+        if ranking_type == "finds":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
+              FROM logs l
+              JOIN caches c ON c.code = l.gc_code
+              WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+                AND {date_condition}
+                AND {EXCLUDE_CACHE_JOIN}
+              GROUP BY l.user_name
+              HAVING COUNT(DISTINCT l.gc_code) > 0
+            ) ranked;
+            """
+
+        if ranking_type == "ftf":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT l.user_name AS name, COUNT(*)::int AS score
+              FROM logs l
+              JOIN caches c ON c.code = l.gc_code
+              WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+                AND l.is_ftf IS TRUE
+                AND {date_condition}
+                AND {EXCLUDE_CACHE_JOIN}
+              GROUP BY l.user_name
+              HAVING COUNT(*) > 0
+            ) ranked;
+            """
+
+        if ranking_type == "hides":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT c.owner_username AS name, COUNT(*)::int AS score
+              FROM caches c
+              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                AND {date_condition}
+                AND {EXCLUDE_CACHE_WHERE}
+              GROUP BY c.owner_username
+              HAVING COUNT(*) > 0
+            ) ranked;
+            """
+
+        if ranking_type == "logs":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT c.owner_username AS name, COUNT(l.*)::int AS score
+              FROM caches c
+              JOIN logs l ON l.gc_code = c.code
+              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                AND l.user_name IS NOT NULL
+                AND LOWER(l.user_name) <> LOWER(c.owner_username)
+                AND {date_condition}
+                AND {EXCLUDE_CACHE_JOIN}
+              GROUP BY c.owner_username
+              HAVING COUNT(l.*) > 0
+            ) ranked;
+            """
+
+        if ranking_type == "favorites":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT c.owner_username AS name, COALESCE(SUM(c.favorite_points), 0)::int AS score
+              FROM caches c
+              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                AND {date_condition}
+                AND {EXCLUDE_CACHE_WHERE}
+              GROUP BY c.owner_username
+              HAVING COALESCE(SUM(c.favorite_points), 0) > 0
+            ) ranked;
+            """
+
+        raise ValueError(f"Unknown ranking type: {ranking_type}")
+
     def generate_ranking_query(
         self,
         ranking_type: str,
@@ -781,6 +903,33 @@ class DataGenerator:
 
         return rankings
 
+    def generate_ranking_stats(self, ranking_types: List[str], time_ranges: List[str]) -> Dict:
+        """Generate player counts and growth percentages for each ranking filter."""
+        stats = {}
+
+        for rtype in ranking_types:
+            stats[rtype] = {}
+            for trange in time_ranges:
+                current_query = self.generate_ranking_count_query(rtype, trange)
+                previous_query = self.generate_ranking_count_query(rtype, trange, previous=True)
+
+                current_result = self.execute_query(current_query)
+                previous_result = self.execute_query(previous_query)
+
+                player_count = current_result[0]["player_count"] if current_result else 0
+                previous_count = previous_result[0]["player_count"] if previous_result else 0
+
+                growth_pct = 0
+                if previous_count > 0:
+                    growth_pct = round((player_count - previous_count) / previous_count * 100, 1)
+
+                stats[rtype][trange] = {
+                    "playerCount": player_count,
+                    "playerCountGrowthPct": growth_pct,
+                }
+
+        return stats
+
     def generate_community_stats(self) -> Dict:
         """Generate community statistics."""
         # Active players (last 30 days)
@@ -846,7 +995,8 @@ class DataGenerator:
 
         return {
             "generatedAt": self.get_generated_at(),
-            "rankings": self.generate_rankings(ranking_types, time_ranges, limit=30),
+            "rankings": self.generate_rankings(ranking_types, time_ranges, limit=50),
+            "rankingStats": self.generate_ranking_stats(ranking_types, time_ranges),
             "communityStats": self.generate_community_stats(),
         }
 

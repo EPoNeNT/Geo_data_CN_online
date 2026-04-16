@@ -494,6 +494,90 @@ interface CityDetails {
 
 ---
 
+## 5. 个人统计 API (`/api/personal`)
+
+**对应 API**: `/api/personal?username=<username>`
+**使用页面**: `/personal` (个人统计页)
+**更新频率**: 实时查询
+
+### Overview 字段结构
+
+```json
+{
+  "overview": {
+    "totalFinds": 1024,
+    "findsLast30Days": 36,
+    "totalHides": 42,
+    "hidesLast30Days": 2,
+    "averageDifficulty": 2.4,
+    "averageTerrain": 2.1,
+    "totalFtfs": 18,
+    "ftfsLast30Days": 1
+  }
+}
+```
+
+| 字段名 | 类型 | 说明 |
+|--------|------|------|
+| `totalFinds` | number | 用户总寻宝数 |
+| `findsLast30Days` | number | 用户近30天寻宝数 |
+| `totalHides` | number | 用户总藏宝数 |
+| `hidesLast30Days` | number | 用户近30天藏宝数 |
+| `averageDifficulty` | number | 用户已找到 cache 的平均难度，保留1位小数 |
+| `averageTerrain` | number | 用户已找到 cache 的平均地形，保留1位小数 |
+| `totalFtfs` | number | 用户总 FTF 数，统计 `logs.is_ftf = true` |
+| `ftfsLast30Days` | number | 用户近30天 FTF 数，统计 `logs.is_ftf = true` 且 `visited >= CURRENT_DATE - INTERVAL '30 day'` |
+
+### SQL 参考
+
+```sql
+WITH find_metrics AS (
+  SELECT
+    COUNT(*)::int AS total_finds,
+    COUNT(*) FILTER (WHERE visited::date >= CURRENT_DATE - INTERVAL '30 day')::int AS finds_last_30_days
+  FROM logs
+  WHERE LOWER(user_name) = LOWER($1)
+),
+hide_metrics AS (
+  SELECT
+    COUNT(*)::int AS total_hides,
+    COUNT(*) FILTER (WHERE placed_date::date >= CURRENT_DATE - INTERVAL '30 day')::int AS hides_last_30_days
+  FROM caches
+  WHERE owner_username IS NOT NULL
+    AND LOWER(owner_username) = LOWER($1)
+),
+difficulty_metrics AS (
+  SELECT
+    ROUND(AVG(c.difficulty)::numeric, 1) AS average_difficulty,
+    ROUND(AVG(c.terrain)::numeric, 1) AS average_terrain
+  FROM logs l
+  JOIN caches c ON c.code = l.gc_code
+  WHERE LOWER(l.user_name) = LOWER($1)
+),
+ftf_metrics AS (
+  SELECT
+    COUNT(*) FILTER (WHERE is_ftf IS TRUE)::int AS total_ftfs,
+    COUNT(*) FILTER (
+      WHERE is_ftf IS TRUE
+        AND visited::date >= CURRENT_DATE - INTERVAL '30 day'
+    )::int AS ftfs_last_30_days
+  FROM logs
+  WHERE LOWER(user_name) = LOWER($1)
+)
+SELECT
+  find_metrics.total_finds,
+  find_metrics.finds_last_30_days,
+  hide_metrics.total_hides,
+  hide_metrics.hides_last_30_days,
+  COALESCE(difficulty_metrics.average_difficulty, 0) AS average_difficulty,
+  COALESCE(difficulty_metrics.average_terrain, 0) AS average_terrain,
+  ftf_metrics.total_ftfs,
+  ftf_metrics.ftfs_last_30_days
+FROM find_metrics, hide_metrics, difficulty_metrics, ftf_metrics;
+```
+
+---
+
 ## SQL 查询参考
 
 以下是对应每个数据文件的完整 SQL 查询，可直接用于你的脚本：

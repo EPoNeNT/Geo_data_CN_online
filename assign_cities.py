@@ -9,33 +9,71 @@
 
 import psycopg2
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 from runtime_utils import require_env, setup_logging
 
 
 logger = setup_logging("assign_cities.log")
 
-CITY_UPDATE_SQL = """
+TAIWAN_COUNTY_NAMES_SQL = ", ".join(
+    [
+        "'連江縣'",
+        "'金門縣'",
+        "'宜蘭縣'",
+        "'彰化縣'",
+        "'南投縣'",
+        "'雲林縣'",
+        "'屏東縣'",
+        "'臺東縣'",
+        "'花蓮縣'",
+        "'澎湖縣'",
+        "'基隆市'",
+        "'新竹市'",
+        "'臺北市'",
+        "'新北市'",
+        "'臺中市'",
+        "'臺南市'",
+        "'桃園市'",
+        "'苗栗縣'",
+        "'新竹縣'",
+        "'嘉義市'",
+        "'嘉義縣'",
+        "'高雄市'",
+    ]
+)
+
+CITY_UPDATE_SQL = f"""
 UPDATE caches AS p
 SET city = CASE
     WHEN p.country = 'Hong Kong' THEN '香港'
     WHEN p.country = 'Macao' THEN '澳门'
-    WHEN p.country = 'Taiwan' THEN '台湾'
     ELSE (
-        SELECT CASE
-            WHEN m.id LIKE '11%%' THEN '北京市'
-            WHEN m.id LIKE '31%%' THEN '上海市'
-            WHEN m.id LIKE '12%%' THEN '天津市'
-            WHEN m.id LIKE '50%%' THEN '重庆市'
-            ELSE m.name
-        END AS display_city_name
+        SELECT m.name AS display_city_name
         FROM map_cities AS m
+        WHERE (
+              p.country = 'Taiwan'
+              AND m.name IN ({TAIWAN_COUNTY_NAMES_SQL})
+          )
+          OR (
+              p.country IS DISTINCT FROM 'Taiwan'
+              AND m.name NOT IN ({TAIWAN_COUNTY_NAMES_SQL})
+          )
         ORDER BY
             m.geom <-> ST_SetSRID(ST_MakePoint(p.longitude, p.latitude), 4326),
             ST_Distance(m.geom, ST_SetSRID(ST_MakePoint(p.longitude, p.latitude), 4326))
         LIMIT 1
     )
 END
-WHERE p.city IS NULL
+WHERE (
+      p.city IS NULL
+      OR p.country = 'Taiwan'
+  )
   AND (
       p.country IN ('Hong Kong', 'Macao', 'Taiwan')
       OR (p.longitude IS NOT NULL AND p.latitude IS NOT NULL)
@@ -62,7 +100,6 @@ def ensure_schema(cursor) -> None:
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS map_cities (
-            id TEXT NOT NULL,
             name TEXT NOT NULL,
             geom geometry(MultiPolygon, 4326) NOT NULL
         );

@@ -35,6 +35,10 @@ logger = setup_logging("crawl_logs.log")
 
 DATABASE_URL = require_env("DATABASE_URL")
 MAX_RETRIES = 3
+FTF_MARKER_RE = re.compile(
+    r"[\{\[\(\uFF08]\s*\*?\s*ftf\s*\*?\s*[\}\]\)\uFF09]",
+    re.IGNORECASE,
+)
 
 NONPREMIUM_COOKIE = require_env("GEOCOOKIE_NONPREMIUM")
 PREMIUM_COOKIE = require_env("GEOCOOKIE_PREMIUM")
@@ -67,6 +71,11 @@ def format_date(raw_date: str) -> str:
         return pd.to_datetime(raw_date).strftime("%Y-%m-%d")
     except Exception:
         return raw_date
+
+
+def is_ftf_log_text(log_content: str) -> bool:
+    """Return True when log text contains an FTF marker inside brackets."""
+    return bool(FTF_MARKER_RE.search(log_content or ""))
 
 
 class DatabaseManager:
@@ -489,14 +498,13 @@ def fetch_logs_for_cache(
                 continue
 
             log_content = item.get("LogText", "")
-            ftf_keywords = ["{*FTF*}", "{FTF}", "[FTF]", "(FTF)", "（FTF）"]
             logs.append(
                 {
                     "GCCode": gc_code,
                     "UserName": item.get("UserName"),
                     "Visited": format_date(item.get("Visited", "")),
                     "FavoritePointUsed": item.get("FavoritePointUsed", False),
-                    "IsFTF": any(key in log_content for key in ftf_keywords),
+                    "IsFTF": is_ftf_log_text(log_content),
                 }
             )
 

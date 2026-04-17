@@ -38,6 +38,8 @@ logger = setup_logging("generate_data.log")
 
 DATABASE_URL = require_env("DATABASE_URL")
 OUTPUT_DIR = "public/data"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CHINA_CITIES_FILE = os.path.join(PROJECT_ROOT, "china_cities.json")
 
 # Constants
 REGIONS = [
@@ -59,6 +61,56 @@ DT_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 # Exclusion filters for caches
 EXCLUDE_CACHE_WHERE = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
 EXCLUDE_CACHE_JOIN = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
+COUNTRY_SUBTITLE_MAP = {
+    "China": "中国",
+    "Taiwan": "台湾",
+    "Hong Kong": "香港",
+    "Macao": "澳门",
+}
+PROVINCE_PREFIX_MAP = {
+    "11": "北京市",
+    "12": "天津市",
+    "13": "河北省",
+    "14": "山西省",
+    "15": "内蒙古自治区",
+    "21": "辽宁省",
+    "22": "吉林省",
+    "23": "黑龙江省",
+    "31": "上海市",
+    "32": "江苏省",
+    "33": "浙江省",
+    "34": "安徽省",
+    "35": "福建省",
+    "36": "江西省",
+    "37": "山东省",
+    "41": "河南省",
+    "42": "湖北省",
+    "43": "湖南省",
+    "44": "广东省",
+    "45": "广西壮族自治区",
+    "46": "海南省",
+    "50": "重庆市",
+    "51": "四川省",
+    "52": "贵州省",
+    "53": "云南省",
+    "54": "西藏自治区",
+    "61": "陕西省",
+    "62": "甘肃省",
+    "63": "青海省",
+    "64": "宁夏回族自治区",
+    "65": "新疆维吾尔自治区",
+}
+CITY_PROVINCE_MAP: Optional[Dict[str, str]] = None
+DIRECT_ADMIN_CITY_SUBTITLES = {
+    "北京市": "北京市",
+    "北京": "北京市",
+    "上海市": "上海市",
+    "上海": "上海市",
+    "天津市": "天津市",
+    "天津": "天津市",
+    "重庆市": "重庆市",
+    "重庆": "重庆市",
+}
 DEFAULT_AVATAR_URL = "https://www.geocaching.com/images/default_avatar.png"
 AVATAR_PROFILE_URL = "https://www.geocaching.com/p/default.aspx"
 AVATAR_MAX_RETRIES = int(os.getenv("AVATAR_MAX_RETRIES", "3"))
@@ -88,6 +140,33 @@ def sql_literal(value: str) -> str:
 def is_real_avatar_url(value: Optional[str]) -> bool:
     """Return True only for real Geocaching square avatar image URLs."""
     return bool(value and REAL_AVATAR_URL_PATTERN.match(value))
+
+
+def load_city_province_map() -> Dict[str, str]:
+    """Load China city-to-province mapping from the bundled city boundary file."""
+    global CITY_PROVINCE_MAP
+    if CITY_PROVINCE_MAP is not None:
+        return CITY_PROVINCE_MAP
+
+    city_provinces: Dict[str, str] = {}
+    try:
+        with open(CHINA_CITIES_FILE, "r", encoding="utf-8") as f:
+            features = json.load(f).get("features", [])
+    except Exception as e:
+        logger.warning(f"Failed to load China city province map: {e}")
+        CITY_PROVINCE_MAP = city_provinces
+        return CITY_PROVINCE_MAP
+
+    for feature in features:
+        city_id = str(feature.get("id", ""))
+        province_name = PROVINCE_PREFIX_MAP.get(city_id[:2])
+        city_name = feature.get("properties", {}).get("name")
+        if city_name and province_name:
+            city_provinces[str(city_name)] = province_name
+
+    city_provinces.update(DIRECT_ADMIN_CITY_SUBTITLES)
+    CITY_PROVINCE_MAP = city_provinces
+    return CITY_PROVINCE_MAP
 
 
 class DataGenerator:
@@ -284,6 +363,20 @@ class DataGenerator:
                     entry["avatarUrl"] = avatar_urls.get(entry.get("name"), DEFAULT_AVATAR_URL)
 
         return rankings
+
+    def format_city_subtitle(self, city_name: str, country_or_region: Optional[str]) -> str:
+        """Format city ranking subtitle as province or Chinese region name."""
+        if country_or_region in {"Taiwan", "台湾"}:
+            return "台湾"
+        if country_or_region in {"Hong Kong", "香港"}:
+            return "香港"
+        if country_or_region in {"Macao", "澳门"}:
+            return "澳门"
+        if country_or_region == "China":
+            return load_city_province_map().get(city_name, "中国")
+        if country_or_region and country_or_region != "None":
+            return COUNTRY_SUBTITLE_MAP.get(country_or_region, country_or_region)
+        return load_city_province_map().get(city_name, "")
 
     def ensure_output_dir(self):
         """Ensure output directory exists."""
@@ -1084,7 +1177,9 @@ class DataGenerator:
                         }
 
                         if is_city_ranking:
-                            entry["subtitle"] = row.get("subtitle", "")
+                            entry["subtitle"] = self.format_city_subtitle(
+                                entry["name"], row.get("subtitle", "")
+                            )
 
                         # Calculate trend based on rank difference
                         previous_rank = prev_ranks.get(entry["name"], 0)  # 0 means not in previous rankings

@@ -478,7 +478,53 @@ class DataGenerator:
             for row in results
         ]
 
-    def generate_dt_matrix(self, country_filter: Optional[str] = None, city_filter: Optional[str] = None) -> List[Dict]:
+    def generate_dt_top_caches_query(
+        self,
+        country_filter: Optional[str] = None,
+        city_filter: Optional[str] = None,
+    ) -> str:
+        """Generate SQL query for top caches in each D/T matrix cell."""
+        where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
+        if country_filter:
+            where_clause += f" AND c.country = {sql_literal(country_filter)}"
+        if city_filter:
+            where_clause += f" AND COALESCE(NULLIF(TRIM(c.city), ''), c.country) = {sql_literal(city_filter)}"
+
+        return f"""
+        SELECT
+          difficulty,
+          terrain,
+          code,
+          name,
+          owner,
+          favorite_points
+        FROM (
+          SELECT
+            c.difficulty::float8 AS difficulty,
+            c.terrain::float8 AS terrain,
+            c.code AS code,
+            c.name AS name,
+            c.owner_username AS owner,
+            COALESCE(c.favorite_points, 0)::int AS favorite_points,
+            ROW_NUMBER() OVER (
+              PARTITION BY c.difficulty, c.terrain
+              ORDER BY COALESCE(c.favorite_points, 0) DESC, c.code ASC
+            ) AS rn
+          FROM caches c
+          {where_clause}
+            AND c.difficulty IN ({','.join(map(str, DT_VALUES))})
+            AND c.terrain IN ({','.join(map(str, DT_VALUES))})
+        ) ranked
+        WHERE rn <= 5
+        ORDER BY difficulty, terrain, favorite_points DESC, code ASC;
+        """
+
+    def generate_dt_matrix(
+        self,
+        country_filter: Optional[str] = None,
+        city_filter: Optional[str] = None,
+        include_top_caches: bool = False,
+    ) -> List[Dict]:
         """Generate Difficulty/Terrain matrix (9x9 = 81 elements)."""
         where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
         if country_filter:
@@ -507,16 +553,36 @@ class DataGenerator:
             key = (row["difficulty"], row["terrain"])
             matrix[key] = row["count"] or 0
 
+        top_caches = {}
+        if include_top_caches:
+            top_cache_results = self.execute_query(
+                self.generate_dt_top_caches_query(country_filter, city_filter)
+            )
+            for row in top_cache_results:
+                key = (row["difficulty"], row["terrain"])
+                top_caches.setdefault(key, []).append(
+                    {
+                        "code": row["code"],
+                        "name": row["name"],
+                        "owner": row["owner"] or "",
+                        "favoritePoints": row["favorite_points"] or 0,
+                    }
+                )
+
         output = []
         for i, d in enumerate(DT_VALUES):
             for j, t in enumerate(DT_VALUES):
-                output.append({
+                cell = {
                     "row": i,
                     "col": j,
                     "difficulty": d,
                     "terrain": t,
                     "count": matrix.get((d, t), 0),
-                })
+                }
+                cell_top_caches = top_caches.get((d, t))
+                if cell_top_caches:
+                    cell["topCaches"] = cell_top_caches
+                output.append(cell)
 
         return output
 
@@ -1394,7 +1460,11 @@ class DataGenerator:
         for city_name in city_names:
             try:
                 cache_trend = self.generate_cache_trend(city_filter=city_name)
-                dt_matrix = self.generate_dt_matrix(country_filter=None, city_filter=city_name)
+                dt_matrix = self.generate_dt_matrix(
+                    country_filter=None,
+                    city_filter=city_name,
+                    include_top_caches=True,
+                )
                 
                 city_details[city_name] = {
                     "cacheTrend": cache_trend,
@@ -1423,7 +1493,7 @@ class DataGenerator:
 
         # Generate global cache trend and dt matrix
         cache_trend = self.generate_cache_trend()
-        dt_matrix = self.generate_dt_matrix()
+        dt_matrix = self.generate_dt_matrix(include_top_caches=True)
 
         # Generate city details for cities in rankings
         city_details = self.generate_city_details(rankings)

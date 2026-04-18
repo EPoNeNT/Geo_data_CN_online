@@ -478,6 +478,58 @@ class DataGenerator:
             for row in results
         ]
 
+    def generate_heatmap_period_query(
+        self,
+        time_range: str,
+        country_filter: Optional[str] = None,
+    ) -> str:
+        """Generate SQL query for overview heatmap points."""
+        where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
+        if country_filter:
+            where_clause += f" AND c.country = {sql_literal(country_filter)}"
+
+        if time_range == "30d":
+            date_filter = "c.placed_date::date >= CURRENT_DATE - INTERVAL '30 day'"
+        elif time_range == "ytd":
+            date_filter = (
+                "c.placed_date::date >= date_trunc('year', CURRENT_DATE)::date "
+                "AND c.placed_date::date <= CURRENT_DATE"
+            )
+        else:
+            raise ValueError(f"Unknown heatmap time range: {time_range}")
+
+        return f"""
+        SELECT
+          ROUND(c.latitude::numeric, 2)::float8 AS latitude,
+          ROUND(c.longitude::numeric, 2)::float8 AS longitude,
+          COUNT(*)::int AS count
+        FROM caches c
+        {where_clause}
+          AND c.latitude IS NOT NULL
+          AND c.longitude IS NOT NULL
+          AND c.placed_date IS NOT NULL
+          AND {date_filter}
+        GROUP BY 1, 2
+        ORDER BY count DESC, latitude ASC, longitude ASC;
+        """
+
+    def generate_heatmap(self, country_filter: Optional[str] = None) -> Dict[str, List[Dict]]:
+        """Generate overview heatmap data for recent and YTD cache placements."""
+        heatmap = {}
+        for time_range in ["30d", "ytd"]:
+            rows = self.execute_query(
+                self.generate_heatmap_period_query(time_range, country_filter)
+            )
+            heatmap[time_range] = [
+                {
+                    "latitude": row["latitude"],
+                    "longitude": row["longitude"],
+                    "count": row["count"] or 0,
+                }
+                for row in rows
+            ]
+        return heatmap
+
     def generate_dt_top_caches_query(
         self,
         country_filter: Optional[str] = None,
@@ -597,6 +649,7 @@ class DataGenerator:
 
             metrics = self.generate_summary_metrics(country)
             yearly_trend = self.generate_yearly_trend(country)
+            heatmap = self.generate_heatmap(country)
             dt_matrix = self.generate_dt_matrix(country)
 
             total_caches = metrics["totalCaches"]
@@ -612,6 +665,7 @@ class DataGenerator:
             region_scopes[key] = {
                 "metrics": metrics,
                 "yearlyTrend": yearly_trend,
+                "heatmap": heatmap,
                 "dtMatrix": dt_matrix,
             }
 
@@ -629,6 +683,7 @@ class DataGenerator:
         summary = {
             "metrics": self.generate_summary_metrics(),
             "yearlyTrend": self.generate_yearly_trend(),
+            "heatmap": self.generate_heatmap(),
             "dtMatrix": self.generate_dt_matrix(),
         }
 

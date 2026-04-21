@@ -484,16 +484,16 @@ class DataGenerator:
         country_filter: Optional[str] = None,
     ) -> str:
         """Generate SQL query for overview heatmap points."""
-        where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
+        where_clause = f"WHERE {EXCLUDE_CACHE_JOIN}"
         if country_filter:
             where_clause += f" AND c.country = {sql_literal(country_filter)}"
 
         if time_range == "30d":
-            date_filter = "c.placed_date::date >= CURRENT_DATE - INTERVAL '30 day'"
+            date_filter = "l.visited::date >= CURRENT_DATE - INTERVAL '30 day'"
         elif time_range == "ytd":
             date_filter = (
-                "c.placed_date::date >= date_trunc('year', CURRENT_DATE)::date "
-                "AND c.placed_date::date <= CURRENT_DATE"
+                "l.visited::date >= date_trunc('year', CURRENT_DATE)::date "
+                "AND l.visited::date <= CURRENT_DATE"
             )
         else:
             raise ValueError(f"Unknown heatmap time range: {time_range}")
@@ -503,18 +503,19 @@ class DataGenerator:
           ROUND(c.latitude::numeric, 2)::float8 AS latitude,
           ROUND(c.longitude::numeric, 2)::float8 AS longitude,
           COUNT(*)::int AS count
-        FROM caches c
+        FROM logs l
+        JOIN caches c ON c.code = l.gc_code
         {where_clause}
           AND c.latitude IS NOT NULL
           AND c.longitude IS NOT NULL
-          AND c.placed_date IS NOT NULL
+          AND l.visited IS NOT NULL
           AND {date_filter}
         GROUP BY 1, 2
         ORDER BY count DESC, latitude ASC, longitude ASC;
         """
 
     def generate_heatmap(self, country_filter: Optional[str] = None) -> Dict[str, List[Dict]]:
-        """Generate overview heatmap data for recent and YTD cache placements."""
+        """Generate overview heatmap data for recent and YTD find logs."""
         heatmap = {}
         for time_range in ["30d", "ytd"]:
             rows = self.execute_query(

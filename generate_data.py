@@ -311,13 +311,23 @@ class DataGenerator:
                 if attempt > 0:
                     time.sleep(2)
 
+                logger.info(
+                    f"Avatar request start for {user_name} "
+                    f"(attempt {attempt + 1}/{AVATAR_MAX_RETRIES})"
+                )
                 response = active_session.get(
                     AVATAR_PROFILE_URL,
                     params={"u": user_name},
                     timeout=AVATAR_REQUEST_TIMEOUT_SECONDS,
                 )
                 if response.status_code == 200:
-                    return self.parse_avatar_url(response.text)
+                    avatar_url = self.parse_avatar_url(response.text)
+                    result = "real" if is_real_avatar_url(avatar_url) else "default"
+                    logger.info(
+                        f"Avatar request finished for {user_name} "
+                        f"(attempt {attempt + 1}/{AVATAR_MAX_RETRIES}, result={result})"
+                    )
+                    return avatar_url
 
                 logger.warning(
                     f"Avatar request for {user_name} returned HTTP {response.status_code}"
@@ -336,16 +346,35 @@ class DataGenerator:
         cached_urls = self.get_cached_avatar_urls(unique_names)
         missing_names = [name for name in unique_names if name not in cached_urls]
 
+        logger.info(
+            "Avatar cache status: "
+            f"{len(cached_urls)} cached, {len(missing_names)} uncached, "
+            f"{len(unique_names)} total unique users"
+        )
+
         fetched_urls = {}
         if missing_names:
             logger.info(f"Fetching avatars for {len(missing_names)} uncached users...")
             with self.build_avatar_session() as session:
                 for index, name in enumerate(missing_names, start=1):
+                    started_at = time.monotonic()
+                    logger.info(f"Fetching avatar {index}/{len(missing_names)}: {name}")
                     fetched_urls[name] = self.fetch_avatar_url(name, session=session)
+                    elapsed = time.monotonic() - started_at
+                    result = "real" if is_real_avatar_url(fetched_urls[name]) else "default"
+                    logger.info(
+                        f"Finished avatar {index}/{len(missing_names)}: {name} "
+                        f"result={result} elapsed={elapsed:.1f}s"
+                    )
                     if index < len(missing_names) and AVATAR_FETCH_DELAY_SECONDS > 0:
                         time.sleep(AVATAR_FETCH_DELAY_SECONDS)
 
             self.upsert_avatar_urls(fetched_urls)
+            real_count = sum(1 for url in fetched_urls.values() if is_real_avatar_url(url))
+            logger.info(
+                f"Avatar fetch completed: {real_count} real URLs, "
+                f"{len(fetched_urls) - real_count} default fallbacks"
+            )
 
         return {name: cached_urls.get(name) or fetched_urls.get(name, DEFAULT_AVATAR_URL) for name in unique_names}
 
@@ -1528,11 +1557,12 @@ class DataGenerator:
             time_ranges,
             limit=50,
         )
-        self.add_avatar_urls_to_rankings_by_region(rankings_by_region)
         ranking_stats_by_region = self.generate_ranking_stats_by_region(
             ranking_types,
             time_ranges,
         )
+        community_stats = self.generate_community_stats()
+        self.add_avatar_urls_to_rankings_by_region(rankings_by_region)
         rankings = rankings_by_region["all"]
         ranking_stats = ranking_stats_by_region["all"]
 
@@ -1542,7 +1572,7 @@ class DataGenerator:
             "rankingsByRegion": rankings_by_region,
             "rankingStats": ranking_stats,
             "rankingStatsByRegion": ranking_stats_by_region,
-            "communityStats": self.generate_community_stats(),
+            "communityStats": community_stats,
         }
 
     # ==================== CITY-RANKINGS.JSON ====================

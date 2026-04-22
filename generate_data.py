@@ -119,6 +119,8 @@ AVATAR_PROFILE_URL = "https://www.geocaching.com/p/default.aspx"
 AVATAR_MAX_RETRIES = int(os.getenv("AVATAR_MAX_RETRIES", "3"))
 AVATAR_FETCH_DELAY_SECONDS = float(os.getenv("AVATAR_FETCH_DELAY_SECONDS", "0.4"))
 AVATAR_REQUEST_TIMEOUT_SECONDS = int(os.getenv("AVATAR_REQUEST_TIMEOUT_SECONDS", "15"))
+AVATAR_NEGATIVE_CACHE_TTL_DAYS = int(os.getenv("AVATAR_NEGATIVE_CACHE_TTL_DAYS", "30"))
+AVATAR_UPSERT_BATCH_SIZE = int(os.getenv("AVATAR_UPSERT_BATCH_SIZE", "100"))
 AVATAR_URL_PATTERNS = [
     re.compile(
         r"profile-image-wrapper.*?url\('(https://img\.geocaching\.com/user/square250/.*?\.(?:jpg|png))'\)",
@@ -224,62 +226,127 @@ class DataGenerator:
         CREATE TABLE IF NOT EXISTS user_avatars (
           user_name TEXT PRIMARY KEY,
           avatar_url TEXT NOT NULL,
+          avatar_status TEXT NOT NULL DEFAULT 'real',
+          checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+        ALTER TABLE user_avatars
+          ADD COLUMN IF NOT EXISTS avatar_status TEXT NOT NULL DEFAULT 'real';
+        ALTER TABLE user_avatars
+          ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
         """
         self.execute_write(query)
 
-    def get_cached_avatar_urls(self, user_names: List[str]) -> Dict[str, str]:
-        """Return avatar URLs already stored for the given users."""
+    def ensure_live_connection(self):
+        """Reconnect before avatar cache writes if the database connection went idle."""
+        try:
+            if not self.conn or self.conn.closed:
+                self.connect()
+                return
+
+            self.conn.rollback()
+            self.cursor.execute("SELECT 1")
+            self.cursor.fetchone()
+        except Exception as e:
+            logger.warning(f"Database connection stale before avatar cache write, reconnecting: {e}")
+            try:
+                if self.cursor:
+                    self.cursor.close()
+            except Exception:
+                pass
+            try:
+                if self.conn:
+                    self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+            self.cursor = None
+            self.connect()
+
+    def get_avatar_cache_entries(self, user_names: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Return real and fresh negative avatar cache entries for the given users."""
         unique_names = sorted({name for name in user_names if name})
         if not unique_names:
             return {}
 
         self.ensure_user_avatar_table()
         query = """
-        SELECT user_name, avatar_url
+        SELECT
+          user_name,
+          avatar_url,
+          COALESCE(avatar_status, 'real') AS avatar_status,
+          checked_at,
+          checked_at >= NOW() - (%s::int * INTERVAL '1 day') AS is_fresh
         FROM user_avatars
-        WHERE user_name = ANY(%s)
-          AND avatar_url <> %s
-          AND avatar_url LIKE %s;
+        WHERE user_name = ANY(%s);
         """
-        rows = self.execute_query(
-            query,
-            (unique_names, DEFAULT_AVATAR_URL, "https://img.geocaching.com/user/square250/%"),
-        )
+        rows = self.execute_query(query, (AVATAR_NEGATIVE_CACHE_TTL_DAYS, unique_names))
         return {
-            row["user_name"]: row["avatar_url"]
+            row["user_name"]: {
+                "avatar_url": row["avatar_url"],
+                "avatar_status": row.get("avatar_status") or "real",
+                "checked_at": row.get("checked_at"),
+                "is_fresh": bool(row.get("is_fresh")),
+            }
             for row in rows
-            if is_real_avatar_url(row.get("avatar_url"))
         }
 
-    def upsert_avatar_urls(self, avatar_urls: Dict[str, str]):
-        """Store fetched avatar URLs in the cache table."""
-        avatar_urls = {
-            user_name: avatar_url
-            for user_name, avatar_url in avatar_urls.items()
-            if is_real_avatar_url(avatar_url)
+    def get_cached_avatar_urls(self, user_names: List[str]) -> Dict[str, str]:
+        """Return real avatar URLs already stored for the given users."""
+        entries = self.get_avatar_cache_entries(user_names)
+        return {
+            user_name: entry["avatar_url"]
+            for user_name, entry in entries.items()
+            if entry.get("avatar_status") == "real" and is_real_avatar_url(entry.get("avatar_url"))
         }
-        if not avatar_urls:
+
+    def upsert_avatar_cache_entries(self, avatar_entries: Dict[str, Tuple[str, str]]):
+        """Store fetched avatar results in the cache table in batches."""
+        rows = []
+        for user_name, value in avatar_entries.items():
+            avatar_url, avatar_status = value
+            if avatar_status == "real" and not is_real_avatar_url(avatar_url):
+                avatar_url = DEFAULT_AVATAR_URL
+                avatar_status = "failed"
+            if avatar_status != "real":
+                avatar_url = DEFAULT_AVATAR_URL
+            rows.append((user_name, avatar_url, avatar_status))
+
+        if not rows:
             return
 
         self.ensure_user_avatar_table()
+        self.ensure_live_connection()
         query = """
-        INSERT INTO user_avatars (user_name, avatar_url)
-        VALUES (%s, %s)
+        INSERT INTO user_avatars (user_name, avatar_url, avatar_status, checked_at)
+        VALUES (%s, %s, %s, NOW())
         ON CONFLICT (user_name) DO UPDATE
         SET avatar_url = EXCLUDED.avatar_url,
+            avatar_status = EXCLUDED.avatar_status,
+            checked_at = NOW(),
             updated_at = NOW();
         """
         try:
-            self.cursor.executemany(query, sorted(avatar_urls.items()))
+            batch_size = max(1, AVATAR_UPSERT_BATCH_SIZE)
+            for start in range(0, len(rows), batch_size):
+                self.cursor.executemany(query, sorted(rows)[start:start + batch_size])
             self.conn.commit()
         except Exception as e:
             if self.conn:
                 self.conn.rollback()
-            logger.error(f"Avatar URL upsert failed: {e}")
+            logger.error(f"Avatar cache upsert failed: {e}")
             raise
+
+    def upsert_avatar_urls(self, avatar_urls: Dict[str, str]):
+        """Store fetched real avatar URLs in the cache table."""
+        self.upsert_avatar_cache_entries(
+            {
+                user_name: (avatar_url, "real")
+                for user_name, avatar_url in avatar_urls.items()
+                if is_real_avatar_url(avatar_url)
+            }
+        )
 
     def build_avatar_session(self) -> requests.Session:
         """Create a requests session for avatar profile pages."""
@@ -305,7 +372,7 @@ class DataGenerator:
                 return match.group(1) if match.groups() else match.group(0)
         return DEFAULT_AVATAR_URL
 
-    def fetch_avatar_url(self, user_name: str, session: Optional[requests.Session] = None) -> str:
+    def fetch_avatar_url(self, user_name: str, session: Optional[requests.Session] = None) -> Tuple[str, str]:
         """Fetch one user's avatar URL from their Geocaching profile."""
         active_session = session or self.build_avatar_session()
 
@@ -330,7 +397,7 @@ class DataGenerator:
                         f"Avatar request finished for {user_name} "
                         f"(attempt {attempt + 1}/{AVATAR_MAX_RETRIES}, result={result})"
                     )
-                    return avatar_url
+                    return (avatar_url, result)
 
                 logger.warning(
                     f"Avatar request for {user_name} returned HTTP {response.status_code}"
@@ -338,7 +405,7 @@ class DataGenerator:
             except Exception as e:
                 logger.warning(f"Avatar request for {user_name} failed: {e}")
 
-        return DEFAULT_AVATAR_URL
+        return (DEFAULT_AVATAR_URL, "failed")
 
     def resolve_avatar_urls(self, user_names: List[str]) -> Dict[str, str]:
         """Load cached avatar URLs and fetch missing users."""
@@ -346,37 +413,66 @@ class DataGenerator:
         if not unique_names:
             return {}
 
-        cached_urls = self.get_cached_avatar_urls(unique_names)
-        missing_names = [name for name in unique_names if name not in cached_urls]
+        cache_entries = self.get_avatar_cache_entries(unique_names)
+        cached_urls = {
+            name: entry["avatar_url"]
+            for name, entry in cache_entries.items()
+            if entry.get("avatar_status") == "real" and is_real_avatar_url(entry.get("avatar_url"))
+        }
+        fresh_negative_names = {
+            name
+            for name, entry in cache_entries.items()
+            if entry.get("avatar_status") in {"default", "failed"} and entry.get("is_fresh")
+        }
+        missing_names = [
+            name
+            for name in unique_names
+            if name not in cached_urls and name not in fresh_negative_names
+        ]
 
         logger.info(
             "Avatar cache status: "
-            f"{len(cached_urls)} cached, {len(missing_names)} uncached, "
+            f"{len(cached_urls)} real cached, {len(fresh_negative_names)} fresh negative cached, "
+            f"{len(missing_names)} uncached/stale, "
             f"{len(unique_names)} total unique users"
         )
 
-        fetched_urls = {}
+        fetched_urls: Dict[str, str] = {}
+        fetched_entries: Dict[str, Tuple[str, str]] = {}
+        pending_entries: Dict[str, Tuple[str, str]] = {}
         if missing_names:
             logger.info(f"Fetching avatars for {len(missing_names)} uncached users...")
             with self.build_avatar_session() as session:
                 for index, name in enumerate(missing_names, start=1):
                     started_at = time.monotonic()
                     logger.info(f"Fetching avatar {index}/{len(missing_names)}: {name}")
-                    fetched_urls[name] = self.fetch_avatar_url(name, session=session)
+                    fetch_result = self.fetch_avatar_url(name, session=session)
+                    if isinstance(fetch_result, tuple):
+                        avatar_url, avatar_status = fetch_result
+                    else:
+                        avatar_url = fetch_result
+                        avatar_status = "real" if is_real_avatar_url(avatar_url) else "default"
+                    fetched_urls[name] = avatar_url
+                    fetched_entries[name] = (avatar_url, avatar_status)
+                    pending_entries[name] = (avatar_url, avatar_status)
                     elapsed = time.monotonic() - started_at
-                    result = "real" if is_real_avatar_url(fetched_urls[name]) else "default"
                     logger.info(
                         f"Finished avatar {index}/{len(missing_names)}: {name} "
-                        f"result={result} elapsed={elapsed:.1f}s"
+                        f"result={avatar_status} elapsed={elapsed:.1f}s"
                     )
+                    if len(pending_entries) >= max(1, AVATAR_UPSERT_BATCH_SIZE):
+                        self.upsert_avatar_cache_entries(pending_entries)
+                        pending_entries = {}
                     if index < len(missing_names) and AVATAR_FETCH_DELAY_SECONDS > 0:
                         time.sleep(AVATAR_FETCH_DELAY_SECONDS)
 
-            self.upsert_avatar_urls(fetched_urls)
-            real_count = sum(1 for url in fetched_urls.values() if is_real_avatar_url(url))
+            self.upsert_avatar_cache_entries(pending_entries)
+            real_count = sum(1 for _, status in fetched_entries.values() if status == "real")
+            default_count = sum(1 for _, status in fetched_entries.values() if status == "default")
+            failed_count = sum(1 for _, status in fetched_entries.values() if status == "failed")
             logger.info(
                 f"Avatar fetch completed: {real_count} real URLs, "
-                f"{len(fetched_urls) - real_count} default fallbacks"
+                f"{default_count} default fallbacks, {failed_count} failed requests"
             )
 
         return {name: cached_urls.get(name) or fetched_urls.get(name, DEFAULT_AVATAR_URL) for name in unique_names}

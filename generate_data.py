@@ -58,9 +58,12 @@ REGION_COUNTRY_MAP = {
 
 DT_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 
-# Exclusion filters for caches
-EXCLUDE_CACHE_WHERE = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
-EXCLUDE_CACHE_JOIN = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
+# Cache filters. Most statistics include archived caches, but D/T matrices and
+# active yearly trend counts still exclude them.
+EXCLUDE_CACHE_WHERE = "c.geocache_type NOT IN (6, 13)"
+EXCLUDE_CACHE_JOIN = "c.geocache_type NOT IN (6, 13)"
+ACTIVE_CACHE_WHERE = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
+ACTIVE_CACHE_JOIN = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
 COUNTRY_SUBTITLE_MAP = {
     "China": "中国",
     "Taiwan": "台湾",
@@ -421,11 +424,11 @@ class DataGenerator:
         """Generate summary metrics for a region or overall."""
         if country_filter:
             country_value = sql_literal(country_filter)
-            cache_where = f"WHERE c.cache_status != 2 AND c.geocache_type NOT IN (6, 13) AND c.country = {country_value}"
-            log_where = f"WHERE c2.cache_status != 2 AND c2.geocache_type NOT IN (6, 13) AND c2.country = {country_value}"
+            cache_where = f"WHERE c.geocache_type NOT IN (6, 13) AND c.country = {country_value}"
+            log_where = f"WHERE c2.geocache_type NOT IN (6, 13) AND c2.country = {country_value}"
         else:
-            cache_where = "WHERE c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
-            log_where = "WHERE c2.cache_status != 2 AND c2.geocache_type NOT IN (6, 13)"
+            cache_where = "WHERE c.geocache_type NOT IN (6, 13)"
+            log_where = "WHERE c2.geocache_type NOT IN (6, 13)"
 
         query = f"""
         WITH cache_scope AS (
@@ -477,12 +480,14 @@ class DataGenerator:
         counts AS (
           SELECT
             EXTRACT(YEAR FROM placed_date)::int AS year,
-            COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE c.cache_status != 2)::int AS total,
             COUNT(*) FILTER (
-              WHERE placed_date::date <=
+              WHERE c.cache_status != 2
+                AND placed_date::date <=
                 (date_trunc('year', make_date(EXTRACT(YEAR FROM placed_date)::int, 1, 1))::date
                  + (CURRENT_DATE - date_trunc('year', CURRENT_DATE)::date))
-            )::int AS ytd_cache
+            )::int AS ytd_cache,
+            COUNT(*) FILTER (WHERE c.cache_status = 2)::int AS archived
           FROM caches c
           {where_clause}
           AND placed_date IS NOT NULL
@@ -491,7 +496,8 @@ class DataGenerator:
         SELECT
           years.year::text AS year,
           COALESCE(counts.total, 0)::int AS total,
-          COALESCE(counts.ytd_cache, 0)::int AS ytdCache
+          COALESCE(counts.ytd_cache, 0)::int AS ytdCache,
+          COALESCE(counts.archived, 0)::int AS archived
         FROM years
         LEFT JOIN counts USING (year)
         ORDER BY years.year;
@@ -503,6 +509,7 @@ class DataGenerator:
                 "year": str(row["year"]),
                 "total": row["total"] or 0,
                 "ytdCache": row["ytdcache"] or 0,
+                "archived": row["archived"] or 0,
             }
             for row in results
         ]
@@ -566,7 +573,7 @@ class DataGenerator:
         city_filter: Optional[str] = None,
     ) -> str:
         """Generate SQL query for top caches in each D/T matrix cell."""
-        where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
+        where_clause = f"WHERE {ACTIVE_CACHE_WHERE}"
         if country_filter:
             where_clause += f" AND c.country = {sql_literal(country_filter)}"
         if city_filter:
@@ -608,7 +615,7 @@ class DataGenerator:
         include_top_caches: bool = False,
     ) -> List[Dict]:
         """Generate Difficulty/Terrain matrix (9x9 = 81 elements)."""
-        where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
+        where_clause = f"WHERE {ACTIVE_CACHE_WHERE}"
         if country_filter:
             where_clause += f" AND c.country = {sql_literal(country_filter)}"
         if city_filter:

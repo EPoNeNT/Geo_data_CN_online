@@ -775,6 +775,7 @@ class DataGenerator:
         ranking_type: str,
         time_range: str,
         previous: bool = False,
+        country_filter: Optional[str] = None,
     ) -> str:
         """Generate player count query for rankingStats without leaderboard limits."""
         date_col = "c.placed_date" if ranking_type == "hides" else "l.visited"
@@ -783,6 +784,9 @@ class DataGenerator:
             date_col,
             previous=previous,
         )
+        country_condition = ""
+        if country_filter:
+            country_condition = f"AND c.country = {sql_literal(country_filter)}"
 
         if ranking_type == "finds":
             return f"""
@@ -794,6 +798,7 @@ class DataGenerator:
               WHERE l.user_name IS NOT NULL AND l.user_name <> ''
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_JOIN}
+                {country_condition}
               GROUP BY l.user_name
               HAVING COUNT(DISTINCT l.gc_code) > 0
             ) ranked;
@@ -810,6 +815,7 @@ class DataGenerator:
                 AND l.is_ftf IS TRUE
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_JOIN}
+                {country_condition}
               GROUP BY l.user_name
               HAVING COUNT(*) > 0
             ) ranked;
@@ -824,6 +830,7 @@ class DataGenerator:
               WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_WHERE}
+                {country_condition}
               GROUP BY c.owner_username
               HAVING COUNT(*) > 0
             ) ranked;
@@ -841,6 +848,7 @@ class DataGenerator:
                 AND LOWER(l.user_name) <> LOWER(c.owner_username)
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_JOIN}
+                {country_condition}
               GROUP BY c.owner_username
               HAVING COUNT(l.*) > 0
             ) ranked;
@@ -857,6 +865,7 @@ class DataGenerator:
                 AND l.favorite_point_used IS TRUE
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_JOIN}
+                {country_condition}
               GROUP BY c.owner_username
               HAVING COUNT(l.*) > 0
             ) ranked;
@@ -870,6 +879,7 @@ class DataGenerator:
         time_range: str,
         is_city_ranking: bool = False,
         limit: int = 30,
+        country_filter: Optional[str] = None,
     ) -> str:
         """Generate SQL query for rankings based on type and time range."""
 
@@ -889,6 +899,10 @@ class DataGenerator:
         else:
             prev_date_filter = "IS NOT NULL"
 
+        country_condition = ""
+        if country_filter:
+            country_condition = f"AND c.country = {sql_literal(country_filter)}"
+
         if ranking_type == "hides":
             if is_city_ranking:
                 return f"""
@@ -901,6 +915,7 @@ class DataGenerator:
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     AND c.placed_date {date_filter}
                     AND {EXCLUDE_CACHE_WHERE}
+                    {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -913,6 +928,7 @@ class DataGenerator:
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                   AND c.placed_date {date_filter}
                   AND {EXCLUDE_CACHE_WHERE}
+                  {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -931,6 +947,7 @@ class DataGenerator:
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     AND l.visited {date_filter}
                     AND {EXCLUDE_CACHE_JOIN}
+                    {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -944,6 +961,7 @@ class DataGenerator:
                 WHERE l.user_name IS NOT NULL AND l.user_name <> ''
                   AND l.visited {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
+                  {country_condition}
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
                 LIMIT {limit};
@@ -961,6 +979,7 @@ class DataGenerator:
               AND l.is_ftf IS TRUE
               AND l.visited {date_filter}
               AND {EXCLUDE_CACHE_JOIN}
+              {country_condition}
             GROUP BY l.user_name
             ORDER BY score DESC, l.user_name ASC
             LIMIT {limit};
@@ -980,6 +999,7 @@ class DataGenerator:
                     AND l.favorite_point_used IS TRUE
                     AND l.visited {date_filter}
                     AND {EXCLUDE_CACHE_JOIN}
+                    {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -994,6 +1014,7 @@ class DataGenerator:
                   AND l.favorite_point_used IS TRUE
                   AND l.visited {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
+                  {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1012,6 +1033,7 @@ class DataGenerator:
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                   AND l.visited {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
+                  {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1029,6 +1051,7 @@ class DataGenerator:
                   AND LOWER(l.user_name) <> LOWER(c.owner_username)
                   AND l.visited {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
+                  {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1042,6 +1065,7 @@ class DataGenerator:
         time_range: str,
         is_city_ranking: bool = False,
         limit: int = 999999,
+        country_filter: Optional[str] = None,
     ) -> str:
         """Generate SQL query for previous period (for trend calculation).
 
@@ -1086,6 +1110,10 @@ class DataGenerator:
             # No lower bound (for 'all' time range)
             date_filter = f"AND {date_col} < {prev_end}"
 
+        country_condition = ""
+        if country_filter:
+            country_condition = f"AND c.country = {sql_literal(country_filter)}"
+
         # Reuse the same query structure but with previous period filter
         if ranking_type == "hides":
             if is_city_ranking:
@@ -1099,6 +1127,7 @@ class DataGenerator:
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     {date_filter}
                     AND {EXCLUDE_CACHE_WHERE}
+                    {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1111,6 +1140,7 @@ class DataGenerator:
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                   {date_filter}
                   AND {EXCLUDE_CACHE_WHERE}
+                  {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1129,6 +1159,7 @@ class DataGenerator:
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     {date_filter}
                     AND {EXCLUDE_CACHE_JOIN}
+                    {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1142,6 +1173,7 @@ class DataGenerator:
                 WHERE l.user_name IS NOT NULL AND l.user_name <> ''
                   {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
+                  {country_condition}
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
                 LIMIT {limit};
@@ -1159,6 +1191,7 @@ class DataGenerator:
               AND l.is_ftf IS TRUE
               {date_filter}
               AND {EXCLUDE_CACHE_JOIN}
+              {country_condition}
             GROUP BY l.user_name
             ORDER BY score DESC, l.user_name ASC
             LIMIT {limit};
@@ -1178,6 +1211,7 @@ class DataGenerator:
                     AND l.favorite_point_used IS TRUE
                     {date_filter}
                     AND {EXCLUDE_CACHE_JOIN}
+                    {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1192,6 +1226,7 @@ class DataGenerator:
                   AND l.favorite_point_used IS TRUE
                   {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
+                  {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1210,6 +1245,7 @@ class DataGenerator:
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     {date_filter}
                     AND {EXCLUDE_CACHE_JOIN}
+                    {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1227,6 +1263,7 @@ class DataGenerator:
                   AND LOWER(l.user_name) <> LOWER(c.owner_username)
                   {date_filter}
                   AND {EXCLUDE_CACHE_JOIN}
+                  {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1240,6 +1277,7 @@ class DataGenerator:
         time_ranges: List[str],
         is_city_ranking: bool = False,
         limit: int = 30,
+        country_filter: Optional[str] = None,
     ) -> Dict:
         """Generate all rankings data with optimized trend calculation and tied rank support."""
         rankings = {}
@@ -1250,7 +1288,13 @@ class DataGenerator:
                 logger.debug(f"Generating {rtype}/{trange} ranking...")
                 
                 # Get current period rankings (fetch more to handle ties at the boundary)
-                query = self.generate_ranking_query(rtype, trange, is_city_ranking, limit=limit * 2)
+                query = self.generate_ranking_query(
+                    rtype,
+                    trange,
+                    is_city_ranking,
+                    limit=limit * 2,
+                    country_filter=country_filter,
+                )
                 results = self.execute_query(query)
 
                 # Filter out zero-score entries
@@ -1259,7 +1303,12 @@ class DataGenerator:
                 # Get previous period rankings once (not per-entry!)
                 prev_ranks = {}
                 try:
-                    prev_query = self.generate_previous_period_query(rtype, trange, is_city_ranking)
+                    prev_query = self.generate_previous_period_query(
+                        rtype,
+                        trange,
+                        is_city_ranking,
+                        country_filter=country_filter,
+                    )
                     prev_results = self.execute_query(prev_query)
                     prev_results = [r for r in prev_results if (r["score"] or 0) > 0]
                     prev_ranks = self.build_rank_lookup(prev_results)
@@ -1318,15 +1367,29 @@ class DataGenerator:
 
         return rankings
 
-    def generate_ranking_stats(self, ranking_types: List[str], time_ranges: List[str]) -> Dict:
+    def generate_ranking_stats(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+        country_filter: Optional[str] = None,
+    ) -> Dict:
         """Generate player counts and growth percentages for each ranking filter."""
         stats = {}
 
         for rtype in ranking_types:
             stats[rtype] = {}
             for trange in time_ranges:
-                current_query = self.generate_ranking_count_query(rtype, trange)
-                previous_query = self.generate_ranking_count_query(rtype, trange, previous=True)
+                current_query = self.generate_ranking_count_query(
+                    rtype,
+                    trange,
+                    country_filter=country_filter,
+                )
+                previous_query = self.generate_ranking_count_query(
+                    rtype,
+                    trange,
+                    previous=True,
+                    country_filter=country_filter,
+                )
 
                 current_result = self.execute_query(current_query)
                 previous_result = self.execute_query(previous_query)
@@ -1344,6 +1407,59 @@ class DataGenerator:
                 }
 
         return stats
+
+    def generate_rankings_by_region(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+        limit: int,
+    ) -> Dict[str, Dict]:
+        """Generate player rankings for all supported region filters."""
+        rankings_by_region = {
+            "all": self.generate_rankings(ranking_types, time_ranges, limit=limit)
+        }
+        for region_key, country in REGION_COUNTRY_MAP.items():
+            rankings_by_region[region_key] = self.generate_rankings(
+                ranking_types,
+                time_ranges,
+                limit=limit,
+                country_filter=country,
+            )
+        return rankings_by_region
+
+    def generate_ranking_stats_by_region(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+    ) -> Dict[str, Dict]:
+        """Generate ranking stats for all supported region filters."""
+        stats_by_region = {
+            "all": self.generate_ranking_stats(ranking_types, time_ranges)
+        }
+        for region_key, country in REGION_COUNTRY_MAP.items():
+            stats_by_region[region_key] = self.generate_ranking_stats(
+                ranking_types,
+                time_ranges,
+                country_filter=country,
+            )
+        return stats_by_region
+
+    def add_avatar_urls_to_rankings_by_region(self, rankings_by_region: Dict[str, Dict]) -> Dict[str, Dict]:
+        """Attach avatarUrl to every player ranking entry in every region."""
+        user_names = []
+        for rankings in rankings_by_region.values():
+            for ranking_type in rankings.values():
+                for entries in ranking_type.values():
+                    user_names.extend(entry["name"] for entry in entries if entry.get("name"))
+
+        avatar_urls = self.resolve_avatar_urls(user_names)
+        for rankings in rankings_by_region.values():
+            for ranking_type in rankings.values():
+                for entries in ranking_type.values():
+                    for entry in entries:
+                        entry["avatarUrl"] = avatar_urls.get(entry.get("name"), DEFAULT_AVATAR_URL)
+
+        return rankings_by_region
 
     def generate_community_stats(self) -> Dict:
         """Generate community statistics."""
@@ -1407,13 +1523,25 @@ class DataGenerator:
 
         ranking_types = ["finds", "ftf", "hides", "logs", "favorites"]
         time_ranges = ["30d", "ytd", "all"]
-        rankings = self.generate_rankings(ranking_types, time_ranges, limit=50)
-        self.add_avatar_urls_to_rankings(rankings)
+        rankings_by_region = self.generate_rankings_by_region(
+            ranking_types,
+            time_ranges,
+            limit=50,
+        )
+        self.add_avatar_urls_to_rankings_by_region(rankings_by_region)
+        ranking_stats_by_region = self.generate_ranking_stats_by_region(
+            ranking_types,
+            time_ranges,
+        )
+        rankings = rankings_by_region["all"]
+        ranking_stats = ranking_stats_by_region["all"]
 
         return {
             "generatedAt": self.get_generated_at(),
             "rankings": rankings,
-            "rankingStats": self.generate_ranking_stats(ranking_types, time_ranges),
+            "rankingsByRegion": rankings_by_region,
+            "rankingStats": ranking_stats,
+            "rankingStatsByRegion": ranking_stats_by_region,
             "communityStats": self.generate_community_stats(),
         }
 

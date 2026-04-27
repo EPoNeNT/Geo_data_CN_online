@@ -190,7 +190,7 @@ def ensure_user_table(conn) -> None:
 
 
 def get_usernames_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> list[str]:
-    """Read log usernames above the minimum log count that need a registration date fetch."""
+    """Read active log users and all cache owners that need a registration date fetch."""
     if include_non_ok:
         user_filter = "(u.user_name IS NULL OR COALESCE(u.fetch_status, '') <> 'ok')"
     else:
@@ -210,13 +210,24 @@ def get_usernames_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> 
         AND TRIM(user_name) <> ''
       GROUP BY TRIM(user_name)
       HAVING COUNT(*) > %s
+    ),
+    owner_users AS (
+      SELECT DISTINCT TRIM(owner_username) AS user_name
+      FROM caches
+      WHERE owner_username IS NOT NULL
+        AND TRIM(owner_username) <> ''
+    ),
+    candidate_users AS (
+      SELECT user_name FROM log_users
+      UNION
+      SELECT user_name FROM owner_users
     )
-    SELECT log_users.user_name
-    FROM log_users
-    LEFT JOIN "user" u ON u.user_name = log_users.user_name
+    SELECT candidate_users.user_name
+    FROM candidate_users
+    LEFT JOIN "user" u ON u.user_name = candidate_users.user_name
     WHERE 1 = 1
       AND {user_filter}
-    ORDER BY log_users.user_name
+    ORDER BY candidate_users.user_name
     {limit_clause};
     """
     with conn.cursor() as cur:
@@ -225,19 +236,31 @@ def get_usernames_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> 
 
 
 def get_distinct_log_user_count(conn) -> int:
-    """Count distinct non-empty log usernames above the minimum log count."""
+    """Count candidate users from active log users and all cache owners."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COUNT(*)::int AS count
-            FROM (
+            WITH log_users AS (
               SELECT TRIM(user_name) AS user_name
               FROM logs
               WHERE user_name IS NOT NULL
                 AND TRIM(user_name) <> ''
               GROUP BY TRIM(user_name)
               HAVING COUNT(*) > %s
-            ) log_users;
+            ),
+            owner_users AS (
+              SELECT DISTINCT TRIM(owner_username) AS user_name
+              FROM caches
+              WHERE owner_username IS NOT NULL
+                AND TRIM(owner_username) <> ''
+            ),
+            candidate_users AS (
+              SELECT user_name FROM log_users
+              UNION
+              SELECT user_name FROM owner_users
+            )
+            SELECT COUNT(*)::int AS count
+            FROM candidate_users;
             """,
             (MIN_LOG_COUNT_FOR_REGDATE_FETCH,),
         )
@@ -284,7 +307,11 @@ def main() -> None:
     try:
         if args.dry_run:
             total_users = get_distinct_log_user_count(conn)
-            logger.info("Distinct logs users with more than %s logs: %s", MIN_LOG_COUNT_FOR_REGDATE_FETCH, total_users)
+            logger.info(
+                "Candidate users from logs with more than %s logs or cache owners: %s",
+                MIN_LOG_COUNT_FOR_REGDATE_FETCH,
+                total_users,
+            )
             return
 
         ensure_user_table(conn)

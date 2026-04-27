@@ -139,6 +139,10 @@ NEWBIE_REGISTRATION_FILTER = (
     "u.registration_date >= CURRENT_DATE - INTERVAL '1 year' "
     "AND u.registration_date <= CURRENT_DATE"
 )
+PREVIOUS_NEWBIE_REGISTRATION_FILTER = (
+    "u.registration_date >= CURRENT_DATE - INTERVAL '2 years' "
+    "AND u.registration_date < CURRENT_DATE - INTERVAL '1 year'"
+)
 
 
 def sql_literal(value: str) -> str:
@@ -914,7 +918,7 @@ class DataGenerator:
         country_filter: Optional[str] = None,
     ) -> str:
         """Generate player count query for rankingStats without leaderboard limits."""
-        date_col = "c.placed_date" if ranking_type in {"hides", "newbieHides"} else "l.visited"
+        date_col = "c.placed_date" if ranking_type == "hides" else "l.visited"
         date_condition = self.generate_ranking_stats_date_condition(
             time_range,
             date_col,
@@ -932,24 +936,6 @@ class DataGenerator:
               FROM logs l
               JOIN caches c ON c.code = l.gc_code
               WHERE l.user_name IS NOT NULL AND l.user_name <> ''
-                AND {date_condition}
-                AND {EXCLUDE_CACHE_JOIN}
-                {country_condition}
-              GROUP BY l.user_name
-              HAVING COUNT(DISTINCT l.gc_code) > 0
-            ) ranked;
-            """
-
-        if ranking_type == "newbieFinds":
-            return f"""
-            SELECT COUNT(*)::int AS player_count
-            FROM (
-              SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
-              FROM logs l
-              JOIN caches c ON c.code = l.gc_code
-              JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
-              WHERE l.user_name IS NOT NULL AND l.user_name <> ''
-                AND {NEWBIE_REGISTRATION_FILTER}
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_JOIN}
                 {country_condition}
@@ -982,23 +968,6 @@ class DataGenerator:
               SELECT c.owner_username AS name, COUNT(*)::int AS score
               FROM caches c
               WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                AND {date_condition}
-                AND {EXCLUDE_CACHE_WHERE}
-                {country_condition}
-              GROUP BY c.owner_username
-              HAVING COUNT(*) > 0
-            ) ranked;
-            """
-
-        if ranking_type == "newbieHides":
-            return f"""
-            SELECT COUNT(*)::int AS player_count
-            FROM (
-              SELECT c.owner_username AS name, COUNT(*)::int AS score
-              FROM caches c
-              JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
-              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                AND {NEWBIE_REGISTRATION_FILTER}
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_WHERE}
                 {country_condition}
@@ -1138,25 +1107,6 @@ class DataGenerator:
                 LIMIT {limit};
                 """
 
-        elif ranking_type == "newbieFinds":
-            if is_city_ranking:
-                raise ValueError("Newbie finds ranking is only supported for player rankings")
-
-            return f"""
-            SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
-            FROM logs l
-            JOIN caches c ON c.code = l.gc_code
-            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
-            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
-              AND {NEWBIE_REGISTRATION_FILTER}
-              AND l.visited {date_filter}
-              AND {EXCLUDE_CACHE_JOIN}
-              {country_condition}
-            GROUP BY l.user_name
-            ORDER BY score DESC, l.user_name ASC
-            LIMIT {limit};
-            """
-
         elif ranking_type == "ftf":
             if is_city_ranking:
                 raise ValueError("FTF ranking is only supported for player rankings")
@@ -1247,24 +1197,6 @@ class DataGenerator:
                 LIMIT {limit};
                 """
 
-        elif ranking_type == "newbieHides":
-            if is_city_ranking:
-                raise ValueError("Newbie hides ranking is only supported for player rankings")
-
-            return f"""
-            SELECT c.owner_username AS name, COUNT(*)::int AS score
-            FROM caches c
-            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
-            WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-              AND {NEWBIE_REGISTRATION_FILTER}
-              AND c.placed_date {date_filter}
-              AND {EXCLUDE_CACHE_WHERE}
-              {country_condition}
-            GROUP BY c.owner_username
-            ORDER BY score DESC, c.owner_username ASC
-            LIMIT {limit};
-            """
-
         raise ValueError(f"Unknown ranking type: {ranking_type}")
 
     def generate_previous_period_query(
@@ -1288,7 +1220,7 @@ class DataGenerator:
         if ranking_type == "favorites":
             date_col = "l.visited"
             exclude_clause = "EXCLUDE_CACHE_JOIN"
-        elif ranking_type in {"hides", "newbieHides"}:
+        elif ranking_type == "hides":
             date_col = "c.placed_date"
             exclude_clause = "EXCLUDE_CACHE_WHERE"
         else:
@@ -1387,25 +1319,6 @@ class DataGenerator:
                 LIMIT {limit};
                 """
 
-        elif ranking_type == "newbieFinds":
-            if is_city_ranking:
-                raise ValueError("Newbie finds ranking is only supported for player rankings")
-
-            return f"""
-            SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
-            FROM logs l
-            JOIN caches c ON c.code = l.gc_code
-            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
-            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
-              AND {NEWBIE_REGISTRATION_FILTER}
-              {date_filter}
-              AND {EXCLUDE_CACHE_JOIN}
-              {country_condition}
-            GROUP BY l.user_name
-            ORDER BY score DESC, l.user_name ASC
-            LIMIT {limit};
-            """
-
         elif ranking_type == "ftf":
             if is_city_ranking:
                 raise ValueError("FTF ranking is only supported for player rankings")
@@ -1495,24 +1408,6 @@ class DataGenerator:
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
                 """
-
-        elif ranking_type == "newbieHides":
-            if is_city_ranking:
-                raise ValueError("Newbie hides ranking is only supported for player rankings")
-
-            return f"""
-            SELECT c.owner_username AS name, COUNT(*)::int AS score
-            FROM caches c
-            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
-            WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-              AND {NEWBIE_REGISTRATION_FILTER}
-              {date_filter}
-              AND {EXCLUDE_CACHE_WHERE}
-              {country_condition}
-            GROUP BY c.owner_username
-            ORDER BY score DESC, c.owner_username ASC
-            LIMIT {limit};
-            """
 
         raise ValueError(f"Unknown ranking type: {ranking_type}")
 
@@ -1689,6 +1584,199 @@ class DataGenerator:
             )
         return stats_by_region
 
+    def generate_newbie_ranking_query(
+        self,
+        ranking_type: str,
+        limit: int = 50,
+        country_filter: Optional[str] = None,
+    ) -> str:
+        """Generate SQL query for no-time-range newbie rankings."""
+        country_condition = ""
+        if country_filter:
+            country_condition = f"AND c.country = {sql_literal(country_filter)}"
+
+        if ranking_type == "finds":
+            return f"""
+            SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND {NEWBIE_REGISTRATION_FILTER}
+              AND {EXCLUDE_CACHE_JOIN}
+              {country_condition}
+            GROUP BY l.user_name
+            ORDER BY score DESC, l.user_name ASC
+            LIMIT {limit};
+            """
+
+        if ranking_type == "hides":
+            return f"""
+            SELECT c.owner_username AS name, COUNT(*)::int AS score
+            FROM caches c
+            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
+            WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+              AND {NEWBIE_REGISTRATION_FILTER}
+              AND {EXCLUDE_CACHE_WHERE}
+              {country_condition}
+            GROUP BY c.owner_username
+            ORDER BY score DESC, c.owner_username ASC
+            LIMIT {limit};
+            """
+
+        raise ValueError(f"Unknown newbie ranking type: {ranking_type}")
+
+    def generate_newbie_ranking_count_query(
+        self,
+        ranking_type: str,
+        country_filter: Optional[str] = None,
+        previous: bool = False,
+    ) -> str:
+        """Generate player count query for newbie ranking stats."""
+        country_condition = ""
+        if country_filter:
+            country_condition = f"AND c.country = {sql_literal(country_filter)}"
+        registration_filter = (
+            PREVIOUS_NEWBIE_REGISTRATION_FILTER
+            if previous
+            else NEWBIE_REGISTRATION_FILTER
+        )
+
+        if ranking_type == "finds":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
+              FROM logs l
+              JOIN caches c ON c.code = l.gc_code
+              JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
+              WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+                AND {registration_filter}
+                AND {EXCLUDE_CACHE_JOIN}
+                {country_condition}
+              GROUP BY l.user_name
+              HAVING COUNT(DISTINCT l.gc_code) > 0
+            ) ranked;
+            """
+
+        if ranking_type == "hides":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT c.owner_username AS name, COUNT(*)::int AS score
+              FROM caches c
+              JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
+              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                AND {registration_filter}
+                AND {EXCLUDE_CACHE_WHERE}
+                {country_condition}
+              GROUP BY c.owner_username
+              HAVING COUNT(*) > 0
+            ) ranked;
+            """
+
+        raise ValueError(f"Unknown newbie ranking type: {ranking_type}")
+
+    def format_ranked_rows_without_trend_period(self, rows: List[Dict], limit: int) -> List[Dict]:
+        """Apply tied ranks for rankings that do not have a meaningful previous period."""
+        ranked_results = []
+        display_rank = 0
+        prev_score = None
+
+        for index, row in enumerate([r for r in rows if (r["score"] or 0) > 0]):
+            score = row["score"] or 0
+            if index == 0 or score != prev_score:
+                display_rank = index + 1
+
+            should_include = len(ranked_results) < limit
+            if not should_include and ranked_results:
+                should_include = score == ranked_results[-1]["score"]
+
+            if should_include:
+                ranked_results.append(
+                    {
+                        "rank": display_rank,
+                        "name": row["name"],
+                        "score": score,
+                        "trend": "flat",
+                        "trendDelta": 0,
+                    }
+                )
+
+            prev_score = score
+
+        return ranked_results
+
+    def generate_newbie_rankings(
+        self,
+        limit: int = 50,
+        country_filter: Optional[str] = None,
+    ) -> Dict:
+        """Generate newbie rankings without time-range dimensions."""
+        rankings = {}
+        for ranking_type in ["finds", "hides"]:
+            query = self.generate_newbie_ranking_query(
+                ranking_type,
+                limit=limit * 2,
+                country_filter=country_filter,
+            )
+            results = self.execute_query(query)
+            rankings[ranking_type] = self.format_ranked_rows_without_trend_period(results, limit)
+        return rankings
+
+    def generate_newbie_ranking_stats(
+        self,
+        country_filter: Optional[str] = None,
+    ) -> Dict:
+        """Generate newbie player counts and growth versus the previous registration year."""
+        stats = {}
+        for ranking_type in ["finds", "hides"]:
+            current_query = self.generate_newbie_ranking_count_query(
+                ranking_type,
+                country_filter=country_filter,
+            )
+            previous_query = self.generate_newbie_ranking_count_query(
+                ranking_type,
+                country_filter=country_filter,
+                previous=True,
+            )
+            current_result = self.execute_query(current_query)
+            previous_result = self.execute_query(previous_query)
+            player_count = current_result[0]["player_count"] if current_result else 0
+            previous_count = previous_result[0]["player_count"] if previous_result else 0
+            growth_pct = None
+            if previous_count > 0:
+                growth_pct = round((player_count - previous_count) / previous_count * 100, 1)
+
+            stats[ranking_type] = {
+                "playerCount": player_count,
+                "playerCountGrowthPct": growth_pct,
+            }
+        return stats
+
+    def generate_newbie_rankings_by_region(self, limit: int = 50) -> Dict[str, Dict]:
+        """Generate newbie rankings for all supported region filters."""
+        rankings_by_region = {
+            "all": self.generate_newbie_rankings(limit=limit)
+        }
+        for region_key, country in REGION_COUNTRY_MAP.items():
+            rankings_by_region[region_key] = self.generate_newbie_rankings(
+                limit=limit,
+                country_filter=country,
+            )
+        return rankings_by_region
+
+    def generate_newbie_ranking_stats_by_region(self) -> Dict[str, Dict]:
+        """Generate newbie ranking stats for all supported region filters."""
+        stats_by_region = {
+            "all": self.generate_newbie_ranking_stats()
+        }
+        for region_key, country in REGION_COUNTRY_MAP.items():
+            stats_by_region[region_key] = self.generate_newbie_ranking_stats(
+                country_filter=country,
+            )
+        return stats_by_region
+
     def add_avatar_urls_to_rankings_by_region(self, rankings_by_region: Dict[str, Dict]) -> Dict[str, Dict]:
         """Attach avatarUrl to every player ranking entry in every region."""
         user_names = []
@@ -1703,6 +1791,21 @@ class DataGenerator:
                 for entries in ranking_type.values():
                     for entry in entries:
                         entry["avatarUrl"] = avatar_urls.get(entry.get("name"), DEFAULT_AVATAR_URL)
+
+        return rankings_by_region
+
+    def add_avatar_urls_to_newbie_rankings_by_region(self, rankings_by_region: Dict[str, Dict]) -> Dict[str, Dict]:
+        """Attach avatarUrl to every newbie ranking entry in every region."""
+        user_names = []
+        for rankings in rankings_by_region.values():
+            for entries in rankings.values():
+                user_names.extend(entry["name"] for entry in entries if entry.get("name"))
+
+        avatar_urls = self.resolve_avatar_urls(user_names)
+        for rankings in rankings_by_region.values():
+            for entries in rankings.values():
+                for entry in entries:
+                    entry["avatarUrl"] = avatar_urls.get(entry.get("name"), DEFAULT_AVATAR_URL)
 
         return rankings_by_region
 
@@ -1766,7 +1869,7 @@ class DataGenerator:
         """Generate complete player-rankings.json data."""
         logger.info("Generating player-rankings.json...")
 
-        ranking_types = ["finds", "ftf", "hides", "logs", "favorites", "newbieFinds", "newbieHides"]
+        ranking_types = ["finds", "ftf", "hides", "logs", "favorites"]
         time_ranges = ["30d", "ytd", "all"]
         rankings_by_region = self.generate_rankings_by_region(
             ranking_types,
@@ -1777,17 +1880,26 @@ class DataGenerator:
             ranking_types,
             time_ranges,
         )
+        newbie_rankings_by_region = self.generate_newbie_rankings_by_region(limit=50)
+        newbie_ranking_stats_by_region = self.generate_newbie_ranking_stats_by_region()
         community_stats = self.generate_community_stats()
         self.add_avatar_urls_to_rankings_by_region(rankings_by_region)
+        self.add_avatar_urls_to_newbie_rankings_by_region(newbie_rankings_by_region)
         rankings = rankings_by_region["all"]
         ranking_stats = ranking_stats_by_region["all"]
+        newbie_rankings = newbie_rankings_by_region["all"]
+        newbie_ranking_stats = newbie_ranking_stats_by_region["all"]
 
         return {
             "generatedAt": self.get_generated_at(),
             "rankings": rankings,
             "rankingsByRegion": rankings_by_region,
+            "newbieRankings": newbie_rankings,
+            "newbieRankingsByRegion": newbie_rankings_by_region,
             "rankingStats": ranking_stats,
             "rankingStatsByRegion": ranking_stats_by_region,
+            "newbieRankingStats": newbie_ranking_stats,
+            "newbieRankingStatsByRegion": newbie_ranking_stats_by_region,
             "communityStats": community_stats,
         }
 

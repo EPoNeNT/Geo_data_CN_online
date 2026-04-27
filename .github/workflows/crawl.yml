@@ -88,13 +88,22 @@ jobs:
         timeout-minutes: 360
         env:
           LOG_TO_FILE: '1'
+
+      - name: Crawl missing user registration dates
+        if: github.event.inputs.mode == 'both' || github.event_name == 'schedule'
+        run: python crawl_user_regdates.py
+        timeout-minutes: 360
+        env:
+          LOG_TO_FILE: '1'
       
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: crawl-logs-logs
-          path: crawl_logs.log
+          path: |
+            crawl_logs.log
+            crawl_user_regdates.log
 
   generate-data:
     runs-on: ubuntu-latest

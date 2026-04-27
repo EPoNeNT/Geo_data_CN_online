@@ -26,7 +26,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from runtime_utils import require_env, setup_logging
+from runtime_utils import looks_like_login_page, require_env, setup_logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
@@ -119,15 +119,14 @@ AVATAR_PROFILE_URL = "https://www.geocaching.com/p/default.aspx"
 AVATAR_MAX_RETRIES = int(os.getenv("AVATAR_MAX_RETRIES", "3"))
 AVATAR_FETCH_DELAY_SECONDS = float(os.getenv("AVATAR_FETCH_DELAY_SECONDS", "0.4"))
 AVATAR_REQUEST_TIMEOUT_SECONDS = int(os.getenv("AVATAR_REQUEST_TIMEOUT_SECONDS", "15"))
-AVATAR_NEGATIVE_CACHE_TTL_DAYS = int(os.getenv("AVATAR_NEGATIVE_CACHE_TTL_DAYS", "30"))
 AVATAR_UPSERT_BATCH_SIZE = int(os.getenv("AVATAR_UPSERT_BATCH_SIZE", "100"))
 AVATAR_URL_PATTERNS = [
     re.compile(
-        r"profile-image-wrapper.*?url\('(https://img\.geocaching\.com/user/square250/.*?\.(?:jpg|png))'\)",
+        r"profile-image-wrapper.*?url\((?:'|\")?(https://img\.geocaching\.com/user/square250/[^'\")]+?\.(?:jpg|png)(?:\?[^'\")]*)?)(?:'|\")?\)",
         re.DOTALL | re.IGNORECASE,
     ),
     re.compile(
-        r"https://img\.geocaching\.com/user/square250/[a-f0-9\-]+\.(?:jpg|png)",
+        r"https://img\.geocaching\.com/user/square250/[^'\"\s<>)]*?\.(?:jpg|png)(?:\?[^'\"\s<>)]*)?",
         re.IGNORECASE,
     ),
 ]
@@ -235,14 +234,15 @@ class DataGenerator:
           user_name TEXT PRIMARY KEY,
           avatar_url TEXT NOT NULL,
           avatar_status TEXT NOT NULL DEFAULT 'real',
-          checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         ALTER TABLE user_avatars
           ADD COLUMN IF NOT EXISTS avatar_status TEXT NOT NULL DEFAULT 'real';
         ALTER TABLE user_avatars
           ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+        ALTER TABLE user_avatars
+          DROP COLUMN IF EXISTS created_at,
+          DROP COLUMN IF EXISTS updated_at;
         """
         self.execute_write(query)
 
@@ -284,18 +284,16 @@ class DataGenerator:
           user_name,
           avatar_url,
           COALESCE(avatar_status, 'real') AS avatar_status,
-          checked_at,
-          checked_at >= NOW() - (%s::int * INTERVAL '1 day') AS is_fresh
+          checked_at
         FROM user_avatars
         WHERE user_name = ANY(%s);
         """
-        rows = self.execute_query(query, (AVATAR_NEGATIVE_CACHE_TTL_DAYS, unique_names))
+        rows = self.execute_query(query, (unique_names,))
         return {
             row["user_name"]: {
                 "avatar_url": row["avatar_url"],
                 "avatar_status": row.get("avatar_status") or "real",
                 "checked_at": row.get("checked_at"),
-                "is_fresh": bool(row.get("is_fresh")),
             }
             for row in rows
         }
@@ -314,11 +312,8 @@ class DataGenerator:
         rows = []
         for user_name, value in avatar_entries.items():
             avatar_url, avatar_status = value
-            if avatar_status == "real" and not is_real_avatar_url(avatar_url):
-                avatar_url = DEFAULT_AVATAR_URL
-                avatar_status = "failed"
-            if avatar_status != "real":
-                avatar_url = DEFAULT_AVATAR_URL
+            if avatar_status != "real" or not is_real_avatar_url(avatar_url):
+                continue
             rows.append((user_name, avatar_url, avatar_status))
 
         if not rows:
@@ -332,8 +327,7 @@ class DataGenerator:
         ON CONFLICT (user_name) DO UPDATE
         SET avatar_url = EXCLUDED.avatar_url,
             avatar_status = EXCLUDED.avatar_status,
-            checked_at = NOW(),
-            updated_at = NOW();
+            checked_at = NOW();
         """
         try:
             batch_size = max(1, AVATAR_UPSERT_BATCH_SIZE)
@@ -399,6 +393,10 @@ class DataGenerator:
                     timeout=AVATAR_REQUEST_TIMEOUT_SECONDS,
                 )
                 if response.status_code == 200:
+                    if looks_like_login_page(response.url, response.text):
+                        logger.warning(f"Avatar request for {user_name} returned a login page")
+                        continue
+
                     avatar_url = self.parse_avatar_url(response.text)
                     result = "real" if is_real_avatar_url(avatar_url) else "default"
                     logger.info(
@@ -427,21 +425,16 @@ class DataGenerator:
             for name, entry in cache_entries.items()
             if entry.get("avatar_status") == "real" and is_real_avatar_url(entry.get("avatar_url"))
         }
-        fresh_negative_names = {
-            name
-            for name, entry in cache_entries.items()
-            if entry.get("avatar_status") in {"default", "failed"} and entry.get("is_fresh")
-        }
         missing_names = [
             name
             for name in unique_names
-            if name not in cached_urls and name not in fresh_negative_names
+            if name not in cached_urls
         ]
 
         logger.info(
             "Avatar cache status: "
-            f"{len(cached_urls)} real cached, {len(fresh_negative_names)} fresh negative cached, "
-            f"{len(missing_names)} uncached/stale, "
+            f"{len(cached_urls)} real cached, "
+            f"{len(missing_names)} uncached/invalid, "
             f"{len(unique_names)} total unique users"
         )
 

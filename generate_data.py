@@ -18,12 +18,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from runtime_utils import looks_like_login_page, require_env, setup_logging
@@ -360,7 +354,10 @@ class DataGenerator:
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         }
-        cookie = os.getenv("GEOCACHING_COOKIE") or os.getenv("GEOCACHING_COOKIES")
+        cookie = (
+            os.getenv("GEOCOOKIE_PREMIUM")
+            or os.getenv("GEOCOOKIE_NONPREMIUM")
+        )
         if cookie:
             headers["Cookie"] = cookie
         session.headers.update(headers)

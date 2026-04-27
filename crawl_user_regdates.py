@@ -171,20 +171,19 @@ def ensure_user_table(conn) -> None:
             CREATE TABLE IF NOT EXISTS "user" (
               user_name TEXT PRIMARY KEY,
               registration_date DATE,
-              registration_date_raw TEXT,
-              fetch_status TEXT NOT NULL DEFAULT 'pending',
-              checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+              fetch_status TEXT NOT NULL DEFAULT 'pending'
             );
             """
         )
         cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS registration_date DATE;')
-        cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS registration_date_raw TEXT;')
         cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS fetch_status TEXT NOT NULL DEFAULT \'pending\';')
-        cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW();')
-        cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();')
-        cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();')
+        cur.execute(
+            'ALTER TABLE "user" '
+            'DROP COLUMN IF EXISTS registration_date_raw, '
+            'DROP COLUMN IF EXISTS checked_at, '
+            'DROP COLUMN IF EXISTS created_at, '
+            'DROP COLUMN IF EXISTS updated_at;'
+        )
         cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS user_user_name_unique_idx ON "user" (user_name);')
     conn.commit()
 
@@ -273,14 +272,11 @@ def upsert_results(conn, results: list[dict]) -> None:
         return
 
     query = """
-    INSERT INTO "user" (user_name, registration_date, registration_date_raw, fetch_status, checked_at)
-    VALUES (%(user_name)s, %(registration_date)s, %(registration_date_raw)s, %(fetch_status)s, NOW())
+    INSERT INTO "user" (user_name, registration_date, fetch_status)
+    VALUES (%(user_name)s, %(registration_date)s, %(fetch_status)s)
     ON CONFLICT (user_name) DO UPDATE
     SET registration_date = EXCLUDED.registration_date,
-        registration_date_raw = EXCLUDED.registration_date_raw,
-        fetch_status = EXCLUDED.fetch_status,
-        checked_at = NOW(),
-        updated_at = NOW();
+        fetch_status = EXCLUDED.fetch_status;
     """
     with conn.cursor() as cur:
         execute_batch(cur, query, results)
@@ -348,7 +344,6 @@ def main() -> None:
                     {
                         "user_name": user_name,
                         "registration_date": registration_date,
-                        "registration_date_raw": raw_date,
                         "fetch_status": status,
                     }
                 )

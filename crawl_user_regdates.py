@@ -32,6 +32,7 @@ DEFAULT_MAX_RETRIES = int(os.getenv("USER_REGDATE_MAX_RETRIES", "3"))
 DEFAULT_DELAY_SECONDS = float(os.getenv("USER_REGDATE_DELAY_SECONDS", "1.6"))
 DEFAULT_BATCH_SIZE = int(os.getenv("USER_REGDATE_BATCH_SIZE", "50"))
 DEFAULT_LIMIT = os.getenv("USER_REGDATE_LIMIT")
+MIN_LOG_COUNT_FOR_REGDATE_FETCH = 10
 
 JOINED_PATTERNS = (
     re.compile(
@@ -189,7 +190,7 @@ def ensure_user_table(conn) -> None:
 
 
 def get_usernames_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> list[str]:
-    """Read distinct log usernames that need a registration date fetch."""
+    """Read log usernames above the minimum log count that need a registration date fetch."""
     if include_non_ok:
         user_filter = "(u.user_name IS NULL OR COALESCE(u.fetch_status, '') <> 'ok')"
     else:
@@ -202,30 +203,43 @@ def get_usernames_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> 
         params.append(limit)
 
     query = f"""
-    SELECT DISTINCT TRIM(l.user_name) AS user_name
-    FROM logs l
-    LEFT JOIN "user" u ON u.user_name = TRIM(l.user_name)
-    WHERE l.user_name IS NOT NULL
-      AND TRIM(l.user_name) <> ''
+    WITH log_users AS (
+      SELECT TRIM(user_name) AS user_name, COUNT(*)::int AS log_count
+      FROM logs
+      WHERE user_name IS NOT NULL
+        AND TRIM(user_name) <> ''
+      GROUP BY TRIM(user_name)
+      HAVING COUNT(*) > %s
+    )
+    SELECT log_users.user_name
+    FROM log_users
+    LEFT JOIN "user" u ON u.user_name = log_users.user_name
+    WHERE 1 = 1
       AND {user_filter}
-    ORDER BY user_name
+    ORDER BY log_users.user_name
     {limit_clause};
     """
     with conn.cursor() as cur:
-        cur.execute(query, params)
+        cur.execute(query, [MIN_LOG_COUNT_FOR_REGDATE_FETCH, *params])
         return [row["user_name"] for row in cur.fetchall()]
 
 
 def get_distinct_log_user_count(conn) -> int:
-    """Count distinct non-empty log usernames."""
+    """Count distinct non-empty log usernames above the minimum log count."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COUNT(DISTINCT TRIM(user_name))::int AS count
-            FROM logs
-            WHERE user_name IS NOT NULL
-              AND TRIM(user_name) <> '';
-            """
+            SELECT COUNT(*)::int AS count
+            FROM (
+              SELECT TRIM(user_name) AS user_name
+              FROM logs
+              WHERE user_name IS NOT NULL
+                AND TRIM(user_name) <> ''
+              GROUP BY TRIM(user_name)
+              HAVING COUNT(*) > %s
+            ) log_users;
+            """,
+            (MIN_LOG_COUNT_FOR_REGDATE_FETCH,),
         )
         return cur.fetchone()["count"] or 0
 
@@ -270,7 +284,7 @@ def main() -> None:
     try:
         if args.dry_run:
             total_users = get_distinct_log_user_count(conn)
-            logger.info("Distinct logs users: %s", total_users)
+            logger.info("Distinct logs users with more than %s logs: %s", MIN_LOG_COUNT_FOR_REGDATE_FETCH, total_users)
             return
 
         ensure_user_table(conn)

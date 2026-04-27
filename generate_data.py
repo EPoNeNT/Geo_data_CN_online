@@ -135,6 +135,10 @@ REAL_AVATAR_URL_PATTERN = re.compile(
     r"^https://img\.geocaching\.com/user/square250/.+\.(?:jpg|png)(?:\?.*)?$",
     re.IGNORECASE,
 )
+NEWBIE_REGISTRATION_FILTER = (
+    "u.registration_date >= CURRENT_DATE - INTERVAL '1 year' "
+    "AND u.registration_date <= CURRENT_DATE"
+)
 
 
 def sql_literal(value: str) -> str:
@@ -910,7 +914,7 @@ class DataGenerator:
         country_filter: Optional[str] = None,
     ) -> str:
         """Generate player count query for rankingStats without leaderboard limits."""
-        date_col = "c.placed_date" if ranking_type == "hides" else "l.visited"
+        date_col = "c.placed_date" if ranking_type in {"hides", "newbieHides"} else "l.visited"
         date_condition = self.generate_ranking_stats_date_condition(
             time_range,
             date_col,
@@ -928,6 +932,24 @@ class DataGenerator:
               FROM logs l
               JOIN caches c ON c.code = l.gc_code
               WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+                AND {date_condition}
+                AND {EXCLUDE_CACHE_JOIN}
+                {country_condition}
+              GROUP BY l.user_name
+              HAVING COUNT(DISTINCT l.gc_code) > 0
+            ) ranked;
+            """
+
+        if ranking_type == "newbieFinds":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
+              FROM logs l
+              JOIN caches c ON c.code = l.gc_code
+              JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
+              WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+                AND {NEWBIE_REGISTRATION_FILTER}
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_JOIN}
                 {country_condition}
@@ -960,6 +982,23 @@ class DataGenerator:
               SELECT c.owner_username AS name, COUNT(*)::int AS score
               FROM caches c
               WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                AND {date_condition}
+                AND {EXCLUDE_CACHE_WHERE}
+                {country_condition}
+              GROUP BY c.owner_username
+              HAVING COUNT(*) > 0
+            ) ranked;
+            """
+
+        if ranking_type == "newbieHides":
+            return f"""
+            SELECT COUNT(*)::int AS player_count
+            FROM (
+              SELECT c.owner_username AS name, COUNT(*)::int AS score
+              FROM caches c
+              JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
+              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                AND {NEWBIE_REGISTRATION_FILTER}
                 AND {date_condition}
                 AND {EXCLUDE_CACHE_WHERE}
                 {country_condition}
@@ -1099,6 +1138,25 @@ class DataGenerator:
                 LIMIT {limit};
                 """
 
+        elif ranking_type == "newbieFinds":
+            if is_city_ranking:
+                raise ValueError("Newbie finds ranking is only supported for player rankings")
+
+            return f"""
+            SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND {NEWBIE_REGISTRATION_FILTER}
+              AND l.visited {date_filter}
+              AND {EXCLUDE_CACHE_JOIN}
+              {country_condition}
+            GROUP BY l.user_name
+            ORDER BY score DESC, l.user_name ASC
+            LIMIT {limit};
+            """
+
         elif ranking_type == "ftf":
             if is_city_ranking:
                 raise ValueError("FTF ranking is only supported for player rankings")
@@ -1189,6 +1247,24 @@ class DataGenerator:
                 LIMIT {limit};
                 """
 
+        elif ranking_type == "newbieHides":
+            if is_city_ranking:
+                raise ValueError("Newbie hides ranking is only supported for player rankings")
+
+            return f"""
+            SELECT c.owner_username AS name, COUNT(*)::int AS score
+            FROM caches c
+            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
+            WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+              AND {NEWBIE_REGISTRATION_FILTER}
+              AND c.placed_date {date_filter}
+              AND {EXCLUDE_CACHE_WHERE}
+              {country_condition}
+            GROUP BY c.owner_username
+            ORDER BY score DESC, c.owner_username ASC
+            LIMIT {limit};
+            """
+
         raise ValueError(f"Unknown ranking type: {ranking_type}")
 
     def generate_previous_period_query(
@@ -1212,7 +1288,7 @@ class DataGenerator:
         if ranking_type == "favorites":
             date_col = "l.visited"
             exclude_clause = "EXCLUDE_CACHE_JOIN"
-        elif ranking_type == "hides":
+        elif ranking_type in {"hides", "newbieHides"}:
             date_col = "c.placed_date"
             exclude_clause = "EXCLUDE_CACHE_WHERE"
         else:
@@ -1311,6 +1387,25 @@ class DataGenerator:
                 LIMIT {limit};
                 """
 
+        elif ranking_type == "newbieFinds":
+            if is_city_ranking:
+                raise ValueError("Newbie finds ranking is only supported for player rankings")
+
+            return f"""
+            SELECT l.user_name AS name, COUNT(DISTINCT l.gc_code)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND {NEWBIE_REGISTRATION_FILTER}
+              {date_filter}
+              AND {EXCLUDE_CACHE_JOIN}
+              {country_condition}
+            GROUP BY l.user_name
+            ORDER BY score DESC, l.user_name ASC
+            LIMIT {limit};
+            """
+
         elif ranking_type == "ftf":
             if is_city_ranking:
                 raise ValueError("FTF ranking is only supported for player rankings")
@@ -1400,6 +1495,24 @@ class DataGenerator:
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
                 """
+
+        elif ranking_type == "newbieHides":
+            if is_city_ranking:
+                raise ValueError("Newbie hides ranking is only supported for player rankings")
+
+            return f"""
+            SELECT c.owner_username AS name, COUNT(*)::int AS score
+            FROM caches c
+            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
+            WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+              AND {NEWBIE_REGISTRATION_FILTER}
+              {date_filter}
+              AND {EXCLUDE_CACHE_WHERE}
+              {country_condition}
+            GROUP BY c.owner_username
+            ORDER BY score DESC, c.owner_username ASC
+            LIMIT {limit};
+            """
 
         raise ValueError(f"Unknown ranking type: {ranking_type}")
 
@@ -1653,7 +1766,7 @@ class DataGenerator:
         """Generate complete player-rankings.json data."""
         logger.info("Generating player-rankings.json...")
 
-        ranking_types = ["finds", "ftf", "hides", "logs", "favorites"]
+        ranking_types = ["finds", "ftf", "hides", "logs", "favorites", "newbieFinds", "newbieHides"]
         time_ranges = ["30d", "ytd", "all"]
         rankings_by_region = self.generate_rankings_by_region(
             ranking_types,

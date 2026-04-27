@@ -547,10 +547,10 @@ def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float) -
     return None
 
 
-def check_cache_status(gc_code: str) -> Optional[int]:
-    """检查单个 cache 的状态"""
+def fetch_cache_preview(gc_code: str) -> Optional[dict]:
+    """按 GC code 获取单个 cache 的预览数据。"""
     api_url = f"https://www.geocaching.com/api/live/v1/search/geocachepreview/{gc_code}"
-    
+
     headers = {
         "accept": "application/json",
         "cookie": COOKIE,
@@ -562,19 +562,32 @@ def check_cache_status(gc_code: str) -> Optional[int]:
         try:
             response = session.get(api_url, headers=headers, timeout=15)
             if response.status_code == 200:
-                data = response.json()
-                return data.get('cacheStatus')
+                return response.json()
             elif response.status_code == 403:
                 time.sleep(10 * (attempt + 1))
             elif response.status_code == 429:
                 time.sleep(60)
         except Exception:
             time.sleep(10 * (attempt + 1))
-    
+
     return None
 
 
-def process_cache_item(item: dict, min_lat: float, max_lat: float, min_lng: float, max_lng: float) -> Optional[dict]:
+def check_cache_status(gc_code: str) -> Optional[int]:
+    """检查单个 cache 的状态"""
+    data = fetch_cache_preview(gc_code)
+    if not data:
+        return None
+    return data.get('cacheStatus')
+
+
+def process_cache_item(
+    item: dict,
+    min_lat: Optional[float] = None,
+    max_lat: Optional[float] = None,
+    min_lng: Optional[float] = None,
+    max_lng: Optional[float] = None,
+) -> Optional[dict]:
     """处理单个 cache 项"""
     cache_lat = item.get('postedCoordinates', {}).get('latitude')
     cache_lng = item.get('postedCoordinates', {}).get('longitude')
@@ -587,20 +600,22 @@ def process_cache_item(item: dict, min_lat: float, max_lat: float, min_lng: floa
     
     # 检查是否是 premium_only
     is_premium = item.get('premiumOnly') == True or item.get('premiumOnly') == 'TRUE'
-    
-    # 如果不是 premium_only，必须有坐标
-    if not is_premium and not all([cache_lat, cache_lng]):
-        return None
-    
-    # 检查是否在框内或是 premium
-    # premium_only 的 cache 没有坐标，所以跳过坐标检查
-    if is_premium:
-        is_in_box = False
-    else:
-        is_in_box = (min_lat <= cache_lat <= max_lat) and (min_lng <= cache_lng <= max_lng)
-    
-    if not (is_in_box or is_premium):
-        return None
+
+    has_bounds = all(value is not None for value in (min_lat, max_lat, min_lng, max_lng))
+    if has_bounds:
+        # 如果不是 premium_only，必须有坐标
+        if not is_premium and not all([cache_lat, cache_lng]):
+            return None
+
+        # 检查是否在框内或是 premium
+        # premium_only 的 cache 没有坐标，所以跳过坐标检查
+        if is_premium:
+            is_in_box = False
+        else:
+            is_in_box = (min_lat <= cache_lat <= max_lat) and (min_lng <= cache_lng <= max_lng)
+
+        if not (is_in_box or is_premium):
+            return None
     
     if country not in ALLOWED_COUNTRIES:
         return None
@@ -900,33 +915,80 @@ def run_crawler():
         logger.info(f"Potential Archived: {len(archived_codes)}")
         
         if archived_codes:
-            # 批量从数据库查询这些缓存的当前状态
-            logger.info("批量查询潜在归档缓存的状态...")
-            current_statuses = db.get_cache_statuses_batch(archived_codes[:100])  # 限制检查数量
-            
-            confirmed_archived = []
-            for gc_code in archived_codes[:100]:
-                # 检查数据库中的当前状态是否已经是 archive (2)
-                if current_statuses.get(gc_code) != 2:
-                    # 如果数据库中不是archive状态，则调用API确认
-                    status = check_cache_status(gc_code)
-                    if status == 2:
-                        confirmed_archived.append(gc_code)
-                        logger.info(f"  {gc_code} 已确认 Archive")
-                    else:
-                        logger.info(f"  {gc_code} 状态: {status}")
+            logger.info("逐个检查潜在归档缓存的最新字段...")
+
+            potential_updates = []
+            status_only_updates = []
+            unchanged_potential = 0
+            failed_preview_count = 0
+
+            for gc_code in archived_codes:
+                preview_data = fetch_cache_preview(gc_code)
+                if not preview_data:
+                    failed_preview_count += 1
+                    logger.warning(f"  {gc_code} 获取预览数据失败，跳过字段更新")
                     time.sleep(random.uniform(0.5, 1.0))
+                    continue
+
+                status = preview_data.get('cacheStatus')
+                cache_data = process_cache_item(preview_data)
+                existing_cache = scanned_data.get(gc_code)
+
+                if cache_data and existing_cache:
+                    cache_record = dict(cache_data)
+                    if (
+                        cache_record.get('premium_only', False)
+                        or cache_record.get('latitude') is None
+                        or cache_record.get('longitude') is None
+                    ):
+                        cache_record['latitude'] = existing_cache.get('latitude')
+                        cache_record['longitude'] = existing_cache.get('longitude')
+
+                    if cache_metadata_changed(existing_cache, cache_record):
+                        potential_updates.append(cache_record)
+                        updated_codes.add(gc_code)
+                        scanned_data[gc_code] = cache_record
+                        if cache_record.get('cache_status') == 2:
+                            logger.info(f"  {gc_code} 已确认 Archive，字段有更新")
+                        else:
+                            logger.info(f"  {gc_code} 状态: {status}，字段有更新")
+                    else:
+                        unchanged_potential += 1
+                        if status == 2:
+                            logger.info(f"  {gc_code} 已确认 Archive，字段无变化")
+                        else:
+                            logger.info(f"  {gc_code} 状态: {status}，字段无变化")
+                elif status is not None and existing_cache and status != existing_cache.get('cache_status'):
+                    status_only_updates.append((gc_code, status))
+                    updated_codes.add(gc_code)
+                    logger.info(f"  {gc_code} 无法解析完整字段，仅更新状态为 {status}")
                 else:
-                    # 数据库中已经是archive状态，无需更新
-                    logger.info(f"  {gc_code} 已在数据库中标记为 Archive")
-            
-            # 批量更新确认归档的缓存
-            if confirmed_archived:
-                logger.info(f"批量更新 {len(confirmed_archived)} 个已归档缓存...")
-                for gc_code in confirmed_archived:
-                    db.update_cache_status(gc_code, 2)
+                    unchanged_potential += 1
+                    logger.info(f"  {gc_code} 状态: {status}，未发现可更新字段")
+
+                time.sleep(random.uniform(0.5, 1.0))
+
+            if potential_updates:
+                logger.info(f"批量更新 {len(potential_updates)} 个潜在归档缓存的完整字段...")
+                db.upsert_caches_batch(potential_updates)
+
+            if status_only_updates:
+                logger.info(f"更新 {len(status_only_updates)} 个潜在归档缓存的状态字段...")
+                for gc_code, status in status_only_updates:
+                    db.update_cache_status(gc_code, status)
+
+            if potential_updates or status_only_updates:
                 db.commit()
-                logger.info(f"已更新 {len(confirmed_archived)} 个已归档缓存")
+                logger.info(
+                    f"潜在归档缓存字段检查完成：完整更新 {len(potential_updates)} 个，"
+                    f"仅状态更新 {len(status_only_updates)} 个，无变化 {unchanged_potential} 个，"
+                    f"预览失败 {failed_preview_count} 个"
+                )
+            else:
+                logger.info(
+                    f"潜在归档缓存字段检查完成：无变化 {unchanged_potential} 个，"
+                    f"预览失败 {failed_preview_count} 个"
+                )
         
         logger.info("=" * 50)
         logger.info(f"本轮爬取完成! 新增: {len(new_codes)}, 更新: {len(updated_codes)}")

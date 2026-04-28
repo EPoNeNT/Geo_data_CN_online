@@ -51,6 +51,7 @@ REGION_COUNTRY_MAP = {
 }
 
 DT_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]
+RANKING_TIME_RANGES = ["30d", "ytd", "active", "all"]
 
 # Cache filters. Most statistics include archived caches, but D/T matrices and
 # active yearly trend counts still exclude them.
@@ -555,6 +556,15 @@ class DataGenerator:
             }
         return {"totalCaches": 0, "totalFinders": 0, "totalOwners": 0, "totalLogs": 0}
 
+    def generate_active_cache_count(self, country_filter: Optional[str] = None) -> int:
+        """Generate active cache count for region distribution cards."""
+        where_clause = f"WHERE {ACTIVE_CACHE_WHERE}"
+        if country_filter:
+            where_clause += f" AND c.country = {sql_literal(country_filter)}"
+
+        result = self.execute_query(f"SELECT COUNT(*)::int AS count FROM caches c {where_clause};")
+        return result[0]["count"] if result else 0
+
     def generate_yearly_trend(self, country_filter: Optional[str] = None) -> List[Dict]:
         """Generate yearly trend data."""
         where_clause = f"WHERE {EXCLUDE_CACHE_WHERE}"
@@ -782,7 +792,7 @@ class DataGenerator:
             heatmap = self.generate_heatmap(country)
             dt_matrix = self.generate_dt_matrix(country)
 
-            total_caches = metrics["totalCaches"]
+            total_caches = self.generate_active_cache_count(country)
 
             # Calculate percentage (will be updated after getting total)
             regions_list.append({
@@ -881,8 +891,10 @@ class DataGenerator:
                 return f"{date_col} >= CURRENT_DATE - INTERVAL '30 day'"
             if time_range == "ytd":
                 return f"{date_col} >= date_trunc('year', CURRENT_DATE)::date"
+            if time_range == "active":
+                return "TRUE"
             if time_range == "all":
-                return f"{date_col} IS NOT NULL"
+                return "TRUE"
             raise ValueError(f"Unknown time range: {time_range}")
 
         if time_range == "30d":
@@ -895,8 +907,18 @@ class DataGenerator:
                 f"{date_col} >= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date "
                 f"AND {date_col} < ((CURRENT_DATE - INTERVAL '1 year')::date + INTERVAL '1 day')"
             )
+        if time_range == "active":
+            return f"{date_col} < CURRENT_DATE"
         if time_range == "all":
             return f"{date_col} < date_trunc('year', CURRENT_DATE)::date"
+        raise ValueError(f"Unknown time range: {time_range}")
+
+    def generate_ranking_cache_condition(self, time_range: str, join_clause: bool = True) -> str:
+        """Return cache scope filter for ranking time ranges."""
+        if time_range in {"30d", "ytd", "active"}:
+            return ACTIVE_CACHE_JOIN if join_clause else ACTIVE_CACHE_WHERE
+        if time_range == "all":
+            return EXCLUDE_CACHE_JOIN if join_clause else EXCLUDE_CACHE_WHERE
         raise ValueError(f"Unknown time range: {time_range}")
 
     def generate_ranking_count_query(
@@ -913,6 +935,8 @@ class DataGenerator:
             date_col,
             previous=previous,
         )
+        cache_join_condition = self.generate_ranking_cache_condition(time_range, join_clause=True)
+        cache_where_condition = self.generate_ranking_cache_condition(time_range, join_clause=False)
         country_condition = ""
         if country_filter:
             country_condition = f"AND c.country = {sql_literal(country_filter)}"
@@ -926,7 +950,7 @@ class DataGenerator:
               JOIN caches c ON c.code = l.gc_code
               WHERE l.user_name IS NOT NULL AND l.user_name <> ''
                 AND {date_condition}
-                AND {EXCLUDE_CACHE_JOIN}
+                AND {cache_join_condition}
                 {country_condition}
               GROUP BY l.user_name
               HAVING COUNT(DISTINCT l.gc_code) > 0
@@ -943,7 +967,7 @@ class DataGenerator:
               WHERE l.user_name IS NOT NULL AND l.user_name <> ''
                 AND l.is_ftf IS TRUE
                 AND {date_condition}
-                AND {EXCLUDE_CACHE_JOIN}
+                AND {cache_join_condition}
                 {country_condition}
               GROUP BY l.user_name
               HAVING COUNT(*) > 0
@@ -958,7 +982,7 @@ class DataGenerator:
               FROM caches c
               WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                 AND {date_condition}
-                AND {EXCLUDE_CACHE_WHERE}
+                AND {cache_where_condition}
                 {country_condition}
               GROUP BY c.owner_username
               HAVING COUNT(*) > 0
@@ -976,7 +1000,7 @@ class DataGenerator:
                 AND l.user_name IS NOT NULL
                 AND LOWER(l.user_name) <> LOWER(c.owner_username)
                 AND {date_condition}
-                AND {EXCLUDE_CACHE_JOIN}
+                AND {cache_join_condition}
                 {country_condition}
               GROUP BY c.owner_username
               HAVING COUNT(l.*) > 0
@@ -993,7 +1017,7 @@ class DataGenerator:
               WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                 AND l.favorite_point_used IS TRUE
                 AND {date_condition}
-                AND {EXCLUDE_CACHE_JOIN}
+                AND {cache_join_condition}
                 {country_condition}
               GROUP BY c.owner_username
               HAVING COUNT(l.*) > 0
@@ -1011,22 +1035,10 @@ class DataGenerator:
         country_filter: Optional[str] = None,
     ) -> str:
         """Generate SQL query for rankings based on type and time range."""
-
-        # Base date filter
-        if time_range == "30d":
-            date_filter = ">= CURRENT_DATE - INTERVAL '30 day'"
-        elif time_range == "ytd":
-            date_filter = ">= date_trunc('year', CURRENT_DATE)::date"
-        else:  # all
-            date_filter = "IS NOT NULL"  # No filter
-
-        # Previous period filter for trend calculation
-        if time_range == "30d":
-            prev_date_filter = ">= CURRENT_DATE - INTERVAL '60 day' AND < CURRENT_DATE - INTERVAL '30 day'"
-        elif time_range == "ytd":
-            prev_date_filter = ">= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date AND < date_trunc('year', CURRENT_DATE)::date"
-        else:
-            prev_date_filter = "IS NOT NULL"
+        cache_join_condition = self.generate_ranking_cache_condition(time_range, join_clause=True)
+        cache_where_condition = self.generate_ranking_cache_condition(time_range, join_clause=False)
+        placed_date_condition = self.generate_ranking_stats_date_condition(time_range, "c.placed_date")
+        visited_date_condition = self.generate_ranking_stats_date_condition(time_range, "l.visited")
 
         country_condition = ""
         if country_filter:
@@ -1042,8 +1054,8 @@ class DataGenerator:
                     c.country AS subtitle
                   FROM caches c
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND c.placed_date {date_filter}
-                    AND {EXCLUDE_CACHE_WHERE}
+                    AND {placed_date_condition}
+                    AND {cache_where_condition}
                     {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -1055,8 +1067,8 @@ class DataGenerator:
                 SELECT owner_username AS name, COUNT(*)::int AS score
                 FROM caches c
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
-                  AND c.placed_date {date_filter}
-                  AND {EXCLUDE_CACHE_WHERE}
+                  AND {placed_date_condition}
+                  AND {cache_where_condition}
                   {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -1074,8 +1086,8 @@ class DataGenerator:
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                    AND l.visited {date_filter}
-                    AND {EXCLUDE_CACHE_JOIN}
+                    AND {visited_date_condition}
+                    AND {cache_join_condition}
                     {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -1088,8 +1100,8 @@ class DataGenerator:
                 FROM logs l
                 JOIN caches c ON c.code = l.gc_code
                 WHERE l.user_name IS NOT NULL AND l.user_name <> ''
-                  AND l.visited {date_filter}
-                  AND {EXCLUDE_CACHE_JOIN}
+                  AND {visited_date_condition}
+                  AND {cache_join_condition}
                   {country_condition}
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
@@ -1106,8 +1118,8 @@ class DataGenerator:
             JOIN caches c ON c.code = l.gc_code
             WHERE l.user_name IS NOT NULL AND l.user_name <> ''
               AND l.is_ftf IS TRUE
-              AND l.visited {date_filter}
-              AND {EXCLUDE_CACHE_JOIN}
+              AND {visited_date_condition}
+              AND {cache_join_condition}
               {country_condition}
             GROUP BY l.user_name
             ORDER BY score DESC, l.user_name ASC
@@ -1126,8 +1138,8 @@ class DataGenerator:
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     AND l.favorite_point_used IS TRUE
-                    AND l.visited {date_filter}
-                    AND {EXCLUDE_CACHE_JOIN}
+                    AND {visited_date_condition}
+                    AND {cache_join_condition}
                     {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -1141,8 +1153,8 @@ class DataGenerator:
                 JOIN logs l ON l.gc_code = c.code
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                   AND l.favorite_point_used IS TRUE
-                  AND l.visited {date_filter}
-                  AND {EXCLUDE_CACHE_JOIN}
+                  AND {visited_date_condition}
+                  AND {cache_join_condition}
                   {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -1160,8 +1172,8 @@ class DataGenerator:
                   FROM logs l
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
-                  AND l.visited {date_filter}
-                  AND {EXCLUDE_CACHE_JOIN}
+                    AND {visited_date_condition}
+                    AND {cache_join_condition}
                   {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -1178,8 +1190,8 @@ class DataGenerator:
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                   AND l.user_name IS NOT NULL
                   AND LOWER(l.user_name) <> LOWER(c.owner_username)
-                  AND l.visited {date_filter}
-                  AND {EXCLUDE_CACHE_JOIN}
+                  AND {visited_date_condition}
+                  AND {cache_join_condition}
                   {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -1200,44 +1212,19 @@ class DataGenerator:
 
         Previous period definitions:
         - 30d: Previous 30-60 days
-        - ytd: Last full calendar year (Jan 1 to Dec 31)
+        - ytd: Last year's year-to-date period
+        - active: Active caches/logs up to yesterday
         - all: All time up to end of last year (Dec 31)
         """
-
-        # Determine date column and table alias based on ranking type.
-        # City favorites count favorite logs by visited date.
-        if ranking_type == "favorites":
-            date_col = "l.visited"
-            exclude_clause = "EXCLUDE_CACHE_JOIN"
-        elif ranking_type == "hides":
-            date_col = "c.placed_date"
-            exclude_clause = "EXCLUDE_CACHE_WHERE"
-        else:
-            date_col = "l.visited"
-            exclude_clause = "EXCLUDE_CACHE_JOIN"
-
-        # Previous period date filter with proper column name
-        if time_range == "30d":
-            # Previous 30-day window (days 30-60 ago)
-            prev_start = "CURRENT_DATE - INTERVAL '60 day'"
-            prev_end = "CURRENT_DATE - INTERVAL '30 day'"
-        elif time_range == "ytd":
-            # Last full calendar year (Jan 1 to Dec 31 of last year)
-            prev_start = "date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date"
-            prev_end = "date_trunc('year', CURRENT_DATE)::date"
-        elif time_range == "all":
-            # All time up to end of last year (Dec 31)
-            prev_start = None  # No lower bound
-            prev_end = "date_trunc('year', CURRENT_DATE)::date"
-        else:
-            raise ValueError(f"Unknown time range: {time_range}")
-
-        # Build date filter conditions
-        if prev_start:
-            date_filter = f"AND {date_col} >= {prev_start}\n                  AND {date_col} < {prev_end}"
-        else:
-            # No lower bound (for 'all' time range)
-            date_filter = f"AND {date_col} < {prev_end}"
+        date_col = "c.placed_date" if ranking_type == "hides" else "l.visited"
+        date_condition = self.generate_ranking_stats_date_condition(
+            time_range,
+            date_col,
+            previous=True,
+        )
+        date_filter = f"AND {date_condition}"
+        cache_join_condition = self.generate_ranking_cache_condition(time_range, join_clause=True)
+        cache_where_condition = self.generate_ranking_cache_condition(time_range, join_clause=False)
 
         country_condition = ""
         if country_filter:
@@ -1255,7 +1242,7 @@ class DataGenerator:
                   FROM caches c
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     {date_filter}
-                    AND {EXCLUDE_CACHE_WHERE}
+                    AND {cache_where_condition}
                     {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -1268,7 +1255,7 @@ class DataGenerator:
                 FROM caches c
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                   {date_filter}
-                  AND {EXCLUDE_CACHE_WHERE}
+                  AND {cache_where_condition}
                   {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -1287,7 +1274,7 @@ class DataGenerator:
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     {date_filter}
-                    AND {EXCLUDE_CACHE_JOIN}
+                    AND {cache_join_condition}
                     {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -1301,7 +1288,7 @@ class DataGenerator:
                 JOIN caches c ON c.code = l.gc_code
                 WHERE l.user_name IS NOT NULL AND l.user_name <> ''
                   {date_filter}
-                  AND {EXCLUDE_CACHE_JOIN}
+                  AND {cache_join_condition}
                   {country_condition}
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
@@ -1319,7 +1306,7 @@ class DataGenerator:
             WHERE l.user_name IS NOT NULL AND l.user_name <> ''
               AND l.is_ftf IS TRUE
               {date_filter}
-              AND {EXCLUDE_CACHE_JOIN}
+              AND {cache_join_condition}
               {country_condition}
             GROUP BY l.user_name
             ORDER BY score DESC, l.user_name ASC
@@ -1339,7 +1326,7 @@ class DataGenerator:
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     AND l.favorite_point_used IS TRUE
                     {date_filter}
-                    AND {EXCLUDE_CACHE_JOIN}
+                    AND {cache_join_condition}
                     {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -1354,7 +1341,7 @@ class DataGenerator:
                 WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
                   AND l.favorite_point_used IS TRUE
                   {date_filter}
-                  AND {EXCLUDE_CACHE_JOIN}
+                  AND {cache_join_condition}
                   {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -1373,7 +1360,7 @@ class DataGenerator:
                   JOIN caches c ON c.code = l.gc_code
                   WHERE COALESCE(NULLIF(TRIM(c.city), ''), c.country) IS NOT NULL
                     {date_filter}
-                    AND {EXCLUDE_CACHE_JOIN}
+                    AND {cache_join_condition}
                     {country_condition}
                 ) AS sub
                 GROUP BY name, subtitle
@@ -1391,7 +1378,7 @@ class DataGenerator:
                   AND l.user_name IS NOT NULL
                   AND LOWER(l.user_name) <> LOWER(c.owner_username)
                   {date_filter}
-                  AND {EXCLUDE_CACHE_JOIN}
+                  AND {cache_join_condition}
                   {country_condition}
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
@@ -1859,7 +1846,7 @@ class DataGenerator:
         logger.info("Generating player-rankings.json...")
 
         ranking_types = ["finds", "ftf", "hides", "logs", "favorites"]
-        time_ranges = ["30d", "ytd", "all"]
+        time_ranges = RANKING_TIME_RANGES
         rankings_by_region = self.generate_rankings_by_region(
             ranking_types,
             time_ranges,
@@ -1914,7 +1901,8 @@ class DataGenerator:
         ),
         counts AS (
           SELECT date_trunc('month', c.placed_date)::date AS month,
-                 COUNT(*)::int AS count
+                 COUNT(*) FILTER (WHERE c.cache_status != 2)::int AS count,
+                 COUNT(*) FILTER (WHERE c.cache_status = 2)::int AS archived
           FROM caches c
           {where_clause}
             AND c.placed_date IS NOT NULL
@@ -1922,14 +1910,22 @@ class DataGenerator:
           GROUP BY 1
         )
         SELECT TO_CHAR(months.month_start, 'YYYY-MM') AS label,
-               COALESCE(counts.count, 0)::int AS count
+               COALESCE(counts.count, 0)::int AS count,
+               COALESCE(counts.archived, 0)::int AS archived
         FROM months
         LEFT JOIN counts ON counts.month = months.month_start::date
         ORDER BY months.month_start;
         """
 
         monthly_results = self.execute_query(monthly_query)
-        monthly = [{"label": row["label"], "count": row["count"] or 0} for row in monthly_results]
+        monthly = [
+            {
+                "label": row["label"],
+                "count": row["count"] or 0,
+                "archived": row["archived"] or 0,
+            }
+            for row in monthly_results
+        ]
 
         # Generate yearly data (last 10 years including current year)
         yearly_query = f"""
@@ -1940,27 +1936,40 @@ class DataGenerator:
           ) AS year
         ),
         counts AS (
-          SELECT EXTRACT(YEAR FROM placed_date)::int AS year, COUNT(*)::int AS count
+          SELECT
+            EXTRACT(YEAR FROM placed_date)::int AS year,
+            COUNT(*) FILTER (WHERE c.cache_status != 2)::int AS count,
+            COUNT(*) FILTER (WHERE c.cache_status = 2)::int AS archived
           FROM caches c
           {where_clause}
             AND c.placed_date IS NOT NULL
             AND EXTRACT(YEAR FROM placed_date)::int >= EXTRACT(YEAR FROM CURRENT_DATE)::int - 9
           GROUP BY 1
         )
-        SELECT years.year::text AS label, COALESCE(counts.count, 0)::int AS count
+        SELECT
+          years.year::text AS label,
+          COALESCE(counts.count, 0)::int AS count,
+          COALESCE(counts.archived, 0)::int AS archived
         FROM years
         LEFT JOIN counts USING (year)
         ORDER BY years.year;
         """
 
         yearly_results = self.execute_query(yearly_query)
-        yearly = [{"label": str(row["label"]), "count": row["count"] or 0} for row in yearly_results]
+        yearly = [
+            {
+                "label": str(row["label"]),
+                "count": row["count"] or 0,
+                "archived": row["archived"] or 0,
+            }
+            for row in yearly_results
+        ]
 
         # Calculate average growth based on yearly data
         avg_growth_pct = 0
         if len(yearly) >= 2:
-            first_count = yearly[0]["count"]
-            last_count = yearly[-1]["count"]
+            first_count = yearly[0]["count"] + yearly[0]["archived"]
+            last_count = yearly[-1]["count"] + yearly[-1]["archived"]
             years_span = len(yearly) - 1
             if first_count > 0:
                 avg_growth = ((last_count / first_count) ** (1 / years_span) - 1) * 100
@@ -2015,7 +2024,7 @@ class DataGenerator:
         logger.info("Generating city-rankings.json...")
 
         ranking_types = ["hides", "finds", "favorites"]
-        time_ranges = ["30d", "ytd", "all"]
+        time_ranges = RANKING_TIME_RANGES
 
         # Generate rankings
         rankings = self.generate_rankings(

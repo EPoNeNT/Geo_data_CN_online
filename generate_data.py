@@ -576,8 +576,7 @@ class DataGenerator:
             EXTRACT(YEAR FROM placed_date)::int AS year,
             COUNT(*) FILTER (WHERE c.cache_status != 2)::int AS total,
             COUNT(*) FILTER (
-              WHERE c.cache_status != 2
-                AND placed_date::date <=
+              WHERE placed_date::date <=
                 (date_trunc('year', make_date(EXTRACT(YEAR FROM placed_date)::int, 1, 1))::date
                  + (CURRENT_DATE - date_trunc('year', CURRENT_DATE)::date))
             )::int AS ytd_cache,

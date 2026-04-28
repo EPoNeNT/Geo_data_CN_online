@@ -59,6 +59,10 @@ EXCLUDE_CACHE_WHERE = "c.geocache_type NOT IN (6, 13)"
 EXCLUDE_CACHE_JOIN = "c.geocache_type NOT IN (6, 13)"
 ACTIVE_CACHE_WHERE = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
 ACTIVE_CACHE_JOIN = "c.cache_status != 2 AND c.geocache_type NOT IN (6, 13)"
+OWNER_USERNAME_FILTER = (
+    "c.owner_username IS NOT NULL AND c.owner_username <> '' "
+    "AND c.owner_username <> '[DELETED_USER]'"
+)
 COUNTRY_SUBTITLE_MAP = {
     "China": "中国",
     "Taiwan": "台湾",
@@ -268,7 +272,7 @@ class DataGenerator:
             self.connect()
 
     def get_avatar_cache_entries(self, user_names: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Return real and fresh negative avatar cache entries for the given users."""
+        """Return cached real/default avatar entries for the given users."""
         unique_names = sorted({name for name in user_names if name})
         if not unique_names:
             return {}
@@ -294,12 +298,19 @@ class DataGenerator:
         }
 
     def get_cached_avatar_urls(self, user_names: List[str]) -> Dict[str, str]:
-        """Return real avatar URLs already stored for the given users."""
+        """Return avatar URLs already stored for the given users."""
         entries = self.get_avatar_cache_entries(user_names)
         return {
-            user_name: entry["avatar_url"]
+            user_name: (
+                entry["avatar_url"]
+                if entry.get("avatar_status") == "real"
+                else DEFAULT_AVATAR_URL
+            )
             for user_name, entry in entries.items()
-            if entry.get("avatar_status") == "real" and is_real_avatar_url(entry.get("avatar_url"))
+            if (
+                entry.get("avatar_status") == "real"
+                and is_real_avatar_url(entry.get("avatar_url"))
+            ) or entry.get("avatar_status") == "default"
         }
 
     def upsert_avatar_cache_entries(self, avatar_entries: Dict[str, Tuple[str, str]]):
@@ -307,9 +318,12 @@ class DataGenerator:
         rows = []
         for user_name, value in avatar_entries.items():
             avatar_url, avatar_status = value
-            if avatar_status != "real" or not is_real_avatar_url(avatar_url):
+            if avatar_status == "real" and is_real_avatar_url(avatar_url):
+                rows.append((user_name, avatar_url, avatar_status))
+            elif avatar_status == "default":
+                rows.append((user_name, DEFAULT_AVATAR_URL, avatar_status))
+            else:
                 continue
-            rows.append((user_name, avatar_url, avatar_status))
 
         if not rows:
             return
@@ -418,11 +432,18 @@ class DataGenerator:
             return {}
 
         cache_entries = self.get_avatar_cache_entries(unique_names)
-        cached_urls = {
-            name: entry["avatar_url"]
-            for name, entry in cache_entries.items()
-            if entry.get("avatar_status") == "real" and is_real_avatar_url(entry.get("avatar_url"))
-        }
+        cached_urls = {}
+        real_cached_count = 0
+        default_cached_count = 0
+        for name, entry in cache_entries.items():
+            avatar_status = entry.get("avatar_status")
+            avatar_url = entry.get("avatar_url")
+            if avatar_status == "real" and is_real_avatar_url(avatar_url):
+                cached_urls[name] = avatar_url
+                real_cached_count += 1
+            elif avatar_status == "default":
+                cached_urls[name] = DEFAULT_AVATAR_URL
+                default_cached_count += 1
         missing_names = [
             name
             for name in unique_names
@@ -431,7 +452,8 @@ class DataGenerator:
 
         logger.info(
             "Avatar cache status: "
-            f"{len(cached_urls)} real cached, "
+            f"{real_cached_count} real cached, "
+            f"{default_cached_count} default cached, "
             f"{len(missing_names)} uncached/invalid, "
             f"{len(unique_names)} total unique users"
         )
@@ -980,7 +1002,7 @@ class DataGenerator:
             FROM (
               SELECT c.owner_username AS name, COUNT(*)::int AS score
               FROM caches c
-              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+              WHERE {OWNER_USERNAME_FILTER}
                 AND {date_condition}
                 AND {cache_where_condition}
                 {country_condition}
@@ -996,7 +1018,7 @@ class DataGenerator:
               SELECT c.owner_username AS name, COUNT(l.*)::int AS score
               FROM caches c
               JOIN logs l ON l.gc_code = c.code
-              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+              WHERE {OWNER_USERNAME_FILTER}
                 AND l.user_name IS NOT NULL
                 AND LOWER(l.user_name) <> LOWER(c.owner_username)
                 AND {date_condition}
@@ -1014,7 +1036,7 @@ class DataGenerator:
               SELECT c.owner_username AS name, COUNT(l.*)::int AS score
               FROM caches c
               JOIN logs l ON l.gc_code = c.code
-              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+              WHERE {OWNER_USERNAME_FILTER}
                 AND l.favorite_point_used IS TRUE
                 AND {date_condition}
                 AND {cache_join_condition}
@@ -1066,7 +1088,7 @@ class DataGenerator:
                 return f"""
                 SELECT owner_username AS name, COUNT(*)::int AS score
                 FROM caches c
-                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                WHERE {OWNER_USERNAME_FILTER}
                   AND {placed_date_condition}
                   AND {cache_where_condition}
                   {country_condition}
@@ -1151,7 +1173,7 @@ class DataGenerator:
                 SELECT c.owner_username AS name, COUNT(l.*)::int AS score
                 FROM caches c
                 JOIN logs l ON l.gc_code = c.code
-                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                WHERE {OWNER_USERNAME_FILTER}
                   AND l.favorite_point_used IS TRUE
                   AND {visited_date_condition}
                   AND {cache_join_condition}
@@ -1187,7 +1209,7 @@ class DataGenerator:
                   COUNT(l.*)::int AS score
                 FROM caches c
                 JOIN logs l ON l.gc_code = c.code
-                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                WHERE {OWNER_USERNAME_FILTER}
                   AND l.user_name IS NOT NULL
                   AND LOWER(l.user_name) <> LOWER(c.owner_username)
                   AND {visited_date_condition}
@@ -1253,7 +1275,7 @@ class DataGenerator:
                 return f"""
                 SELECT owner_username AS name, COUNT(*)::int AS score
                 FROM caches c
-                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                WHERE {OWNER_USERNAME_FILTER}
                   {date_filter}
                   AND {cache_where_condition}
                   {country_condition}
@@ -1338,7 +1360,7 @@ class DataGenerator:
                 SELECT c.owner_username AS name, COUNT(l.*)::int AS score
                 FROM caches c
                 JOIN logs l ON l.gc_code = c.code
-                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                WHERE {OWNER_USERNAME_FILTER}
                   AND l.favorite_point_used IS TRUE
                   {date_filter}
                   AND {cache_join_condition}
@@ -1374,7 +1396,7 @@ class DataGenerator:
                   COUNT(l.*)::int AS score
                 FROM caches c
                 JOIN logs l ON l.gc_code = c.code
-                WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+                WHERE {OWNER_USERNAME_FILTER}
                   AND l.user_name IS NOT NULL
                   AND LOWER(l.user_name) <> LOWER(c.owner_username)
                   {date_filter}
@@ -1591,7 +1613,7 @@ class DataGenerator:
             SELECT c.owner_username AS name, COUNT(*)::int AS score
             FROM caches c
             JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
-            WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+            WHERE {OWNER_USERNAME_FILTER}
               AND {NEWBIE_REGISTRATION_FILTER}
               AND {EXCLUDE_CACHE_WHERE}
               {country_condition}
@@ -1642,7 +1664,7 @@ class DataGenerator:
               SELECT c.owner_username AS name, COUNT(*)::int AS score
               FROM caches c
               JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
-              WHERE c.owner_username IS NOT NULL AND c.owner_username <> ''
+              WHERE {OWNER_USERNAME_FILTER}
                 AND {registration_filter}
                 AND {EXCLUDE_CACHE_WHERE}
                 {country_condition}

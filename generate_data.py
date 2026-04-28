@@ -929,9 +929,7 @@ class DataGenerator:
                 f"{date_col} >= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date "
                 f"AND {date_col} < ((CURRENT_DATE - INTERVAL '1 year')::date + INTERVAL '1 day')"
             )
-        if time_range == "active":
-            return f"{date_col} < CURRENT_DATE"
-        if time_range == "all":
+        if time_range in {"active", "all"}:
             return f"{date_col} < date_trunc('year', CURRENT_DATE)::date"
         raise ValueError(f"Unknown time range: {time_range}")
 

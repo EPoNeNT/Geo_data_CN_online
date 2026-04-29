@@ -931,7 +931,7 @@ class DataGenerator:
         if time_range == "ytd":
             return (
                 f"{date_col} >= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date "
-                f"AND {date_col} < ((CURRENT_DATE - INTERVAL '1 year')::date + INTERVAL '1 day')"
+                f"AND {date_col} < date_trunc('year', CURRENT_DATE)::date"
             )
         if time_range in {"active", "all"}:
             return f"{date_col} < date_trunc('year', CURRENT_DATE)::date"
@@ -1236,8 +1236,8 @@ class DataGenerator:
 
         Previous period definitions:
         - 30d: Previous 30-60 days
-        - ytd: Last year's year-to-date period
-        - active: Active caches/logs up to yesterday
+        - ytd: Previous full calendar year
+        - active: Same as all, but still using the active-cache scope
         - all: All time up to end of last year (Dec 31)
         """
         date_col = "c.placed_date" if ranking_type == "hides" else "l.visited"
@@ -1940,7 +1940,7 @@ class DataGenerator:
         self,
         country_filter: Optional[str] = None,
     ) -> Dict:
-        """Generate event player counts and growth versus the previous calendar year."""
+        """Generate event player counts and growth versus cumulative counts before this year."""
         stats = {}
         for ranking_type in ["hosts", "participants"]:
             current_result = self.execute_query(

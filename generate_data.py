@@ -7,6 +7,7 @@ Runs after crawl_caches and crawl_logs in GitHub Actions workflow.
 Output files:
 - public/data/overview.json
 - public/data/player-rankings.json
+- public/data/cache-rankings.json
 - public/data/city-rankings.json
 - public/data/generated-at.json
 """
@@ -54,6 +55,20 @@ DT_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 RANKING_TIME_RANGES = ["30d", "ytd", "active", "all"]
 EXCLUDED_CACHE_TYPES = "6, 13, 3653"
 EVENT_CACHE_TYPES = "6, 13, 3653"
+CACHE_TYPE_LABELS = {
+    2: "Tradition",
+    3: "Multi",
+    4: "Virtual",
+    5: "Letterbox",
+    6: "Event",
+    8: "Mystery",
+    11: "Webcam",
+    12: "Locationless",
+    13: "CITO",
+    137: "Earthcache",
+    1858: "Wherigo",
+    3653: "Community Celebration Event",
+}
 
 # Cache filters. Most statistics include archived caches, but D/T matrices and
 # active yearly trend counts still exclude them.
@@ -66,6 +81,11 @@ EVENT_CACHE_JOIN = f"c.geocache_type IN ({EVENT_CACHE_TYPES})"
 OWNER_USERNAME_FILTER = (
     "c.owner_username IS NOT NULL AND c.owner_username <> '' "
     "AND c.owner_username <> '[DELETED_USER]'"
+)
+CACHE_RANKING_ENTRY_FILTER = (
+    "c.code IS NOT NULL AND c.code <> '' "
+    "AND c.name IS NOT NULL AND c.name <> '' "
+    "AND c.owner_username IS NOT NULL AND c.owner_username <> ''"
 )
 COUNTRY_SUBTITLE_MAP = {
     "China": "中国",
@@ -890,8 +910,8 @@ class DataGenerator:
         else:
             return ("flat", 0)
 
-    def build_rank_lookup(self, rows: List[Dict]) -> Dict[str, int]:
-        """Build name-to-rank mapping using the same tied rank rule as output."""
+    def build_rank_lookup(self, rows: List[Dict], key_field: str = "name") -> Dict[str, int]:
+        """Build item-to-rank mapping using the same tied rank rule as output."""
         ranks = {}
         display_rank = 0
         prev_score = None
@@ -900,7 +920,7 @@ class DataGenerator:
             score = row["score"] or 0
             if index == 0 or score != prev_score:
                 display_rank = index + 1
-            ranks[row["name"]] = display_rank
+            ranks[row[key_field]] = display_rank
             prev_score = score
 
         return ranks
@@ -2130,6 +2150,281 @@ class DataGenerator:
             "communityStats": community_stats,
         }
 
+    # ==================== CACHE-RANKINGS.JSON ====================
+
+    def generate_cache_ranking_query(
+        self,
+        ranking_type: str,
+        time_range: str,
+        previous: bool = False,
+        limit: int = 999999,
+        country_filter: Optional[str] = None,
+    ) -> str:
+        """Generate SQL query for cache rankings."""
+        date_condition = self.generate_ranking_stats_date_condition(
+            time_range,
+            "l.visited",
+            previous=previous,
+        )
+        cache_condition = self.generate_ranking_cache_condition(time_range, join_clause=True)
+        country_condition = ""
+        if country_filter:
+            country_condition = f"AND c.country = {sql_literal(country_filter)}"
+
+        favorite_condition = ""
+        if ranking_type == "favorites":
+            favorite_condition = "AND l.favorite_point_used IS TRUE"
+        elif ranking_type != "logs":
+            raise ValueError(f"Unknown cache ranking type: {ranking_type}")
+
+        return f"""
+        SELECT
+          c.code,
+          c.name,
+          c.owner_username AS owner,
+          c.geocache_type AS geocache_type,
+          COUNT(l.*)::int AS score
+        FROM caches c
+        JOIN logs l ON l.gc_code = c.code
+        WHERE {CACHE_RANKING_ENTRY_FILTER}
+          {favorite_condition}
+          AND {date_condition}
+          AND {cache_condition}
+          {country_condition}
+        GROUP BY c.code, c.name, c.owner_username, c.geocache_type
+        ORDER BY score DESC, c.code ASC
+        LIMIT {limit};
+        """
+
+    def format_cache_type_label(self, geocache_type: Optional[int]) -> str:
+        """Format raw geocache_type as a cache ranking type label."""
+        if geocache_type is None:
+            return "Unknown"
+        try:
+            type_id = int(geocache_type)
+        except (TypeError, ValueError):
+            return "Unknown"
+        return CACHE_TYPE_LABELS.get(type_id, f"Type {type_id}")
+
+    def generate_cache_ranking_count_query(
+        self,
+        ranking_type: str,
+        time_range: str,
+        previous: bool = False,
+        country_filter: Optional[str] = None,
+    ) -> str:
+        """Generate cache count query for cache ranking stats without leaderboard limits."""
+        date_condition = self.generate_ranking_stats_date_condition(
+            time_range,
+            "l.visited",
+            previous=previous,
+        )
+        cache_condition = self.generate_ranking_cache_condition(time_range, join_clause=True)
+        country_condition = ""
+        if country_filter:
+            country_condition = f"AND c.country = {sql_literal(country_filter)}"
+
+        favorite_condition = ""
+        if ranking_type == "favorites":
+            favorite_condition = "AND l.favorite_point_used IS TRUE"
+        elif ranking_type != "logs":
+            raise ValueError(f"Unknown cache ranking type: {ranking_type}")
+
+        return f"""
+        SELECT COUNT(*)::int AS player_count
+        FROM (
+          SELECT c.code, COUNT(l.*)::int AS score
+          FROM caches c
+          JOIN logs l ON l.gc_code = c.code
+          WHERE {CACHE_RANKING_ENTRY_FILTER}
+            {favorite_condition}
+            AND {date_condition}
+            AND {cache_condition}
+            {country_condition}
+          GROUP BY c.code
+          HAVING COUNT(l.*) > 0
+        ) ranked;
+        """
+
+    def generate_cache_rankings(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+        limit: int = 50,
+        country_filter: Optional[str] = None,
+    ) -> Dict:
+        """Generate cache rankings with tied ranks and trend calculation."""
+        rankings = {}
+
+        for rtype in ranking_types:
+            rankings[rtype] = {}
+            for trange in time_ranges:
+                logger.debug(f"Generating cache {rtype}/{trange} ranking...")
+
+                query = self.generate_cache_ranking_query(
+                    rtype,
+                    trange,
+                    limit=limit * 2,
+                    country_filter=country_filter,
+                )
+                results = self.execute_query(query)
+                results = [r for r in results if (r["score"] or 0) > 0]
+
+                prev_ranks = {}
+                try:
+                    prev_query = self.generate_cache_ranking_query(
+                        rtype,
+                        trange,
+                        previous=True,
+                        country_filter=country_filter,
+                    )
+                    prev_results = self.execute_query(prev_query)
+                    prev_results = [r for r in prev_results if (r["score"] or 0) > 0]
+                    prev_ranks = self.build_rank_lookup(prev_results, key_field="code")
+                    logger.debug(
+                        f"  Got {len(prev_results)} previous period cache entries for {rtype}/{trange}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to get previous period cache data for {rtype}/{trange}: {e}")
+
+                ranked_results = []
+                display_rank = 0
+                prev_score = None
+
+                for i, row in enumerate(results):
+                    score = row["score"] or 0
+                    if i == 0 or score != prev_score:
+                        display_rank = i + 1
+
+                    should_include = len(ranked_results) < limit
+                    if not should_include and ranked_results:
+                        last_included_score = ranked_results[-1]["score"]
+                        if score == last_included_score:
+                            should_include = True
+
+                    if should_include:
+                        previous_rank = prev_ranks.get(row["code"], 0)
+                        trend, trend_delta = self.calculate_trend(display_rank, previous_rank)
+                        ranked_results.append({
+                            "rank": display_rank,
+                            "code": row["code"],
+                            "name": row["name"],
+                            "owner": row["owner"],
+                            "typeLabel": self.format_cache_type_label(row.get("geocache_type")),
+                            "geocacheType": row.get("geocache_type"),
+                            "score": score,
+                            "trend": trend,
+                            "trendDelta": trend_delta,
+                        })
+
+                    prev_score = score
+
+                logger.debug(f"  Returning {len(ranked_results)} cache entries for {rtype}/{trange}")
+                rankings[rtype][trange] = ranked_results
+
+        return rankings
+
+    def generate_cache_ranking_stats(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+        country_filter: Optional[str] = None,
+    ) -> Dict:
+        """Generate cache counts and growth percentages for each cache ranking filter."""
+        stats = {}
+
+        for rtype in ranking_types:
+            stats[rtype] = {}
+            for trange in time_ranges:
+                current_query = self.generate_cache_ranking_count_query(
+                    rtype,
+                    trange,
+                    country_filter=country_filter,
+                )
+                previous_query = self.generate_cache_ranking_count_query(
+                    rtype,
+                    trange,
+                    previous=True,
+                    country_filter=country_filter,
+                )
+
+                current_result = self.execute_query(current_query)
+                previous_result = self.execute_query(previous_query)
+
+                cache_count = current_result[0]["player_count"] if current_result else 0
+                previous_count = previous_result[0]["player_count"] if previous_result else 0
+
+                growth_pct = None
+                if previous_count > 0:
+                    growth_pct = round((cache_count - previous_count) / previous_count * 100, 1)
+
+                stats[rtype][trange] = {
+                    "playerCount": cache_count,
+                    "playerCountGrowthPct": growth_pct,
+                }
+
+        return stats
+
+    def generate_cache_rankings_by_region(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+        limit: int,
+    ) -> Dict[str, Dict]:
+        """Generate cache rankings for all supported region filters."""
+        rankings_by_region = {
+            "all": self.generate_cache_rankings(ranking_types, time_ranges, limit=limit)
+        }
+        for region_key, country in REGION_COUNTRY_MAP.items():
+            rankings_by_region[region_key] = self.generate_cache_rankings(
+                ranking_types,
+                time_ranges,
+                limit=limit,
+                country_filter=country,
+            )
+        return rankings_by_region
+
+    def generate_cache_ranking_stats_by_region(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+    ) -> Dict[str, Dict]:
+        """Generate cache ranking stats for all supported region filters."""
+        stats_by_region = {
+            "all": self.generate_cache_ranking_stats(ranking_types, time_ranges)
+        }
+        for region_key, country in REGION_COUNTRY_MAP.items():
+            stats_by_region[region_key] = self.generate_cache_ranking_stats(
+                ranking_types,
+                time_ranges,
+                country_filter=country,
+            )
+        return stats_by_region
+
+    def generate_cache_rankings_json(self) -> Dict:
+        """Generate complete cache-rankings.json data."""
+        logger.info("Generating cache-rankings.json...")
+
+        ranking_types = ["logs", "favorites"]
+        time_ranges = RANKING_TIME_RANGES
+        rankings_by_region = self.generate_cache_rankings_by_region(
+            ranking_types,
+            time_ranges,
+            limit=50,
+        )
+        ranking_stats_by_region = self.generate_cache_ranking_stats_by_region(
+            ranking_types,
+            time_ranges,
+        )
+
+        return {
+            "generatedAt": self.get_generated_at(),
+            "rankings": rankings_by_region["all"],
+            "rankingsByRegion": rankings_by_region,
+            "rankingStats": ranking_stats_by_region["all"],
+            "rankingStatsByRegion": ranking_stats_by_region,
+        }
+
     # ==================== CITY-RANKINGS.JSON ====================
 
     def generate_cache_trend(self, city_filter: Optional[str] = None) -> Dict:
@@ -2315,6 +2610,7 @@ class DataGenerator:
         files_to_generate = [
             ("overview.json", self.generate_overview_json),
             ("player-rankings.json", self.generate_player_rankings_json),
+            ("cache-rankings.json", self.generate_cache_rankings_json),
             ("city-rankings.json", self.generate_city_rankings_json),
             ("generated-at.json", self.generate_timestamp_json),
         ]

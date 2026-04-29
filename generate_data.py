@@ -69,6 +69,18 @@ CACHE_TYPE_LABELS = {
     1858: "Wherigo",
     3653: "Community Celebration Event",
 }
+CACHE_TYPE_FILTERS = {
+    "all": None,
+    "tradition": 2,
+    "multi": 3,
+    "virtual": 4,
+    "letterbox": 5,
+    "mystery": 8,
+    "webcam": 11,
+    "locationless": 12,
+    "earthcache": 137,
+    "wherigo": 1858,
+}
 
 # Cache filters. Most statistics include archived caches, but D/T matrices and
 # active yearly trend counts still exclude them.
@@ -2159,6 +2171,7 @@ class DataGenerator:
         previous: bool = False,
         limit: int = 999999,
         country_filter: Optional[str] = None,
+        cache_type_filter: Optional[int] = None,
     ) -> str:
         """Generate SQL query for cache rankings."""
         date_condition = self.generate_ranking_stats_date_condition(
@@ -2170,6 +2183,9 @@ class DataGenerator:
         country_condition = ""
         if country_filter:
             country_condition = f"AND c.country = {sql_literal(country_filter)}"
+        cache_type_condition = ""
+        if cache_type_filter is not None:
+            cache_type_condition = f"AND c.geocache_type = {int(cache_type_filter)}"
 
         favorite_condition = ""
         if ranking_type == "favorites":
@@ -2190,6 +2206,7 @@ class DataGenerator:
           {favorite_condition}
           AND {date_condition}
           AND {cache_condition}
+          {cache_type_condition}
           {country_condition}
         GROUP BY c.code, c.name, c.owner_username, c.geocache_type
         ORDER BY score DESC, c.code ASC
@@ -2212,6 +2229,7 @@ class DataGenerator:
         time_range: str,
         previous: bool = False,
         country_filter: Optional[str] = None,
+        cache_type_filter: Optional[int] = None,
     ) -> str:
         """Generate cache count query for cache ranking stats without leaderboard limits."""
         date_condition = self.generate_ranking_stats_date_condition(
@@ -2223,6 +2241,9 @@ class DataGenerator:
         country_condition = ""
         if country_filter:
             country_condition = f"AND c.country = {sql_literal(country_filter)}"
+        cache_type_condition = ""
+        if cache_type_filter is not None:
+            cache_type_condition = f"AND c.geocache_type = {int(cache_type_filter)}"
 
         favorite_condition = ""
         if ranking_type == "favorites":
@@ -2240,6 +2261,7 @@ class DataGenerator:
             {favorite_condition}
             AND {date_condition}
             AND {cache_condition}
+            {cache_type_condition}
             {country_condition}
           GROUP BY c.code
           HAVING COUNT(l.*) > 0
@@ -2252,6 +2274,7 @@ class DataGenerator:
         time_ranges: List[str],
         limit: int = 50,
         country_filter: Optional[str] = None,
+        cache_type_filter: Optional[int] = None,
     ) -> Dict:
         """Generate cache rankings with tied ranks and trend calculation."""
         rankings = {}
@@ -2266,6 +2289,7 @@ class DataGenerator:
                     trange,
                     limit=limit * 2,
                     country_filter=country_filter,
+                    cache_type_filter=cache_type_filter,
                 )
                 results = self.execute_query(query)
                 results = [r for r in results if (r["score"] or 0) > 0]
@@ -2277,6 +2301,7 @@ class DataGenerator:
                         trange,
                         previous=True,
                         country_filter=country_filter,
+                        cache_type_filter=cache_type_filter,
                     )
                     prev_results = self.execute_query(prev_query)
                     prev_results = [r for r in prev_results if (r["score"] or 0) > 0]
@@ -2329,6 +2354,7 @@ class DataGenerator:
         ranking_types: List[str],
         time_ranges: List[str],
         country_filter: Optional[str] = None,
+        cache_type_filter: Optional[int] = None,
     ) -> Dict:
         """Generate cache counts and growth percentages for each cache ranking filter."""
         stats = {}
@@ -2340,12 +2366,14 @@ class DataGenerator:
                     rtype,
                     trange,
                     country_filter=country_filter,
+                    cache_type_filter=cache_type_filter,
                 )
                 previous_query = self.generate_cache_ranking_count_query(
                     rtype,
                     trange,
                     previous=True,
                     country_filter=country_filter,
+                    cache_type_filter=cache_type_filter,
                 )
 
                 current_result = self.execute_query(current_query)
@@ -2401,6 +2429,92 @@ class DataGenerator:
             )
         return stats_by_region
 
+    def generate_cache_rankings_by_cache_type(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+        limit: int,
+    ) -> Dict[str, Dict]:
+        """Generate cache rankings for all supported cache type filters."""
+        rankings_by_cache_type = {}
+        for cache_type_key, cache_type_id in CACHE_TYPE_FILTERS.items():
+            rankings_by_cache_type[cache_type_key] = self.generate_cache_rankings(
+                ranking_types,
+                time_ranges,
+                limit=limit,
+                cache_type_filter=cache_type_id,
+            )
+        return rankings_by_cache_type
+
+    def generate_cache_ranking_stats_by_cache_type(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+    ) -> Dict[str, Dict]:
+        """Generate cache ranking stats for all supported cache type filters."""
+        stats_by_cache_type = {}
+        for cache_type_key, cache_type_id in CACHE_TYPE_FILTERS.items():
+            stats_by_cache_type[cache_type_key] = self.generate_cache_ranking_stats(
+                ranking_types,
+                time_ranges,
+                cache_type_filter=cache_type_id,
+            )
+        return stats_by_cache_type
+
+    def generate_cache_rankings_by_region_and_cache_type(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+        limit: int,
+        rankings_by_region: Dict[str, Dict],
+        rankings_by_cache_type: Dict[str, Dict],
+    ) -> Dict[str, Dict]:
+        """Generate cache rankings for combined region and cache type filters."""
+        rankings_by_region_and_cache_type = {
+            "all": rankings_by_cache_type,
+        }
+        for region_key, country in REGION_COUNTRY_MAP.items():
+            rankings_by_region_and_cache_type[region_key] = {
+                "all": rankings_by_region[region_key],
+            }
+            for cache_type_key, cache_type_id in CACHE_TYPE_FILTERS.items():
+                if cache_type_key == "all":
+                    continue
+                rankings_by_region_and_cache_type[region_key][cache_type_key] = self.generate_cache_rankings(
+                    ranking_types,
+                    time_ranges,
+                    limit=limit,
+                    country_filter=country,
+                    cache_type_filter=cache_type_id,
+                )
+        return rankings_by_region_and_cache_type
+
+    def generate_cache_ranking_stats_by_region_and_cache_type(
+        self,
+        ranking_types: List[str],
+        time_ranges: List[str],
+        ranking_stats_by_region: Dict[str, Dict],
+        ranking_stats_by_cache_type: Dict[str, Dict],
+    ) -> Dict[str, Dict]:
+        """Generate cache ranking stats for combined region and cache type filters."""
+        stats_by_region_and_cache_type = {
+            "all": ranking_stats_by_cache_type,
+        }
+        for region_key, country in REGION_COUNTRY_MAP.items():
+            stats_by_region_and_cache_type[region_key] = {
+                "all": ranking_stats_by_region[region_key],
+            }
+            for cache_type_key, cache_type_id in CACHE_TYPE_FILTERS.items():
+                if cache_type_key == "all":
+                    continue
+                stats_by_region_and_cache_type[region_key][cache_type_key] = self.generate_cache_ranking_stats(
+                    ranking_types,
+                    time_ranges,
+                    country_filter=country,
+                    cache_type_filter=cache_type_id,
+                )
+        return stats_by_region_and_cache_type
+
     def generate_cache_rankings_json(self) -> Dict:
         """Generate complete cache-rankings.json data."""
         logger.info("Generating cache-rankings.json...")
@@ -2416,13 +2530,39 @@ class DataGenerator:
             ranking_types,
             time_ranges,
         )
+        rankings_by_cache_type = self.generate_cache_rankings_by_cache_type(
+            ranking_types,
+            time_ranges,
+            limit=50,
+        )
+        ranking_stats_by_cache_type = self.generate_cache_ranking_stats_by_cache_type(
+            ranking_types,
+            time_ranges,
+        )
+        rankings_by_region_and_cache_type = self.generate_cache_rankings_by_region_and_cache_type(
+            ranking_types,
+            time_ranges,
+            limit=50,
+            rankings_by_region=rankings_by_region,
+            rankings_by_cache_type=rankings_by_cache_type,
+        )
+        ranking_stats_by_region_and_cache_type = self.generate_cache_ranking_stats_by_region_and_cache_type(
+            ranking_types,
+            time_ranges,
+            ranking_stats_by_region=ranking_stats_by_region,
+            ranking_stats_by_cache_type=ranking_stats_by_cache_type,
+        )
 
         return {
             "generatedAt": self.get_generated_at(),
             "rankings": rankings_by_region["all"],
             "rankingsByRegion": rankings_by_region,
+            "rankingsByCacheType": rankings_by_cache_type,
+            "rankingsByRegionAndCacheType": rankings_by_region_and_cache_type,
             "rankingStats": ranking_stats_by_region["all"],
             "rankingStatsByRegion": ranking_stats_by_region,
+            "rankingStatsByCacheType": ranking_stats_by_cache_type,
+            "rankingStatsByRegionAndCacheType": ranking_stats_by_region_and_cache_type,
         }
 
     # ==================== CITY-RANKINGS.JSON ====================

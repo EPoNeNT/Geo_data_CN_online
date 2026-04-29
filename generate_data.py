@@ -1783,6 +1783,7 @@ class DataGenerator:
         limit: int = 50,
         country_filter: Optional[str] = None,
         previous_year: bool = False,
+        previous_year_window: bool = False,
     ) -> str:
         """Generate SQL query for event rankings."""
         country_condition = ""
@@ -1791,9 +1792,13 @@ class DataGenerator:
 
         if ranking_type == "hosts":
             date_condition = ""
-            if previous_year:
+            if previous_year_window:
                 date_condition = (
                     "AND c.placed_date >= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date "
+                    "AND c.placed_date < date_trunc('year', CURRENT_DATE)::date"
+                )
+            elif previous_year:
+                date_condition = (
                     "AND c.placed_date < date_trunc('year', CURRENT_DATE)::date"
                 )
             return f"""
@@ -1810,9 +1815,13 @@ class DataGenerator:
 
         if ranking_type == "participants":
             date_condition = ""
-            if previous_year:
+            if previous_year_window:
                 date_condition = (
                     "AND l.visited >= date_trunc('year', CURRENT_DATE - INTERVAL '1 year')::date "
+                    "AND l.visited < date_trunc('year', CURRENT_DATE)::date"
+                )
+            elif previous_year:
+                date_condition = (
                     "AND l.visited < date_trunc('year', CURRENT_DATE)::date"
                 )
             return f"""
@@ -1836,6 +1845,7 @@ class DataGenerator:
         ranking_type: str,
         country_filter: Optional[str] = None,
         previous_year: bool = False,
+        previous_year_window: bool = False,
     ) -> str:
         """Generate player count query for event ranking stats."""
         ranking_query = self.generate_event_ranking_query(
@@ -1843,6 +1853,7 @@ class DataGenerator:
             limit=999999,
             country_filter=country_filter,
             previous_year=previous_year,
+            previous_year_window=previous_year_window,
         ).rstrip().rstrip(";")
         return f"""
         SELECT COUNT(*)::int AS player_count

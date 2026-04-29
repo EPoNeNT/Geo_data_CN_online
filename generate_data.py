@@ -1820,6 +1820,7 @@ class DataGenerator:
             FROM logs l
             JOIN caches c ON c.code = l.gc_code
             WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND l.log_type = 'Attended'
               AND {EVENT_CACHE_JOIN}
               {country_condition}
               {date_condition}

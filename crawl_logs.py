@@ -35,6 +35,9 @@ logger = setup_logging("crawl_logs.log")
 
 DATABASE_URL = require_env("DATABASE_URL")
 MAX_RETRIES = 3
+EVENT_CACHE_TYPES = {6, 13, 3653}
+FOUND_LOG_TYPE = "Found it"
+ATTENDED_LOG_TYPE = "Attended"
 FTF_MARKER_RE = re.compile(
     r"[\{\[\(\uFF08]\s*\*?\s*ftf\s*\*?\s*[\}\]\)\uFF09]",
     re.IGNORECASE,
@@ -97,7 +100,18 @@ class DatabaseManager:
             keepalives_count=5,
         )
         self.cursor = self.conn.cursor()
+        self.ensure_logs_schema()
         logger.info("数据库连接成功")
+
+    def ensure_logs_schema(self):
+        """Ensure columns required by current log crawling logic exist."""
+        self.cursor.execute(
+            """
+            ALTER TABLE logs
+            ADD COLUMN IF NOT EXISTS log_type TEXT NOT NULL DEFAULT 'Found it'
+            """
+        )
+        self.conn.commit()
 
     def reconnect(self):
         """重新连接数据库。"""
@@ -122,12 +136,12 @@ class DatabaseManager:
 
     def get_all_caches_to_crawl(
         self,
-    ) -> List[Tuple[str, Optional[float], Optional[float], bool]]:
+    ) -> List[Tuple[str, Optional[float], Optional[float], bool, Optional[int]]]:
         """获取需要爬取 logs 的全部 cache，并保留 premium 标记。"""
         self.cursor.execute(
             """
             SELECT c.code, c.latitude, c.longitude, c.premium_only,
-                   c.logs_crawled_at, c.last_found_date
+                   c.geocache_type, c.logs_crawled_at, c.last_found_date
             FROM caches c
             WHERE c.cache_status != 2
             ORDER BY c.code
@@ -136,7 +150,7 @@ class DatabaseManager:
 
         results = []
         for row in self.cursor.fetchall():
-            code, lat, lng, premium_only, logs_crawled_at, last_found_date = row
+            code, lat, lng, premium_only, geocache_type, logs_crawled_at, last_found_date = row
 
             # Convert to date for safe comparison (handle both datetime and date types)
             logs_crawled_date = (
@@ -149,7 +163,7 @@ class DatabaseManager:
             if logs_crawled_at is None or (
                 last_found_date is not None and last_found_cmp >= logs_crawled_date
             ):
-                results.append((code, lat, lng, bool(premium_only)))
+                results.append((code, lat, lng, bool(premium_only), geocache_type))
         return results
 
     def batch_update_logs_crawled_at(self, codes: List[str], crawl_date: str):
@@ -188,8 +202,8 @@ class DatabaseManager:
                 execute_batch(
                     self.cursor,
                     """
-                    INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     """,
                     [
@@ -199,6 +213,7 @@ class DatabaseManager:
                             log["Visited"],
                             log.get("FavoritePointUsed", False),
                             log.get("IsFTF", False),
+                            log.get("LogType", FOUND_LOG_TYPE),
                         )
                         for log in logs
                     ],
@@ -221,7 +236,7 @@ class DatabaseManager:
 
         self.cursor.execute(
             """
-            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf
+            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf, log_type
             FROM logs
             WHERE gc_code = ANY(%s)
             """,
@@ -235,6 +250,7 @@ class DatabaseManager:
                 "visited": row[2],
                 "favorite_point_used": row[3],
                 "is_ftf": row[4],
+                "log_type": row[5],
             }
         return existing
 
@@ -268,6 +284,7 @@ class DatabaseManager:
                 "visited": log["Visited"],
                 "favorite_point_used": log.get("FavoritePointUsed", False),
                 "is_ftf": log.get("IsFTF", False),
+                "log_type": log.get("LogType", FOUND_LOG_TYPE),
             }
 
             if key not in existing_logs:
@@ -291,6 +308,7 @@ class DatabaseManager:
                     db_visited_str == api_visited_str
                     and bool(old_record["favorite_point_used"]) == bool(new_record["favorite_point_used"])
                     and bool(old_record["is_ftf"]) == bool(new_record["is_ftf"])
+                    and (old_record.get("log_type") or FOUND_LOG_TYPE) == new_record["log_type"]
                 )
 
                 if not fields_match:
@@ -316,8 +334,8 @@ class DatabaseManager:
         execute_batch(
             self.cursor,
             """
-            INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
             [
@@ -327,6 +345,7 @@ class DatabaseManager:
                     log["Visited"],
                     log.get("FavoritePointUsed", False),
                     log.get("IsFTF", False),
+                    log.get("LogType", FOUND_LOG_TYPE),
                 )
                 for log in logs
             ],
@@ -340,13 +359,15 @@ class DatabaseManager:
                 UPDATE logs
                 SET visited = %s,
                     favorite_point_used = %s,
-                    is_ftf = %s
+                    is_ftf = %s,
+                    log_type = %s
                 WHERE gc_code = %s AND user_name = %s
                 """,
                 (
                     log["Visited"],
                     log.get("FavoritePointUsed", False),
                     log.get("IsFTF", False),
+                    log.get("LogType", FOUND_LOG_TYPE),
                     log["GCCode"],
                     log["UserName"],
                 ),
@@ -446,9 +467,16 @@ def get_logbook_token(gc_code: str, cookie: str) -> Optional[str]:
 
 
 def fetch_logs_for_cache(
-    gc_code: str, token: str, page_sleep: float, cookie: str
+    gc_code: str,
+    token: str,
+    page_sleep: float,
+    cookie: str,
+    accepted_log_types: Optional[set] = None,
 ) -> List[dict]:
     """获取单个 cache 的所有 logs。"""
+    if accepted_log_types is None:
+        accepted_log_types = {FOUND_LOG_TYPE}
+
     logs = []
     current_idx = 1
     num_per_page = 100
@@ -494,7 +522,8 @@ def fetch_logs_for_cache(
             break
 
         for item in data:
-            if item.get("LogType") != "Found it":
+            log_type = item.get("LogType")
+            if log_type not in accepted_log_types:
                 continue
 
             log_content = item.get("LogText", "")
@@ -505,6 +534,7 @@ def fetch_logs_for_cache(
                     "Visited": format_date(item.get("Visited", "")),
                     "FavoritePointUsed": item.get("FavoritePointUsed", False),
                     "IsFTF": is_ftf_log_text(log_content),
+                    "LogType": log_type,
                 }
             )
 
@@ -539,7 +569,7 @@ def get_coordinates(gc_code: str, cookie: str) -> Tuple[Optional[float], Optiona
 def crawl_cache_group(
     db: DatabaseManager,
     group_name: str,
-    caches: List[Tuple[str, Optional[float], Optional[float]]],
+    caches: List[Tuple[str, Optional[float], Optional[float], Optional[int]]],
     today_str: str,
 ) -> Dict[str, int]:
     """按指定配置爬取一组 cache。"""
@@ -558,8 +588,13 @@ def crawl_cache_group(
 
     logger.info(f"开始处理 {group_name} 组，共 {len(caches)} 个 cache")
 
-    for i, (code, old_lat, old_lng) in enumerate(caches):
+    for i, (code, old_lat, old_lng, geocache_type) in enumerate(caches):
         logger.info(f"[{group_name} {i + 1}/{len(caches)}] 处理: {code}")
+        accepted_log_types = (
+            {ATTENDED_LOG_TYPE}
+            if geocache_type in EVENT_CACHE_TYPES
+            else {FOUND_LOG_TYPE}
+        )
 
         retry_count = 0
         max_retries = 1
@@ -591,7 +626,13 @@ def crawl_cache_group(
 
                 consecutive_token_failures = 0
 
-                cache_logs = fetch_logs_for_cache(code, token, page_sleep, cookie)
+                cache_logs = fetch_logs_for_cache(
+                    code,
+                    token,
+                    page_sleep,
+                    cookie,
+                    accepted_log_types=accepted_log_types,
+                )
 
                 if cache_logs:
                     all_logs.extend(cache_logs)
@@ -655,9 +696,15 @@ def run_logs_crawler():
     try:
         logger.info("加载全部 cache 列表...")
         caches = db.get_all_caches_to_crawl()
-        premium_caches = [(code, lat, lng) for code, lat, lng, premium_only in caches if premium_only]
+        premium_caches = [
+            (code, lat, lng, geocache_type)
+            for code, lat, lng, premium_only, geocache_type in caches
+            if premium_only
+        ]
         nonpremium_caches = [
-            (code, lat, lng) for code, lat, lng, premium_only in caches if not premium_only
+            (code, lat, lng, geocache_type)
+            for code, lat, lng, premium_only, geocache_type in caches
+            if not premium_only
         ]
         logger.info(
             f"需要处理 {len(caches)} 个 cache，其中 premium {len(premium_caches)} 个，"

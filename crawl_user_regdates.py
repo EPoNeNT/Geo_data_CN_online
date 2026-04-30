@@ -6,6 +6,7 @@ import os
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import quote
 
@@ -33,16 +34,32 @@ DEFAULT_DELAY_SECONDS = float(os.getenv("USER_REGDATE_DELAY_SECONDS", "1.6"))
 DEFAULT_BATCH_SIZE = int(os.getenv("USER_REGDATE_BATCH_SIZE", "50"))
 DEFAULT_LIMIT = os.getenv("USER_REGDATE_LIMIT")
 MIN_LOG_COUNT_FOR_REGDATE_FETCH = 10
+DEBUG_NOT_FOUND_HTML = os.getenv("USER_REGDATE_DEBUG_NOT_FOUND_HTML", "").lower() in {"1", "true", "yes"}
+DEBUG_HTML_DIR = Path(os.getenv("USER_REGDATE_DEBUG_HTML_DIR", "test/regdate_debug_pages"))
 
 JOINED_PATTERNS = (
     re.compile(
-        r'id="ctl00_ProfileHead_ProfileHeader_lblMemberSinceDate">\s*Joined\s*(.*?)\s*</span>',
+        r'<span\b[^>]*\bid=["\']ctl00_ProfileHead_ProfileHeader_lblMemberSinceDate["\'][^>]*>\s*Joined\s*(.*?)\s*</span>',
         re.IGNORECASE | re.DOTALL,
     ),
     re.compile(
-        r'lblMemberSinceDate">\s*Joined\s*(.*?)\s*</span>',
+        r'<span\b[^>]*\bid=["\'][^"\']*lblMemberSinceDate["\'][^>]*>\s*Joined\s*(.*?)\s*</span>',
         re.IGNORECASE | re.DOTALL,
     ),
+)
+
+PROFILE_MEMBER_PATTERN = re.compile(
+    r'<span\b[^>]*\bid=["\']ctl00_ProfileHead_ProfileHeader_lblMemberName["\'][^>]*>(.*?)</span>',
+    re.IGNORECASE | re.DOTALL,
+)
+TITLE_PATTERN = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+MEMBER_SINCE_CONTEXT_PATTERN = re.compile(
+    r".{0,120}lblMemberSinceDate.{0,180}",
+    re.IGNORECASE | re.DOTALL,
+)
+JOINED_CONTEXT_PATTERN = re.compile(
+    r".{0,120}(lblMemberSinceDate|Joined|Member Since|memberSince|dateJoined).{0,180}",
+    re.IGNORECASE | re.DOTALL,
 )
 
 DATE_FORMATS = (
@@ -92,6 +109,56 @@ def build_session() -> requests.Session:
 
     session.headers.update(headers)
     return session
+
+
+def clean_html_text(value: str) -> str:
+    """Collapse HTML-ish text into one log-safe line."""
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def safe_debug_filename(user_name: str) -> str:
+    """Build a filesystem-safe debug filename for a profile response."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", user_name).strip("_") or "user"
+
+
+def summarize_profile_response(html: str) -> dict:
+    """Return a concise fingerprint for unexpected profile responses."""
+    text = html or ""
+    title_match = TITLE_PATTERN.search(text)
+    member_match = PROFILE_MEMBER_PATTERN.search(text)
+    context_match = MEMBER_SINCE_CONTEXT_PATTERN.search(text) or JOINED_CONTEXT_PATTERN.search(text)
+    markers = [
+        marker
+        for marker in (
+            "lblMemberSinceDate",
+            "ctl00_ProfileHead_ProfileHeader_lblMemberName",
+            "Joined",
+            "dateJoined",
+            "UserProfile",
+            "This user's profile is private",
+            "Sorry, the requested user profile was not found",
+            "Page Not Found",
+        )
+        if marker in text
+    ]
+    return {
+        "title": clean_html_text(title_match.group(1)) if title_match else "",
+        "profile_name": clean_html_text(member_match.group(1)) if member_match else "",
+        "joined_context": clean_html_text(context_match.group(0)) if context_match else "",
+        "markers": ",".join(markers),
+        "looks_like_profile": bool(member_match) or "UserProfile" in text,
+    }
+
+
+def maybe_save_debug_html(user_name: str, html: str) -> None:
+    """Optionally save unexpected profile HTML for action artifact debugging."""
+    if not DEBUG_NOT_FOUND_HTML:
+        return
+
+    DEBUG_HTML_DIR.mkdir(parents=True, exist_ok=True)
+    path = DEBUG_HTML_DIR / f"{safe_debug_filename(user_name)}.html"
+    path.write_text(html or "", encoding="utf-8", errors="replace")
+    logger.warning("Saved %s profile debug HTML to %s", user_name, path)
 
 
 def parse_registration_date(html: str) -> Tuple[Optional[str], Optional[str]]:
@@ -145,6 +212,21 @@ def fetch_registration_date(
                 return parsed_date, raw_date, "ok"
             if raw_date:
                 return None, raw_date, "parse_failed"
+
+            summary = summarize_profile_response(response.text)
+            logger.warning(
+                "%s registration date not found: final_url=%s length=%s title=%r profile_name=%r markers=%s context=%r",
+                user_name,
+                response.url,
+                len(response.text or ""),
+                summary["title"],
+                summary["profile_name"],
+                summary["markers"],
+                summary["joined_context"],
+            )
+            maybe_save_debug_html(user_name, response.text)
+            if summary["looks_like_profile"] or "lblMemberSinceDate" in summary["markers"]:
+                return None, None, "parse_failed"
             return None, None, "not_found"
 
         except requests.RequestException as exc:

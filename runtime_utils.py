@@ -4,6 +4,7 @@
 import logging
 import os
 import sys
+import time
 
 
 class AuthenticationError(RuntimeError):
@@ -42,6 +43,41 @@ def setup_logging(log_filename: str) -> logging.Logger:
         force=True,
     )
     return logging.getLogger(__name__)
+
+
+def connect_postgres(database_url: str, logger: logging.Logger | None = None, **kwargs):
+    """Connect to Postgres with retries for transient CI/Neon network failures."""
+    import psycopg2
+
+    attempts = int(os.getenv("DATABASE_CONNECT_RETRIES", "5"))
+    initial_delay = float(os.getenv("DATABASE_CONNECT_RETRY_DELAY_SECONDS", "5"))
+    max_delay = float(os.getenv("DATABASE_CONNECT_RETRY_MAX_DELAY_SECONDS", "60"))
+
+    if "connect_timeout" not in kwargs:
+        kwargs["connect_timeout"] = int(os.getenv("DATABASE_CONNECT_TIMEOUT", "10"))
+    elif os.getenv("DATABASE_CONNECT_TIMEOUT"):
+        kwargs["connect_timeout"] = int(os.getenv("DATABASE_CONNECT_TIMEOUT", "10"))
+
+    attempts = max(1, attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            return psycopg2.connect(database_url, **kwargs)
+        except psycopg2.OperationalError as exc:
+            if attempt >= attempts:
+                if logger:
+                    logger.error("Database connection failed after %s attempts: %s", attempts, exc)
+                raise
+
+            delay = min(max_delay, initial_delay * (2 ** (attempt - 1)))
+            if logger:
+                logger.warning(
+                    "Database connection attempt %s/%s failed: %s; retrying in %.1fs",
+                    attempt,
+                    attempts,
+                    exc,
+                    delay,
+                )
+            time.sleep(delay)
 
 
 def is_login_url(url: str) -> bool:

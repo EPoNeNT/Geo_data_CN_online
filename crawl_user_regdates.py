@@ -21,7 +21,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, execute_batch
 import requests
 
-from runtime_utils import looks_like_login_page, require_env, setup_logging
+from runtime_utils import connect_postgres, looks_like_login_page, require_env, setup_logging
 
 
 logger = setup_logging("crawl_user_regdates.log")
@@ -238,8 +238,9 @@ def fetch_registration_date(
 
 def connect_db():
     """Connect to Neon."""
-    return psycopg2.connect(
+    return connect_postgres(
         DATABASE_URL,
+        logger=logger,
         connect_timeout=10,
         cursor_factory=RealDictCursor,
     )

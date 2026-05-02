@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from runtime_utils import looks_like_login_page, require_env, setup_logging
+from runtime_utils import connect_postgres, looks_like_login_page, require_env, setup_logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
@@ -226,8 +226,9 @@ class DataGenerator:
 
     def connect(self):
         """Connect to database."""
-        self.conn = psycopg2.connect(
+        self.conn = connect_postgres(
             self.database_url,
+            logger=logger,
             connect_timeout=10,
             cursor_factory=RealDictCursor,
         )

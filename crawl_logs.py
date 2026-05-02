@@ -20,6 +20,7 @@ from urllib3.util.retry import Retry
 
 from runtime_utils import (
     AuthenticationError,
+    connect_postgres,
     is_login_url,
     looks_like_login_page,
     require_env,
@@ -91,8 +92,9 @@ class DatabaseManager:
 
     def connect(self):
         """连接数据库。"""
-        self.conn = psycopg2.connect(
+        self.conn = connect_postgres(
             self.database_url,
+            logger=logger,
             connect_timeout=10,
             keepalives=1,
             keepalives_idle=30,
@@ -381,7 +383,7 @@ class DatabaseManager:
                 self.cursor.execute(
                     """
                     UPDATE caches
-                    SET latitude = %s, longitude = %s, updated_at = CURRENT_TIMESTAMP
+                    SET latitude = %s, longitude = %s
                     WHERE code = %s
                     """,
                     (lat, lng, code),

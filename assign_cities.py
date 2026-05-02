@@ -16,7 +16,7 @@ try:
 except ImportError:
     pass
 
-from runtime_utils import require_env, setup_logging
+from runtime_utils import connect_postgres, require_env, setup_logging
 
 
 logger = setup_logging("assign_cities.log")
@@ -84,8 +84,9 @@ WHERE (
 
 
 def connect_db(database_url: str):
-    return psycopg2.connect(
+    return connect_postgres(
         database_url,
+        logger=logger,
         connect_timeout=10,
         keepalives=1,
         keepalives_idle=30,

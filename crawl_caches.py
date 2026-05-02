@@ -20,6 +20,7 @@ from urllib3.util.retry import Retry
 
 from runtime_utils import (
     AuthenticationError,
+    connect_postgres,
     is_login_url,
     looks_like_login_page,
     require_env,
@@ -148,8 +149,9 @@ class DatabaseManager:
     
     def connect(self):
         """连接数据库，设置 keepalive 参数保持连接"""
-        self.conn = psycopg2.connect(
+        self.conn = connect_postgres(
             self.database_url,
+            logger=logger,
             connect_timeout=10,
             keepalives=1,
             keepalives_idle=30,
@@ -222,9 +224,9 @@ class DatabaseManager:
                 geocache_type, container_type, difficulty, terrain,
                 cache_status, latitude, longitude, details_url,
                 placed_date, owner_username, last_found_date,
-                trackable_count, region, country, attributes, updated_at
+                trackable_count, region, country, attributes
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (code) DO UPDATE SET
                 name = EXCLUDED.name,
@@ -244,8 +246,7 @@ class DatabaseManager:
                 trackable_count = EXCLUDED.trackable_count,
                 region = EXCLUDED.region,
                 country = EXCLUDED.country,
-                attributes = EXCLUDED.attributes,
-                updated_at = CURRENT_TIMESTAMP
+                attributes = EXCLUDED.attributes
         """, (
             cache_data['id'], cache_data['name'], cache_data['code'],
             cache_data['premium_only'], cache_data['favorite_points'],
@@ -271,8 +272,8 @@ class DatabaseManager:
                 geocache_type, container_type, difficulty, terrain,
                 cache_status, latitude, longitude, details_url,
                 placed_date, owner_username, last_found_date,
-                trackable_count, region, country, attributes, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                trackable_count, region, country, attributes
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (code) DO UPDATE SET
                 name = EXCLUDED.name,
                 premium_only = EXCLUDED.premium_only,
@@ -291,8 +292,7 @@ class DatabaseManager:
                 trackable_count = EXCLUDED.trackable_count,
                 region = EXCLUDED.region,
                 country = EXCLUDED.country,
-                attributes = EXCLUDED.attributes,
-                updated_at = CURRENT_TIMESTAMP
+                attributes = EXCLUDED.attributes
         """
 
         # 分批处理
@@ -368,7 +368,7 @@ class DatabaseManager:
         for attempt in range(max_retries):
             try:
                 self.cursor.execute("""
-                    UPDATE caches SET cache_status = %s, updated_at = CURRENT_TIMESTAMP
+                    UPDATE caches SET cache_status = %s
                     WHERE code = %s
                 """, (status, code))
                 return
@@ -414,7 +414,6 @@ def mark_grid_completed(db: DatabaseManager, grid_id: int, cache_count: int):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # 不使用 updated_at，兼容旧表结构
             db.cursor.execute("""
                 UPDATE crawl_progress 
                 SET status = 'completed', cache_count = %s
@@ -439,7 +438,6 @@ def add_new_grids_to_db(db: DatabaseManager, grids: List[dict]):
             for grid in grids:
                 bounds = grid["bounds"]
                 count = grid.get("count")
-                # 不使用 created_at，兼容旧表结构
                 db.cursor.execute("""
                     INSERT INTO crawl_progress (grid_bounds, cache_count, status)
                     VALUES (%s, %s, 'pending')

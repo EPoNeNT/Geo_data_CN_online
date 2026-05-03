@@ -35,6 +35,7 @@ DEFAULT_BATCH_SIZE = int(os.getenv("USER_REGDATE_BATCH_SIZE", "50"))
 DEFAULT_LIMIT = os.getenv("USER_REGDATE_LIMIT", "500")
 MIN_LOG_COUNT_FOR_REGDATE_FETCH = 10
 MAX_LOGIN_REQUIRED_BEFORE_STOP = int(os.getenv("USER_REGDATE_MAX_LOGIN_REQUIRED", "20"))
+AUTH_CHECK_USER = os.getenv("USER_REGDATE_AUTH_CHECK_USER", "asakosachben")
 DEBUG_NOT_FOUND_HTML = os.getenv("USER_REGDATE_DEBUG_NOT_FOUND_HTML", "").lower() in {"1", "true", "yes"}
 DEBUG_HTML_DIR = Path(os.getenv("USER_REGDATE_DEBUG_HTML_DIR", "test/regdate_debug_pages"))
 
@@ -87,7 +88,33 @@ def parse_optional_int(value: Optional[str]) -> Optional[int]:
     return parsed
 
 
-def build_session() -> requests.Session:
+def normalize_cookie_value(value: str) -> str:
+    """Normalize cookie env values from .env files and GitHub Secrets."""
+    cookie = (value or "").strip()
+    if len(cookie) >= 2 and cookie[0] == cookie[-1] and cookie[0] in {"'", '"'}:
+        cookie = cookie[1:-1].strip()
+    return cookie
+
+
+def cookie_candidates() -> list[tuple[str, str]]:
+    """Return configured cookie candidates in priority order."""
+    candidates = []
+    seen_values = set()
+    for key in (
+        "GEOCACHING_COOKIE",
+        "GEOCACHING_COOKIES",
+        "GEOCOOKIE_NONPREMIUM",
+        "GEOCOOKIE_PREMIUM",
+    ):
+        value = normalize_cookie_value(os.getenv(key) or "")
+        if not value or value in seen_values:
+            continue
+        candidates.append((key, value))
+        seen_values.add(value)
+    return candidates
+
+
+def build_session(cookie: Optional[str] = None) -> requests.Session:
     """Create a requests session for Geocaching profile pages."""
     session = requests.Session()
     headers = {
@@ -99,17 +126,65 @@ def build_session() -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    cookie = (
-        os.getenv("GEOCACHING_COOKIE")
-        or os.getenv("GEOCACHING_COOKIES")
-        or os.getenv("GEOCOOKIE_NONPREMIUM")
-        or os.getenv("GEOCOOKIE_PREMIUM")
-    )
+    if cookie is None:
+        candidates = cookie_candidates()
+        cookie = candidates[0][1] if candidates else None
     if cookie:
         headers["Cookie"] = cookie
 
     session.headers.update(headers)
     return session
+
+
+def session_has_profile_access(session: requests.Session, user_name: str, timeout_seconds: int) -> bool:
+    """Return True when a session can read a known user's joined date."""
+    url = f"{PROFILE_URL}?u={quote(user_name)}"
+    response = session.get(url, timeout=timeout_seconds)
+    if response.status_code != 200:
+        logger.warning("Auth check returned HTTP %s for %s", response.status_code, user_name)
+        return False
+    if looks_like_login_page(response.url, response.text):
+        logger.warning("Auth check returned a login page for %s", user_name)
+        return False
+    parsed_date, raw_date = parse_registration_date(response.text)
+    if parsed_date:
+        return True
+
+    summary = summarize_profile_response(response.text)
+    logger.warning(
+        "Auth check could not read joined date for %s: final_url=%s length=%s title=%r markers=%s context=%r raw=%r",
+        user_name,
+        response.url,
+        len(response.text or ""),
+        summary["title"],
+        summary["markers"],
+        summary["joined_context"],
+        raw_date,
+    )
+    return False
+
+
+def build_authenticated_session(timeout_seconds: int) -> Optional[requests.Session]:
+    """Pick the first configured cookie that can read profile joined dates."""
+    candidates = cookie_candidates()
+    if not candidates:
+        logger.error("No Geocaching cookie env var is configured for registration-date crawling")
+        return None
+
+    for key, cookie in candidates:
+        session = build_session(cookie)
+        try:
+            logger.info("Checking %s for registration-date profile access", key)
+            if session_has_profile_access(session, AUTH_CHECK_USER, timeout_seconds):
+                logger.info("Using %s for registration-date crawling", key)
+                return session
+            logger.warning("%s failed registration-date auth check", key)
+        except requests.RequestException as exc:
+            logger.warning("%s auth check request failed: %s", key, exc)
+        session.close()
+
+    logger.error("No configured Geocaching cookie can read profile joined dates; stopping this run")
+    return None
 
 
 def clean_html_text(value: str) -> str:
@@ -310,6 +385,7 @@ def get_usernames_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> 
     LEFT JOIN "user" u ON u.user_name = candidate_users.user_name
     WHERE 1 = 1
       AND {user_filter}
+      AND candidate_users.user_name <> '[DELETED_USER]'
     ORDER BY candidate_users.user_name
     {limit_clause};
     """
@@ -343,7 +419,8 @@ def get_distinct_log_user_count(conn) -> int:
               SELECT user_name FROM owner_users
             )
             SELECT COUNT(*)::int AS count
-            FROM candidate_users;
+            FROM candidate_users
+            WHERE candidate_users.user_name <> '[DELETED_USER]';
             """,
             (MIN_LOG_COUNT_FOR_REGDATE_FETCH,),
         )
@@ -403,7 +480,12 @@ def main() -> None:
         )
         logger.info("Users to fetch: %s", len(user_names))
 
-        with build_session() as session:
+        session = build_authenticated_session(timeout_seconds=max(1, args.timeout))
+        if session is None:
+            logger.error("User registration date crawl skipped because profile access is unavailable")
+            return
+
+        with session:
             for index, user_name in enumerate(user_names, start=1):
                 started_at = time.monotonic()
                 registration_date, raw_date, status = fetch_registration_date(

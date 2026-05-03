@@ -32,8 +32,9 @@ DEFAULT_TIMEOUT_SECONDS = int(os.getenv("USER_REGDATE_TIMEOUT_SECONDS", "15"))
 DEFAULT_MAX_RETRIES = int(os.getenv("USER_REGDATE_MAX_RETRIES", "3"))
 DEFAULT_DELAY_SECONDS = float(os.getenv("USER_REGDATE_DELAY_SECONDS", "1.6"))
 DEFAULT_BATCH_SIZE = int(os.getenv("USER_REGDATE_BATCH_SIZE", "50"))
-DEFAULT_LIMIT = os.getenv("USER_REGDATE_LIMIT")
+DEFAULT_LIMIT = os.getenv("USER_REGDATE_LIMIT", "500")
 MIN_LOG_COUNT_FOR_REGDATE_FETCH = 10
+MAX_LOGIN_REQUIRED_BEFORE_STOP = int(os.getenv("USER_REGDATE_MAX_LOGIN_REQUIRED", "20"))
 DEBUG_NOT_FOUND_HTML = os.getenv("USER_REGDATE_DEBUG_NOT_FOUND_HTML", "").lower() in {"1", "true", "yes"}
 DEBUG_HTML_DIR = Path(os.getenv("USER_REGDATE_DEBUG_HTML_DIR", "test/regdate_debug_pages"))
 
@@ -382,6 +383,7 @@ def main() -> None:
     args = parse_args()
     conn = connect_db()
     pending_results = []
+    login_required_count = 0
 
     try:
         if args.dry_run:
@@ -423,6 +425,9 @@ def main() -> None:
                     elapsed,
                 )
 
+                if status == "login_required":
+                    login_required_count += 1
+
                 pending_results.append(
                     {
                         "user_name": user_name,
@@ -430,6 +435,14 @@ def main() -> None:
                         "fetch_status": status,
                     }
                 )
+
+                if login_required_count > MAX_LOGIN_REQUIRED_BEFORE_STOP:
+                    logger.error(
+                        "Stopping user registration crawl after %s login_required responses. "
+                        "Authentication may be lost; remaining users will be retried next run.",
+                        login_required_count,
+                    )
+                    break
 
                 if len(pending_results) >= max(1, args.batch_size):
                     upsert_results(conn, pending_results)

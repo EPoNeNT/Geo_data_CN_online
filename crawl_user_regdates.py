@@ -74,6 +74,10 @@ DATE_FORMATS = (
     "%d %B %Y",
     "%m.%d.%Y",
     "%d.%m.%Y",
+    "%Y. %m. %d.",
+    "%Y.%m.%d.",
+    "%Y. %m. %d",
+    "%Y.%m.%d",
 )
 
 
@@ -101,8 +105,8 @@ def cookie_candidates() -> list[tuple[str, str]]:
     candidates = []
     seen_values = set()
     for key in (
-        "GEOCACHING_COOKIE",
-        "GEOCACHING_COOKIES",
+        "REG-COOKIE",
+        "REG_COOKIE",
         "GEOCOOKIE_NONPREMIUM",
         "GEOCOOKIE_PREMIUM",
     ):

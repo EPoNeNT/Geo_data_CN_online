@@ -21,6 +21,7 @@ on:
 
 env:
   DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  REG_COOKIE: ${{ secrets.REG_COOKIE }}
   GEOCOOKIE_NONPREMIUM: ${{ secrets.GEOCOOKIE_NONPREMIUM }}
   GEOCOOKIE_PREMIUM: ${{ secrets.GEOCOOKIE_PREMIUM }}
 

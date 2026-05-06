@@ -661,6 +661,7 @@ def crawl_cache_group(
     crawled_codes = []
     all_logs = []
     failed_caches = []
+    LOG_UPLOAD_THRESHOLD = 2000
 
     consecutive_token_failures = 0
     MAX_CONSECUTIVE_TOKEN_FAILURES = 5
@@ -798,7 +799,7 @@ def crawl_cache_group(
                 else:
                     logger.error(f"  出错: {e}，重试次数已用完")
 
-        if (i + 1) % 30 == 0:
+        if len(all_logs) >= LOG_UPLOAD_THRESHOLD:
             if all_logs:
                 inserted, updated = db.smart_upsert_logs(all_logs)
                 logs_count += (inserted + updated)

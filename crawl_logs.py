@@ -453,6 +453,11 @@ def looks_like_public_geocaching_page(text: str) -> bool:
     return False
 
 
+def is_public_logbook_auth_error(error: Exception) -> bool:
+    """Return True when token fetch got a public logbook page instead of an authenticated one."""
+    return "public logbook page returned" in str(error)
+
+
 def get_logbook_token(gc_code: str, cookie: str) -> Optional[str]:
     """获取 logbook token。"""
     url = f"https://www.geocaching.com/seek/cache_details.aspx?wp={gc_code}"
@@ -633,9 +638,11 @@ def crawl_cache_group(
     logs_count = 0
     crawled_codes = []
     all_logs = []
+    failed_caches = []
 
     consecutive_token_failures = 0
     MAX_CONSECUTIVE_TOKEN_FAILURES = 5
+    MAX_PUBLIC_PAGE_RETRIES = 3
 
     logger.info(f"开始处理 {group_name} 组，共 {len(caches)} 个 cache")
 
@@ -649,6 +656,7 @@ def crawl_cache_group(
 
         retry_count = 0
         max_retries = 1
+        public_page_retries = 0
         success = False
 
         while retry_count <= max_retries and not success:
@@ -663,7 +671,34 @@ def crawl_cache_group(
                             logger.info(f"  更新坐标: ({new_lat}, {new_lng})")
                     time.sleep(1)
 
-                token = get_logbook_token(code, cookie)
+                try:
+                    token = get_logbook_token(code, cookie)
+                except AuthenticationError as e:
+                    if not is_public_logbook_auth_error(e):
+                        raise
+
+                    public_page_retries += 1
+                    if public_page_retries < MAX_PUBLIC_PAGE_RETRIES:
+                        logger.warning(
+                            f"  返回游客页，2 秒后重试: {code} "
+                            f"({public_page_retries}/{MAX_PUBLIC_PAGE_RETRIES})"
+                        )
+                        time.sleep(2)
+                        continue
+
+                    logger.error(
+                        f"  返回游客页，已重试 {MAX_PUBLIC_PAGE_RETRIES} 次，跳过: {code}"
+                    )
+                    failed_caches.append(
+                        {
+                            "code": code,
+                            "group": group_name,
+                            "reason": "public_logbook_page",
+                            "message": str(e),
+                        }
+                    )
+                    break
+
                 if not token:
                     consecutive_token_failures += 1
                     logger.warning(f"  无法获取 token (连续失败 {consecutive_token_failures}/{MAX_CONSECUTIVE_TOKEN_FAILURES})")
@@ -673,6 +708,14 @@ def crawl_cache_group(
                             f"Authentication failure detected: {MAX_CONSECUTIVE_TOKEN_FAILURES} consecutive caches "
                             f"failed to get logbook token in {group_name} group. Cookie may be invalid."
                         )
+                    failed_caches.append(
+                        {
+                            "code": code,
+                            "group": group_name,
+                            "reason": "token_missing",
+                            "message": "get_logbook_token returned no token",
+                        }
+                    )
                     break
 
                 consecutive_token_failures = 0
@@ -692,6 +735,14 @@ def crawl_cache_group(
                         time.sleep(1)
                         continue
                     logger.error(f"  logs 未完整获取，跳过更新 logs_crawled_at: {code}")
+                    failed_caches.append(
+                        {
+                            "code": code,
+                            "group": group_name,
+                            "reason": "incomplete_logs",
+                            "message": "logbook pages were not fetched completely",
+                        }
+                    )
                     break
 
                 if cache_logs:
@@ -745,7 +796,11 @@ def crawl_cache_group(
     db.commit()
 
     logger.info(f"{group_name} 组处理完成: 成功 {success_count}, 新增 logs {logs_count}")
-    return {"success_count": success_count, "logs_count": logs_count}
+    return {
+        "success_count": success_count,
+        "logs_count": logs_count,
+        "failed_caches": failed_caches,
+    }
 
 
 def run_logs_crawler():
@@ -774,6 +829,10 @@ def run_logs_crawler():
         today_str = datetime.now().strftime("%Y-%m-%d")
         premium_stats = crawl_cache_group(db, "premium", premium_caches, today_str)
         nonpremium_stats = crawl_cache_group(db, "nonpremium", nonpremium_caches, today_str)
+        failed_caches = (
+            premium_stats.get("failed_caches", [])
+            + nonpremium_stats.get("failed_caches", [])
+        )
 
         logger.info("=" * 50)
         logger.info(
@@ -785,6 +844,16 @@ def run_logs_crawler():
             f"分组统计: premium 成功 {premium_stats['success_count']} / logs {premium_stats['logs_count']}, "
             f"nonpremium 成功 {nonpremium_stats['success_count']} / logs {nonpremium_stats['logs_count']}"
         )
+        if failed_caches:
+            logger.warning(f"Failed caches: {len(failed_caches)}")
+            for item in failed_caches:
+                logger.warning(
+                    "Failed cache "
+                    f"group={item.get('group')} code={item.get('code')} "
+                    f"reason={item.get('reason')} message={item.get('message')}"
+                )
+        else:
+            logger.info("Failed caches: 0")
         logger.info("=" * 50)
 
     except Exception:

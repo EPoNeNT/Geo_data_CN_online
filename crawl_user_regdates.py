@@ -21,7 +21,13 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, execute_batch
 import requests
 
-from runtime_utils import connect_postgres, looks_like_login_page, require_env, setup_logging
+from runtime_utils import (
+    connect_postgres,
+    looks_like_login_page,
+    minimize_cookie_value,
+    require_env,
+    setup_logging,
+)
 
 
 logger = setup_logging("crawl_user_regdates.log")
@@ -94,10 +100,7 @@ def parse_optional_int(value: Optional[str]) -> Optional[int]:
 
 def normalize_cookie_value(value: str) -> str:
     """Normalize cookie env values from .env files and GitHub Secrets."""
-    cookie = (value or "").strip()
-    if len(cookie) >= 2 and cookie[0] == cookie[-1] and cookie[0] in {"'", '"'}:
-        cookie = cookie[1:-1].strip()
-    return cookie
+    return minimize_cookie_value(value)
 
 
 def cookie_candidates() -> list[tuple[str, str]]:

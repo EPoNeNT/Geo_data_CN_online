@@ -23,6 +23,8 @@ from runtime_utils import (
     connect_postgres,
     is_login_url,
     looks_like_login_page,
+    optional_cookie,
+    require_cookie,
     require_env,
     setup_logging,
 )
@@ -35,7 +37,8 @@ logger = setup_logging("crawl_caches.log")
 
 # 配置
 DATABASE_URL = require_env("DATABASE_URL")
-COOKIE = require_env("GEOCOOKIE_NONPREMIUM")
+COOKIE = require_cookie("GEOCOOKIE_NONPREMIUM", "GEOCACHING_COOKIE")
+PREMIUM_COOKIE = optional_cookie("GEOCOOKIE_PREMIUM")
 VERSION = "20260403.2.3046"
 MAP_VERSION_OVERRIDE = os.environ.get("GEOCACHING_MAP_VERSION")
 MAP_PAGE_URL = (
@@ -549,24 +552,38 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
     """按 GC code 获取单个 cache 的预览数据。"""
     api_url = f"https://www.geocaching.com/api/live/v1/search/geocachepreview/{gc_code}"
 
-    headers = {
-        "accept": "application/json",
-        "cookie": COOKIE,
-        "referer": "https://www.geocaching.com/play/map",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    }
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = session.get(api_url, headers=headers, timeout=15)
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 403:
+    cookie_candidates = []
+    seen_cookies = set()
+    for label, cookie in (("nonpremium", COOKIE), ("premium", PREMIUM_COOKIE)):
+        if not cookie or cookie in seen_cookies:
+            continue
+        cookie_candidates.append((label, cookie))
+        seen_cookies.add(cookie)
+
+    for label, cookie in cookie_candidates:
+        headers = {
+            "accept": "application/json",
+            "cookie": cookie,
+            "referer": "https://www.geocaching.com/play/map",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        }
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = session.get(api_url, headers=headers, timeout=15)
+                if response.status_code == 200:
+                    return response.json()
+                if response.status_code in {401, 403}:
+                    logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 返回 HTTP {response.status_code}")
+                    break
+                if response.status_code == 429:
+                    time.sleep(60)
+                    continue
+                logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 返回 HTTP {response.status_code}")
+                time.sleep(5 * (attempt + 1))
+            except Exception as exc:
+                logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 请求失败: {exc}")
                 time.sleep(10 * (attempt + 1))
-            elif response.status_code == 429:
-                time.sleep(60)
-        except Exception:
-            time.sleep(10 * (attempt + 1))
 
     return None
 
@@ -585,6 +602,7 @@ def process_cache_item(
     max_lat: Optional[float] = None,
     min_lng: Optional[float] = None,
     max_lng: Optional[float] = None,
+    require_allowed_country: bool = True,
 ) -> Optional[dict]:
     """处理单个 cache 项"""
     cache_lat = item.get('postedCoordinates', {}).get('latitude')
@@ -615,7 +633,7 @@ def process_cache_item(
         if not (is_in_box or is_premium):
             return None
     
-    if country not in ALLOWED_COUNTRIES:
+    if require_allowed_country and country not in ALLOWED_COUNTRIES:
         return None
     
     # 处理属性
@@ -929,11 +947,18 @@ def run_crawler():
                     continue
 
                 status = preview_data.get('cacheStatus')
-                cache_data = process_cache_item(preview_data)
                 existing_cache = scanned_data.get(gc_code)
+                cache_data = process_cache_item(preview_data, require_allowed_country=False)
 
                 if cache_data and existing_cache:
                     cache_record = dict(cache_data)
+                    for key, existing_value in existing_cache.items():
+                        if cache_record.get(key) is None and existing_value is not None:
+                            cache_record[key] = existing_value
+
+                    if 'attributes' not in preview_data and existing_cache.get('attributes') is not None:
+                        cache_record['attributes'] = existing_cache.get('attributes')
+
                     if (
                         cache_record.get('premium_only', False)
                         or cache_record.get('latitude') is None

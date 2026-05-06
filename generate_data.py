@@ -21,7 +21,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from runtime_utils import connect_postgres, looks_like_login_page, require_env, setup_logging
+from runtime_utils import (
+    connect_postgres,
+    looks_like_login_page,
+    minimize_cookie_value,
+    require_env,
+    setup_logging,
+)
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
@@ -411,7 +417,7 @@ class DataGenerator:
             or os.getenv("GEOCOOKIE_NONPREMIUM")
         )
         if cookie:
-            headers["Cookie"] = cookie
+            headers["Cookie"] = minimize_cookie_value(cookie)
         session.headers.update(headers)
         return session
 

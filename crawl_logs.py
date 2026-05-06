@@ -23,6 +23,7 @@ from runtime_utils import (
     connect_postgres,
     is_login_url,
     looks_like_login_page,
+    require_cookie,
     require_env,
     setup_logging,
 )
@@ -44,8 +45,8 @@ FTF_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
-NONPREMIUM_COOKIE = require_env("GEOCOOKIE_NONPREMIUM")
-PREMIUM_COOKIE = require_env("GEOCOOKIE_PREMIUM")
+NONPREMIUM_COOKIE = require_cookie("GEOCOOKIE_NONPREMIUM", "GEOCACHING_COOKIE")
+PREMIUM_COOKIE = require_cookie("GEOCOOKIE_PREMIUM")
 
 
 session = requests.Session()
@@ -430,6 +431,28 @@ def make_headers(cookie: str) -> dict:
     }
 
 
+def looks_like_public_geocaching_page(text: str) -> bool:
+    """Return True when Geocaching served a public page instead of an authenticated one."""
+    lowered = text or ""
+    compact = re.sub(r"\s+", "", lowered)
+    if '"isAuthenticated":false' in compact:
+        return True
+    if re.search(r"userInfo\s*=\s*\{\s*ID\s*:\s*0\s*\}", text or ""):
+        return True
+
+    match = re.search(
+        r'"pageInfo"\s*:\s*\{\s*"idx"\s*:\s*1,\s*"size"\s*:\s*(\d+),\s*"totalRows"\s*:\s*(\d+)',
+        text or "",
+    )
+    if match:
+        page_size = int(match.group(1))
+        total_rows = int(match.group(2))
+        if page_size <= 5 and total_rows > page_size:
+            return True
+
+    return False
+
+
 def get_logbook_token(gc_code: str, cookie: str) -> Optional[str]:
     """获取 logbook token。"""
     url = f"https://www.geocaching.com/seek/cache_details.aspx?wp={gc_code}"
@@ -443,6 +466,10 @@ def get_logbook_token(gc_code: str, cookie: str) -> Optional[str]:
                 if looks_like_login_page(resp.url, resp.text):
                     raise AuthenticationError(
                         f"Authentication failed while getting token for {gc_code}: redirected to login page"
+                    )
+                if looks_like_public_geocaching_page(resp.text):
+                    raise AuthenticationError(
+                        f"Authentication failed while getting token for {gc_code}: public logbook page returned"
                     )
 
                 match = re.search(r"userToken\s*=\s*['\"](.*?)['\"]", resp.text)
@@ -468,13 +495,13 @@ def get_logbook_token(gc_code: str, cookie: str) -> Optional[str]:
     return None
 
 
-def fetch_logs_for_cache(
+def fetch_logs_for_cache_result(
     gc_code: str,
     token: str,
     page_sleep: float,
     cookie: str,
     accepted_log_types: Optional[set] = None,
-) -> List[dict]:
+) -> Tuple[List[dict], bool]:
     """获取单个 cache 的所有 logs。"""
     if accepted_log_types is None:
         accepted_log_types = {FOUND_LOG_TYPE}
@@ -513,15 +540,18 @@ def fetch_logs_for_cache(
             ) as e:
                 logger.warning(f"网络异常: {gc_code} {e}，正在进行第 {attempt + 1} 次重试...")
                 time.sleep(2)
+            except (requests.RequestException, ValueError) as e:
+                logger.warning(f"Failed to fetch logs for {gc_code}: {e}; retrying ({attempt + 1})...")
+                time.sleep(2)
 
         if not success:
             logger.error(
                 f"获取 logs 失败 {gc_code}: 在重试 {max_retries} 次后依然无法连接服务器"
             )
-            break
+            return logs, False
 
         if not data:
-            break
+            return logs, True
 
         for item in data:
             log_type = item.get("LogType")
@@ -541,11 +571,30 @@ def fetch_logs_for_cache(
             )
 
         if len(data) < num_per_page:
-            break
+            return logs, True
 
         current_idx += 1
         time.sleep(page_sleep)
 
+    logger.error(f"Failed to fetch logs for {gc_code}: exceeded max pages {max_pages}; not marking as crawled")
+    return logs, False
+
+
+def fetch_logs_for_cache(
+    gc_code: str,
+    token: str,
+    page_sleep: float,
+    cookie: str,
+    accepted_log_types: Optional[set] = None,
+) -> List[dict]:
+    """Fetch logs for one cache. Kept for diagnostics and older callers."""
+    logs, _ = fetch_logs_for_cache_result(
+        gc_code,
+        token,
+        page_sleep,
+        cookie,
+        accepted_log_types=accepted_log_types,
+    )
     return logs
 
 
@@ -628,13 +677,22 @@ def crawl_cache_group(
 
                 consecutive_token_failures = 0
 
-                cache_logs = fetch_logs_for_cache(
+                cache_logs, crawl_complete = fetch_logs_for_cache_result(
                     code,
                     token,
                     page_sleep,
                     cookie,
                     accepted_log_types=accepted_log_types,
                 )
+
+                if not crawl_complete:
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        logger.warning(f"  logs 未完整获取，{code} 将在 1 秒后重试...")
+                        time.sleep(1)
+                        continue
+                    logger.error(f"  logs 未完整获取，跳过更新 logs_crawled_at: {code}")
+                    break
 
                 if cache_logs:
                     all_logs.extend(cache_logs)

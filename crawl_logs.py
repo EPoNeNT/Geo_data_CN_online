@@ -239,7 +239,8 @@ class DatabaseManager:
 
         self.cursor.execute(
             """
-            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf, log_type
+            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf, log_type,
+                   COUNT(*) OVER (PARTITION BY gc_code, user_name) AS duplicate_count
             FROM logs
             WHERE gc_code = ANY(%s)
             """,
@@ -254,6 +255,7 @@ class DatabaseManager:
                 "favorite_point_used": row[3],
                 "is_ftf": row[4],
                 "log_type": row[5],
+                "duplicate_count": row[6],
             }
         return existing
 
@@ -314,7 +316,7 @@ class DatabaseManager:
                     and (old_record.get("log_type") or FOUND_LOG_TYPE) == new_record["log_type"]
                 )
 
-                if not fields_match:
+                if not fields_match or int(old_record.get("duplicate_count") or 1) > 1:
                     # 字段有变化，需要更新
                     to_update.append(log)
 
@@ -357,6 +359,26 @@ class DatabaseManager:
     def _batch_update_logs(self, logs: List[dict]):
         """执行批量 UPDATE 操作，根据 (gc_code, user_name) 匹配并更新其他字段。"""
         for log in logs:
+            self.cursor.execute(
+                """
+                DELETE FROM logs
+                WHERE gc_code = %s
+                  AND user_name = %s
+                  AND ctid NOT IN (
+                      SELECT ctid
+                      FROM logs
+                      WHERE gc_code = %s AND user_name = %s
+                      ORDER BY visited DESC
+                      LIMIT 1
+                  )
+                """,
+                (
+                    log["GCCode"],
+                    log["UserName"],
+                    log["GCCode"],
+                    log["UserName"],
+                ),
+            )
             self.cursor.execute(
                 """
                 UPDATE logs

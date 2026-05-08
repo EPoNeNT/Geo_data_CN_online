@@ -8,6 +8,7 @@
 """
 
 import psycopg2
+import time
 
 try:
     from dotenv import load_dotenv
@@ -123,8 +124,25 @@ def update_cities(cursor) -> int:
     return int(cursor.rowcount or 0)
 
 
-def main() -> None:
-    database_url = require_env("DATABASE_URL")
+def safe_rollback(conn) -> None:
+    if not conn or conn.closed:
+        return
+    try:
+        conn.rollback()
+    except psycopg2.Error as exc:
+        logger.warning("数据库 rollback 失败，连接可能已关闭: %s", exc)
+
+
+def safe_close(conn) -> None:
+    if not conn or conn.closed:
+        return
+    try:
+        conn.close()
+    except psycopg2.Error as exc:
+        logger.warning("数据库连接关闭失败: %s", exc)
+
+
+def run_once(database_url: str) -> None:
     conn = connect_db(database_url)
 
     try:
@@ -135,11 +153,36 @@ def main() -> None:
         conn.commit()
         logger.info("城市划分完成，更新了 %s 条 caches.city 记录", updated)
     except Exception:
-        conn.rollback()
-        logger.exception("城市划分失败")
+        safe_rollback(conn)
         raise
     finally:
-        conn.close()
+        safe_close(conn)
+
+
+def main() -> None:
+    database_url = require_env("DATABASE_URL")
+    max_attempts = int(os.getenv("ASSIGN_CITIES_RETRIES", "3"))
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            run_once(database_url)
+            return
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            if attempt >= max_attempts:
+                logger.exception("城市划分失败，数据库连接错误重试次数已用完")
+                raise
+            wait_seconds = min(60, 5 * attempt)
+            logger.warning(
+                "城市划分遇到数据库连接错误，准备重试 %s/%s，等待 %s 秒: %s",
+                attempt + 1,
+                max_attempts,
+                wait_seconds,
+                exc,
+            )
+            time.sleep(wait_seconds)
+        except Exception:
+            logger.exception("城市划分失败")
+            raise
 
 
 if __name__ == "__main__":

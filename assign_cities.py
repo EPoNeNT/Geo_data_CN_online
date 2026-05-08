@@ -7,6 +7,7 @@
 2. 城市边界数据需提前一次性导入 map_cities（见 seed_map_cities_once.py）。
 """
 
+import os
 import psycopg2
 import time
 

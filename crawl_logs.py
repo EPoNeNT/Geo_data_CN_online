@@ -146,7 +146,7 @@ class DatabaseManager:
             SELECT c.code, c.latitude, c.longitude, c.premium_only,
                    c.geocache_type, c.logs_crawled_at, c.last_found_date
             FROM caches c
-            WHERE c.cache_status != 2
+            WHERE COALESCE(c.cache_status, 0) NOT IN (2, 404)
             ORDER BY c.code
             """
         )
@@ -818,7 +818,7 @@ def crawl_cache_group(
 
     db.commit()
 
-    logger.info(f"{group_name} 组处理完成: 成功 {success_count}, 新增 logs {logs_count}")
+    logger.info(f"{group_name} 组处理完成: {success_count}个cache, 新增 logs {logs_count}")
     return {
         "success_count": success_count,
         "logs_count": logs_count,
@@ -860,12 +860,12 @@ def run_logs_crawler():
         logger.info("=" * 50)
         logger.info(
             "Logs 爬取完成! "
-            f"总成功: {premium_stats['success_count'] + nonpremium_stats['success_count']}, "
+            f"总计: {premium_stats['success_count'] + nonpremium_stats['success_count']}个cache, "
             f"总新增 logs: {premium_stats['logs_count'] + nonpremium_stats['logs_count']}"
         )
         logger.info(
-            f"分组统计: premium 成功 {premium_stats['success_count']} / logs {premium_stats['logs_count']}, "
-            f"nonpremium 成功 {nonpremium_stats['success_count']} / logs {nonpremium_stats['logs_count']}"
+            f"分组统计: premium {premium_stats['success_count']}个cache / logs {premium_stats['logs_count']}, "
+            f"nonpremium {nonpremium_stats['success_count']}个cache / logs {nonpremium_stats['logs_count']}"
         )
         if failed_caches:
             logger.warning(f"Failed caches: {len(failed_caches)}")

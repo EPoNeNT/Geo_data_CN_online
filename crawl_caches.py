@@ -50,6 +50,8 @@ MAP_PAGE_URL = (
 )
 ALLOWED_COUNTRIES = ["China", "Hong Kong", "Taiwan", "Macao"]
 MAX_RETRIES = 3
+CACHE_DELETED_STATUS = 404
+DELETED_PREVIEW_MARKER = "__deleted_cache"
 _DETECTED_MAP_VERSION = None
 
 # 设置重试策略
@@ -548,6 +550,10 @@ def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float) -
     return None
 
 
+def is_deleted_cache_preview(data: Optional[dict]) -> bool:
+    return bool(data and data.get(DELETED_PREVIEW_MARKER))
+
+
 def fetch_cache_preview(gc_code: str) -> Optional[dict]:
     """按 GC code 获取单个 cache 的预览数据。"""
     api_url = f"https://www.geocaching.com/api/live/v1/search/geocachepreview/{gc_code}"
@@ -560,6 +566,8 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
         cookie_candidates.append((label, cookie))
         seen_cookies.add(cookie)
 
+    all_candidates_returned_404 = bool(cookie_candidates)
+
     for label, cookie in cookie_candidates:
         headers = {
             "accept": "application/json",
@@ -568,22 +576,46 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
         }
 
+        cookie_404_count = 0
         for attempt in range(MAX_RETRIES):
             try:
                 response = session.get(api_url, headers=headers, timeout=15)
                 if response.status_code == 200:
                     return response.json()
                 if response.status_code in {401, 403}:
+                    all_candidates_returned_404 = False
                     logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 返回 HTTP {response.status_code}")
                     break
+                if response.status_code == CACHE_DELETED_STATUS:
+                    cookie_404_count += 1
+                    logger.warning(
+                        f"  {gc_code} 预览接口使用 {label} cookie 返回 HTTP 404 "
+                        f"({cookie_404_count}/{MAX_RETRIES})"
+                    )
+                    time.sleep(5 * (attempt + 1))
+                    continue
                 if response.status_code == 429:
+                    all_candidates_returned_404 = False
                     time.sleep(60)
                     continue
+                all_candidates_returned_404 = False
                 logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 返回 HTTP {response.status_code}")
                 time.sleep(5 * (attempt + 1))
             except Exception as exc:
+                all_candidates_returned_404 = False
                 logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 请求失败: {exc}")
                 time.sleep(10 * (attempt + 1))
+
+        if cookie_404_count != MAX_RETRIES:
+            all_candidates_returned_404 = False
+
+    if len(cookie_candidates) >= 2 and all_candidates_returned_404:
+        logger.warning(f"  {gc_code} 使用两个 cookie 均连续 {MAX_RETRIES} 次返回 404，标记为已删除")
+        return {
+            "code": gc_code,
+            "cacheStatus": CACHE_DELETED_STATUS,
+            DELETED_PREVIEW_MARKER: True,
+        }
 
     return None
 
@@ -943,6 +975,18 @@ def run_crawler():
                 if not preview_data:
                     failed_preview_count += 1
                     logger.warning(f"  {gc_code} 获取预览数据失败，跳过字段更新")
+                    time.sleep(random.uniform(0.5, 1.0))
+                    continue
+
+                if is_deleted_cache_preview(preview_data):
+                    existing_cache = scanned_data.get(gc_code)
+                    if existing_cache and existing_cache.get('cache_status') != CACHE_DELETED_STATUS:
+                        status_only_updates.append((gc_code, CACHE_DELETED_STATUS))
+                        updated_codes.add(gc_code)
+                        logger.info(f"  {gc_code} 已确认删除，仅更新状态为 {CACHE_DELETED_STATUS}")
+                    else:
+                        unchanged_potential += 1
+                        logger.info(f"  {gc_code} 已确认删除，状态无变化")
                     time.sleep(random.uniform(0.5, 1.0))
                     continue
 

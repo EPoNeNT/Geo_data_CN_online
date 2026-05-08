@@ -89,13 +89,16 @@ CACHE_TYPE_FILTERS = {
 }
 
 # Cache filters. Most statistics include archived caches, but D/T matrices and
-# active yearly trend counts still exclude them.
-EXCLUDE_CACHE_WHERE = f"c.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
-EXCLUDE_CACHE_JOIN = f"c.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
-ACTIVE_CACHE_WHERE = f"c.cache_status != 2 AND c.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
-ACTIVE_CACHE_JOIN = f"c.cache_status != 2 AND c.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
-EVENT_CACHE_WHERE = f"c.geocache_type IN ({EVENT_CACHE_TYPES})"
-EVENT_CACHE_JOIN = f"c.geocache_type IN ({EVENT_CACHE_TYPES})"
+# active yearly trend counts still exclude them. Deleted caches are excluded from
+# every generated dataset.
+CACHE_NOT_DELETED_WHERE = "COALESCE(c.cache_status, 0) != 404"
+CACHE_NOT_DELETED_JOIN = "COALESCE(c.cache_status, 0) != 404"
+EXCLUDE_CACHE_WHERE = f"{CACHE_NOT_DELETED_WHERE} AND c.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
+EXCLUDE_CACHE_JOIN = f"{CACHE_NOT_DELETED_JOIN} AND c.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
+ACTIVE_CACHE_WHERE = f"COALESCE(c.cache_status, 0) NOT IN (2, 404) AND c.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
+ACTIVE_CACHE_JOIN = f"COALESCE(c.cache_status, 0) NOT IN (2, 404) AND c.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
+EVENT_CACHE_WHERE = f"{CACHE_NOT_DELETED_WHERE} AND c.geocache_type IN ({EVENT_CACHE_TYPES})"
+EVENT_CACHE_JOIN = f"{CACHE_NOT_DELETED_JOIN} AND c.geocache_type IN ({EVENT_CACHE_TYPES})"
 OWNER_USERNAME_FILTER = (
     "c.owner_username IS NOT NULL AND c.owner_username <> '' "
     "AND c.owner_username <> '[DELETED_USER]'"
@@ -103,7 +106,8 @@ OWNER_USERNAME_FILTER = (
 CACHE_RANKING_ENTRY_FILTER = (
     "c.code IS NOT NULL AND c.code <> '' "
     "AND c.name IS NOT NULL AND c.name <> '' "
-    "AND c.owner_username IS NOT NULL AND c.owner_username <> ''"
+    "AND c.owner_username IS NOT NULL AND c.owner_username <> '' "
+    "AND COALESCE(c.cache_status, 0) != 404"
 )
 COUNTRY_SUBTITLE_MAP = {
     "China": "中国",
@@ -585,10 +589,17 @@ class DataGenerator:
         if country_filter:
             country_value = sql_literal(country_filter)
             cache_where = f"WHERE {EXCLUDE_CACHE_WHERE} AND c.country = {country_value}"
-            log_where = f"WHERE c2.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES}) AND c2.country = {country_value}"
+            log_where = (
+                f"WHERE COALESCE(c2.cache_status, 0) != 404 "
+                f"AND c2.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES}) "
+                f"AND c2.country = {country_value}"
+            )
         else:
             cache_where = f"WHERE {EXCLUDE_CACHE_WHERE}"
-            log_where = f"WHERE c2.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
+            log_where = (
+                f"WHERE COALESCE(c2.cache_status, 0) != 404 "
+                f"AND c2.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
+            )
 
         query = f"""
         WITH cache_scope AS (

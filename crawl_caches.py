@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Geocache 爬虫 - 适配 Neon 数据库
 基于 get_caches.py 的逻辑重写
@@ -39,6 +39,8 @@ logger = setup_logging("crawl_caches.log")
 DATABASE_URL = require_env("DATABASE_URL")
 COOKIE = require_cookie("GEOCOOKIE_NONPREMIUM", "GEOCACHING_COOKIE")
 PREMIUM_COOKIE = optional_cookie("GEOCOOKIE_PREMIUM")
+_RAW_NONPREMIUM_COOKIE = (os.environ.get("GEOCOOKIE_NONPREMIUM") or os.environ.get("GEOCACHING_COOKIE") or "").strip().strip('"').strip("'")
+_RAW_PREMIUM_COOKIE = (os.environ.get("GEOCOOKIE_PREMIUM") or "").strip().strip('"').strip("'")
 VERSION = "20260403.2.3046"
 MAP_VERSION_OVERRIDE = os.environ.get("GEOCACHING_MAP_VERSION")
 MAP_PAGE_URL = (
@@ -560,7 +562,7 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
 
     cookie_candidates = []
     seen_cookies = set()
-    for label, cookie in (("nonpremium", COOKIE), ("premium", PREMIUM_COOKIE)):
+    for label, cookie in (("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)):
         if not cookie or cookie in seen_cookies:
             continue
         cookie_candidates.append((label, cookie))
@@ -570,10 +572,20 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
 
     for label, cookie in cookie_candidates:
         headers = {
-            "accept": "application/json",
+            "accept": "*/*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "cache-control": "no-cache",
             "cookie": cookie,
+            "pragma": "no-cache",
             "referer": "https://www.geocaching.com/play/map",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "x-nextjs-data": "1",
         }
 
         cookie_404_count = 0
@@ -610,7 +622,11 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
             all_candidates_returned_404 = False
 
     if len(cookie_candidates) >= 2 and all_candidates_returned_404:
-        logger.warning(f"  {gc_code} 使用两个 cookie 均连续 {MAX_RETRIES} 次返回 404，标记为已删除")
+        if _cache_webpage_exists(gc_code):
+            logger.warning(f"  {gc_code} 预览接口返回 404 但网页可访问，不标记为已删除")
+            return None
+
+        logger.warning(f"  {gc_code} 使用两个 cookie 均连续 {MAX_RETRIES} 次返回 404 且网页不可访问，标记为已删除")
         return {
             "code": gc_code,
             "cacheStatus": CACHE_DELETED_STATUS,
@@ -618,6 +634,39 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
         }
 
     return None
+
+
+def _cache_webpage_exists(gc_code: str) -> bool:
+    detail_url = f"https://www.geocaching.com/geocache/{gc_code}"
+    for label, cookie in (("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)):
+        if not cookie:
+            continue
+        headers = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "cookie": cookie,
+            "referer": "https://www.geocaching.com/play/map",
+            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        }
+        try:
+            resp = session.get(detail_url, headers=headers, timeout=15, allow_redirects=True)
+            if resp.status_code == 200 and "geocache" in resp.url:
+                logger.info(f"  {gc_code} 网页存在 (via {label} cookie)")
+                return True
+            if resp.status_code == 404:
+                logger.info(f"  {gc_code} 网页也返回 404 (via {label} cookie)")
+                return False
+        except Exception as exc:
+            logger.warning(f"  {gc_code} 网页检查失败 (via {label} cookie): {exc}")
+    return False
 
 
 def check_cache_status(gc_code: str) -> Optional[int]:

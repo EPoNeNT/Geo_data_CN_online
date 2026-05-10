@@ -622,51 +622,9 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
             all_candidates_returned_404 = False
 
     if len(cookie_candidates) >= 2 and all_candidates_returned_404:
-        if _cache_webpage_exists(gc_code):
-            logger.warning(f"  {gc_code} 预览接口返回 404 但网页可访问，不标记为已删除")
-            return None
-
-        logger.warning(f"  {gc_code} 使用两个 cookie 均连续 {MAX_RETRIES} 次返回 404 且网页不可访问，标记为已删除")
-        return {
-            "code": gc_code,
-            "cacheStatus": CACHE_DELETED_STATUS,
-            DELETED_PREVIEW_MARKER: True,
-        }
+        logger.warning(f"  {gc_code} 两个 cookie 均连续 {MAX_RETRIES} 次返回 404，本次爬取跳过")
 
     return None
-
-
-def _cache_webpage_exists(gc_code: str) -> bool:
-    detail_url = f"https://www.geocaching.com/geocache/{gc_code}"
-    for label, cookie in (("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)):
-        if not cookie:
-            continue
-        headers = {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "cookie": cookie,
-            "referer": "https://www.geocaching.com/play/map",
-            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        }
-        try:
-            resp = session.get(detail_url, headers=headers, timeout=15, allow_redirects=True)
-            if resp.status_code == 200 and "geocache" in resp.url:
-                logger.info(f"  {gc_code} 网页存在 (via {label} cookie)")
-                return True
-            if resp.status_code == 404:
-                logger.info(f"  {gc_code} 网页也返回 404 (via {label} cookie)")
-                return False
-        except Exception as exc:
-            logger.warning(f"  {gc_code} 网页检查失败 (via {label} cookie): {exc}")
-    return False
 
 
 def check_cache_status(gc_code: str) -> Optional[int]:
@@ -886,7 +844,7 @@ def run_crawler():
         current_crawl_codes = set()
         new_codes = set()
         updated_codes = set()
-        grids_to_split = []  # 需要切分的网格
+        crawled_bounds: list[tuple[float, float, float, float]] = []
         commit_counter = 0  # 提交计数器
         COMMIT_INTERVAL = 10  # 每10个网格提交一次
         
@@ -920,6 +878,7 @@ def run_crawler():
             
             results = data.get('pageProps', {}).get('searchResults', {}).get('results', [])
             cache_count = len(results)
+            crawled_bounds.append((max_lat, min_lng, min_lat, max_lng))
             logger.info(f"  获取到 {cache_count} 个结果")
             
             new_in_grid = 0
@@ -1007,9 +966,37 @@ def run_crawler():
             db.commit()
             logger.info(f"已提交 {commit_counter} 个网格的事务")
         
-        # 检查已归档的 cache（批量查询优化）
-        archived_codes = list(original_codes - current_crawl_codes)
-        logger.info(f"Potential Archived: {len(archived_codes)}")
+        # 检查本次爬取中未出现的 cache（仅限爬取框内的）
+        all_missing = list(original_codes - current_crawl_codes)
+        logger.info(f"Caches not found in this crawl: {len(all_missing)}")
+
+        archived_codes: list[str] = []
+        skipped_outside_grids = 0
+        if crawled_bounds:
+            for gc_code in all_missing:
+                existing = scanned_data.get(gc_code)
+                if not existing:
+                    archived_codes.append(gc_code)
+                    continue
+                lat = existing.get('latitude')
+                lng = existing.get('longitude')
+                if lat is None or lng is None:
+                    archived_codes.append(gc_code)
+                    continue
+                in_grid = any(
+                    min_lat <= lat <= max_lat and min_lng <= lng <= max_lng
+                    for max_lat, min_lng, min_lat, max_lng in crawled_bounds
+                )
+                if in_grid:
+                    archived_codes.append(gc_code)
+                else:
+                    skipped_outside_grids += 1
+            if skipped_outside_grids:
+                logger.info(f"  跳过 {skipped_outside_grids} 个不在本次爬取框内的 cache")
+        else:
+            archived_codes = all_missing
+
+        logger.info(f"Potential Archived (within crawled grids): {len(archived_codes)}")
         
         if archived_codes:
             logger.info("逐个检查潜在归档缓存的最新字段...")

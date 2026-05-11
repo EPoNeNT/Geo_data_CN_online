@@ -10,7 +10,7 @@ import time
 import random
 import re
 from datetime import datetime, timezone
-from typing import List, Dict, Set, Optional, Tuple
+from typing import Any, List, Dict, Set, Optional, Tuple
 
 import requests
 import psycopg2
@@ -622,8 +622,152 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
             all_candidates_returned_404 = False
 
     if len(cookie_candidates) >= 2 and all_candidates_returned_404:
-        logger.warning(f"  {gc_code} 两个 cookie 均连续 {MAX_RETRIES} 次返回 404，本次爬取跳过")
+        logger.warning(f"  {gc_code} 两个 cookie 均连续 {MAX_RETRIES} 次返回 404")
+        page_data = _fetch_archived_cache_page_data(gc_code)
+        if page_data is not None:
+            page_data["cacheStatus"] = 2
+            fields = [k for k in page_data if k != "code"]
+            logger.info(f"  {gc_code} 预览接口返回 404 但网页可访问，从详情页提取 {len(fields)} 个字段")
+            return page_data
+        logger.warning(f"  {gc_code} 网页也不可访问，本次爬取跳过")
 
+    return None
+
+
+def _fetch_archived_cache_page_data(gc_code: str) -> Optional[dict]:
+    """从 cache 详情页提取已归档 cache 的元数据（preview API 对已归档 cache 返回 404）。
+
+    返回 API 格式的 dict（code, name, cacheStatus, owner->username 等），
+    以便下游 process_cache_item 能正常处理。
+    """
+    detail_url = f"https://www.geocaching.com/geocache/{gc_code}"
+
+    type_names = {
+        "traditional": 2, "traditional cache": 2,
+        "multi": 3, "multi-cache": 3, "multicache": 3,
+        "mystery": 8, "puzzle": 8, "unknown": 8,
+        "earthcache": 13, "earth": 13,
+        "letterbox": 5, "letterbox hybrid": 5,
+        "wherigo": 19,
+        "virtual": 4,
+        "webcam": 11,
+        "event": 6, "cito": 7, "mega": 453, "giga": 4732,
+    }
+    container_names = {
+        "micro": 2, "small": 3, "regular": 4, "large": 5,
+        "other": 8, "not chosen": 8, "virtual": 6,
+    }
+
+    for label, cookie in (("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)):
+        if not cookie:
+            continue
+        headers = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "cookie": cookie,
+            "referer": "https://www.geocaching.com/play/map",
+            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        }
+        try:
+            resp = session.get(detail_url, headers=headers, timeout=15, allow_redirects=True)
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200 or "geocache" not in resp.url:
+                continue
+
+            text = resp.text
+            result: dict[str, Any] = {"code": gc_code}
+
+            jsonld_match = re.search(
+                r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                text, re.DOTALL | re.IGNORECASE,
+            )
+            if jsonld_match:
+                try:
+                    ld = json.loads(jsonld_match.group(1))
+                    if isinstance(ld, dict):
+                        if ld.get("name"):
+                            result["name"] = ld["name"]
+                        if ld.get("placedBy"):
+                            result["owner"] = {"username": ld["placedBy"]}
+                        if ld.get("datePublished"):
+                            result["placedDate"] = ld["datePublished"]
+                        loc = ld.get("location")
+                        if isinstance(loc, dict):
+                            lat = loc.get("latitude")
+                            lng = loc.get("longitude")
+                            if lat is not None and lng is not None:
+                                result["postedCoordinates"] = {"latitude": float(lat), "longitude": float(lng)}
+                        contained = ld.get("containedInPlace")
+                        if isinstance(contained, dict) and contained.get("name"):
+                            result["country"] = contained["name"]
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+
+            if "owner" not in result:
+                author_match = re.search(
+                    r'<meta[^>]*name="author"[^>]*content="([^"]*)"',
+                    text, re.IGNORECASE,
+                )
+                if author_match:
+                    result["owner"] = {"username": author_match.group(1).strip()}
+
+            if "name" not in result:
+                title_match = re.search(
+                    r'<title>(?:GC\w+\s*-\s*)?([^<]+)</title>',
+                    text, re.IGNORECASE,
+                )
+                if title_match:
+                    result["name"] = title_match.group(1).strip()
+                else:
+                    og_match = re.search(
+                        r'<meta[^>]*property="og:title"[^>]*content="[^"]*-\s*([^"]*)"',
+                        text, re.IGNORECASE,
+                    )
+                    if og_match:
+                        result["name"] = og_match.group(1).strip()
+
+            diff_match = re.search(r'[Dd]ifficulty[:\s]*([\d.]+)', text)
+            if diff_match:
+                try:
+                    result["difficulty"] = round(float(diff_match.group(1)), 1)
+                except (TypeError, ValueError):
+                    pass
+
+            terr_match = re.search(r'[Tt]errain[:\s]*([\d.]+)', text)
+            if terr_match:
+                try:
+                    result["terrain"] = round(float(terr_match.group(1)), 1)
+                except (TypeError, ValueError):
+                    pass
+
+            type_match = re.search(r'[Tt]ype[:\s]*([^<]+)', text)
+            if type_match:
+                type_text = type_match.group(1).strip().lower()
+                for key, type_id in type_names.items():
+                    if key in type_text:
+                        result["geocacheType"] = type_id
+                        break
+
+            size_match = re.search(r'(?:[Ss]ize|[Cc]ontainer)[:\s]*([^<]+)', text)
+            if size_match:
+                size_text = size_match.group(1).strip().lower()
+                for key, type_id in container_names.items():
+                    if key in size_text:
+                        result["containerType"] = type_id
+                        break
+
+            return result
+        except Exception:
+            continue
     return None
 
 

@@ -74,7 +74,7 @@ from crawl_logs import (  # noqa: E402
 
 CacheRow = Tuple[str, Optional[float], Optional[float], bool]
 CrawlCache = Tuple[str, Optional[float], Optional[float]]
-ChangedCacheSummary = Dict[str, Dict[str, int]]
+ChangedCacheSummary = Dict[str, Dict[str, Any]]
 
 
 def utc_now_iso() -> str:
@@ -216,7 +216,9 @@ def summarize_changed_logs_by_cache(
 
     gc_codes = list({log["GCCode"] for log in new_logs})
     existing_logs = db.get_existing_logs_for_caches(gc_codes)
-    summary: ChangedCacheSummary = defaultdict(lambda: {"raw": 0, "inserted": 0, "updated": 0})
+    summary: ChangedCacheSummary = defaultdict(
+        lambda: {"raw": 0, "inserted": 0, "updated": 0, "details": []}
+    )
 
     for log in new_logs:
         gc_code = log["GCCode"]
@@ -226,21 +228,63 @@ def summarize_changed_logs_by_cache(
         if key not in existing_logs:
             summary[gc_code]["raw"] += 1
             summary[gc_code]["inserted"] += 1
+            summary[gc_code]["details"].append(
+                {
+                    "user": user_name,
+                    "action": "insert",
+                    "reasons": ["missing"],
+                    "api": {
+                        "visited": normalize_log_date_for_compare(log["Visited"]),
+                        "favorite_point_used": bool(log.get("FavoritePointUsed", False)),
+                        "is_ftf": bool(log.get("IsFTF", False)),
+                        "log_type": log.get("LogType", FOUND_LOG_TYPE),
+                    },
+                }
+            )
             continue
 
         old_record = existing_logs[key]
         db_visited_str = normalize_log_date_for_compare(old_record["visited"])
         api_visited_str = normalize_log_date_for_compare(log["Visited"])
+        api_record = {
+            "visited": api_visited_str,
+            "favorite_point_used": bool(log.get("FavoritePointUsed", False)),
+            "is_ftf": bool(log.get("IsFTF", False)),
+            "log_type": log.get("LogType", FOUND_LOG_TYPE),
+        }
+        db_record = {
+            "visited": db_visited_str,
+            "favorite_point_used": bool(old_record["favorite_point_used"]),
+            "is_ftf": bool(old_record["is_ftf"]),
+            "log_type": old_record.get("log_type") or FOUND_LOG_TYPE,
+            "duplicate_count": int(old_record.get("duplicate_count") or 1),
+        }
         fields_match = (
-            db_visited_str == api_visited_str
-            and bool(old_record["favorite_point_used"]) == bool(log.get("FavoritePointUsed", False))
-            and bool(old_record["is_ftf"]) == bool(log.get("IsFTF", False))
-            and (old_record.get("log_type") or FOUND_LOG_TYPE) == log.get("LogType", FOUND_LOG_TYPE)
+            db_record["visited"] == api_record["visited"]
+            and db_record["favorite_point_used"] == api_record["favorite_point_used"]
+            and db_record["is_ftf"] == api_record["is_ftf"]
+            and db_record["log_type"] == api_record["log_type"]
         )
 
-        if not fields_match or int(old_record.get("duplicate_count") or 1) > 1:
+        if not fields_match or db_record["duplicate_count"] > 1:
+            reasons = [
+                field
+                for field in ("visited", "favorite_point_used", "is_ftf", "log_type")
+                if db_record[field] != api_record[field]
+            ]
+            if db_record["duplicate_count"] > 1:
+                reasons.append("duplicate_count")
             summary[gc_code]["raw"] += 1
             summary[gc_code]["updated"] += 1
+            summary[gc_code]["details"].append(
+                {
+                    "user": user_name,
+                    "action": "update",
+                    "reasons": reasons,
+                    "db": db_record,
+                    "api": api_record,
+                }
+            )
 
     return dict(summary)
 
@@ -250,13 +294,18 @@ def merge_changed_cache_summary(
     source: ChangedCacheSummary,
 ) -> None:
     for code, counts in source.items():
-        existing = target.setdefault(code, {"raw": 0, "inserted": 0, "updated": 0})
+        existing = target.setdefault(code, {"raw": 0, "inserted": 0, "updated": 0, "details": []})
         existing["raw"] += counts.get("raw", 0)
         existing["inserted"] += counts.get("inserted", 0)
         existing["updated"] += counts.get("updated", 0)
+        existing["details"].extend(counts.get("details", []))
 
 
-def log_changed_cache_summary(prefix: str, summary: ChangedCacheSummary) -> None:
+def log_changed_cache_summary(
+    prefix: str,
+    summary: ChangedCacheSummary,
+    detail_limit_per_cache: int = 5,
+) -> None:
     if not summary:
         logger.info("%s changed caches: 0", prefix)
         return
@@ -272,6 +321,24 @@ def log_changed_cache_summary(prefix: str, summary: ChangedCacheSummary) -> None
             counts.get("inserted", 0),
             counts.get("updated", 0),
         )
+        for detail in counts.get("details", [])[:detail_limit_per_cache]:
+            logger.info(
+                "%s changed log: %s user=%s action=%s reasons=%s db=%s api=%s",
+                prefix,
+                code,
+                detail.get("user"),
+                detail.get("action"),
+                ",".join(detail.get("reasons", [])),
+                detail.get("db"),
+                detail.get("api"),
+            )
+
+
+def count_summary_changes(summary: ChangedCacheSummary) -> int:
+    return sum(
+        int(counts.get("inserted", 0)) + int(counts.get("updated", 0))
+        for counts in summary.values()
+    )
 
 
 def get_archived_caches(
@@ -351,7 +418,22 @@ def flush_batch(
             updated,
             changed_logs,
         )
-        log_changed_cache_summary("Batch", changed_cache_summary)
+        candidate_changed_logs = count_summary_changes(changed_cache_summary)
+        if changed_logs > 0:
+            if candidate_changed_logs != changed_logs:
+                logger.warning(
+                    "Batch changed-log candidate count %s differs from actual changed count %s",
+                    candidate_changed_logs,
+                    changed_logs,
+                )
+                log_changed_cache_summary("Batch candidate", changed_cache_summary)
+            else:
+                log_changed_cache_summary("Batch actual", changed_cache_summary)
+        elif candidate_changed_logs > 0:
+            logger.info(
+                "Batch changed-log candidates %s produced no actual DB changes",
+                candidate_changed_logs,
+            )
 
     if pending_codes:
         db.batch_update_logs_crawled_at(pending_codes, today_str)
@@ -361,6 +443,8 @@ def flush_batch(
     state["stats"]["success"] = len(state["completed"])
     state["stats"]["logsChanged"] = state["stats"].get("logsChanged", 0) + changed_logs
     save_state(state_file, state)
+    if changed_logs <= 0:
+        return changed_logs, {}
     return changed_logs, changed_cache_summary
 
 

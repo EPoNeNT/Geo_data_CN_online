@@ -1,0 +1,93 @@
+name: Archived Logs Crawler
+
+on:
+  # Checked weekly at Beijing time Monday 04:00 = UTC Sunday 20:00.
+  # The job body runs every two weeks from the 2026-05-24 20:00 UTC anchor.
+  schedule:
+    - cron: '0 20 * * 0'
+
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Optional --limit value for a manual run'
+        required: false
+        type: string
+
+env:
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  GEOCOOKIE_NONPREMIUM: ${{ secrets.GEOCOOKIE_NONPREMIUM }}
+  GEOCOOKIE_PREMIUM: ${{ secrets.GEOCOOKIE_PREMIUM }}
+
+jobs:
+  crawl-archived-logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check biweekly schedule
+        id: biweekly
+        if: github.event_name == 'schedule'
+        shell: bash
+        run: |
+          anchor=$(date -u -d '2026-05-24 20:00:00 UTC' +%s)
+          now=$(date -u +%s)
+          elapsed_days=$(( (now - anchor) / 86400 ))
+
+          if [ "$elapsed_days" -lt 0 ]; then
+            should_run=false
+          else
+            week_index=$(( elapsed_days / 7 ))
+            if [ $(( week_index % 2 )) -eq 0 ]; then
+              should_run=true
+            else
+              should_run=false
+            fi
+          fi
+
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+          echo "Biweekly archived logs run: $should_run"
+
+      - name: Skip off-week schedule
+        if: github.event_name == 'schedule' && steps.biweekly.outputs.should_run != 'true'
+        run: echo "Skipping archived logs crawler this week."
+
+      - name: Checkout code
+        if: github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        if: github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run archived logs crawler
+        if: github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          if [ -n "$CRAWL_LIMIT" ]; then
+            python crawl_archived_logs.py --limit "$CRAWL_LIMIT"
+          else
+            python crawl_archived_logs.py
+          fi
+        env:
+          LOG_TO_FILE: '1'
+          CRAWL_LIMIT: ${{ github.event.inputs.limit }}
+
+      - name: Upload run artifacts
+        if: always() && (github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: archived-logs-crawler-artifacts
+          path: |
+            crawl_logs.log
+            crawl_archived_logs_state.json
+            crawl_archived_logs_failed.jsonl
+          if-no-files-found: ignore

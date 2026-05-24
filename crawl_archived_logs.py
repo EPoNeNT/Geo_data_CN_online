@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,6 +60,7 @@ load_local_env()
 
 from crawl_logs import (  # noqa: E402
     DATABASE_URL,
+    FOUND_LOG_TYPE,
     PROFILES,
     AuthenticationError,
     DatabaseManager,
@@ -71,6 +73,7 @@ from crawl_logs import (  # noqa: E402
 
 CacheRow = Tuple[str, Optional[float], Optional[float], bool]
 CrawlCache = Tuple[str, Optional[float], Optional[float]]
+ChangedCacheSummary = Dict[str, Dict[str, int]]
 
 
 def utc_now_iso() -> str:
@@ -203,6 +206,78 @@ def append_failed(path: Path, row: Dict[str, Any]) -> None:
         f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def summarize_changed_logs_by_cache(
+    db: DatabaseManager,
+    new_logs: List[dict],
+) -> ChangedCacheSummary:
+    if not new_logs:
+        return {}
+
+    gc_codes = list({log["GCCode"] for log in new_logs})
+    existing_logs = db.get_existing_logs_for_caches(gc_codes)
+    summary: ChangedCacheSummary = defaultdict(lambda: {"raw": 0, "inserted": 0, "updated": 0})
+
+    for log in new_logs:
+        gc_code = log["GCCode"]
+        user_name = log["UserName"]
+        key = (gc_code, user_name)
+
+        if key not in existing_logs:
+            summary[gc_code]["raw"] += 1
+            summary[gc_code]["inserted"] += 1
+            continue
+
+        old_record = existing_logs[key]
+        db_visited = old_record["visited"]
+        if hasattr(db_visited, "isoformat"):
+            db_visited_str = db_visited.isoformat()[:10]
+        else:
+            db_visited_str = str(db_visited)[:10]
+
+        api_visited_str = str(log["Visited"])[:10]
+        fields_match = (
+            db_visited_str == api_visited_str
+            and bool(old_record["favorite_point_used"]) == bool(log.get("FavoritePointUsed", False))
+            and bool(old_record["is_ftf"]) == bool(log.get("IsFTF", False))
+            and (old_record.get("log_type") or FOUND_LOG_TYPE) == log.get("LogType", FOUND_LOG_TYPE)
+        )
+
+        if not fields_match or int(old_record.get("duplicate_count") or 1) > 1:
+            summary[gc_code]["raw"] += 1
+            summary[gc_code]["updated"] += 1
+
+    return dict(summary)
+
+
+def merge_changed_cache_summary(
+    target: ChangedCacheSummary,
+    source: ChangedCacheSummary,
+) -> None:
+    for code, counts in source.items():
+        existing = target.setdefault(code, {"raw": 0, "inserted": 0, "updated": 0})
+        existing["raw"] += counts.get("raw", 0)
+        existing["inserted"] += counts.get("inserted", 0)
+        existing["updated"] += counts.get("updated", 0)
+
+
+def log_changed_cache_summary(prefix: str, summary: ChangedCacheSummary) -> None:
+    if not summary:
+        logger.info("%s changed caches: 0", prefix)
+        return
+
+    logger.info("%s changed caches: %s", prefix, len(summary))
+    for code in sorted(summary):
+        counts = summary[code]
+        logger.info(
+            "%s changed cache: %s raw %s, inserted %s, updated %s",
+            prefix,
+            code,
+            counts.get("raw", 0),
+            counts.get("inserted", 0),
+            counts.get("updated", 0),
+        )
+
+
 def get_archived_caches(
     db: DatabaseManager,
     limit: Optional[int] = None,
@@ -263,12 +338,14 @@ def flush_batch(
     pending_codes: List[str],
     pending_completed: Dict[str, Dict[str, Any]],
     today_str: str,
-) -> int:
+) -> Tuple[int, ChangedCacheSummary]:
     if not pending_logs and not pending_codes:
-        return 0
+        return 0, {}
 
     changed_logs = 0
+    changed_cache_summary: ChangedCacheSummary = {}
     if pending_logs:
+        changed_cache_summary = summarize_changed_logs_by_cache(db, pending_logs)
         inserted, updated = db.smart_upsert_logs(pending_logs)
         changed_logs = inserted + updated
         logger.info(
@@ -278,6 +355,7 @@ def flush_batch(
             updated,
             changed_logs,
         )
+        log_changed_cache_summary("Batch", changed_cache_summary)
 
     if pending_codes:
         db.batch_update_logs_crawled_at(pending_codes, today_str)
@@ -287,7 +365,7 @@ def flush_batch(
     state["stats"]["success"] = len(state["completed"])
     state["stats"]["logsChanged"] = state["stats"].get("logsChanged", 0) + changed_logs
     save_state(state_file, state)
-    return changed_logs
+    return changed_logs, changed_cache_summary
 
 
 def crawl_one_cache(
@@ -335,6 +413,7 @@ def crawl_group_resumable(
     success_count = 0
     failed_count = 0
     changed_logs = 0
+    group_changed_caches: ChangedCacheSummary = {}
 
     max_attempts = max(1, args.cache_retries)
     batch_size = max(1, args.batch_size)
@@ -364,7 +443,7 @@ def crawl_group_resumable(
 
             except AuthenticationError:
                 logger.exception("Authentication failed, stopping run")
-                changed_logs += flush_batch(
+                batch_changed_logs, batch_changed_caches = flush_batch(
                     db,
                     state,
                     args.state_file,
@@ -373,6 +452,8 @@ def crawl_group_resumable(
                     pending_completed,
                     today_str,
                 )
+                changed_logs += batch_changed_logs
+                merge_changed_cache_summary(group_changed_caches, batch_changed_caches)
                 raise
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
                 last_error = repr(exc)
@@ -415,7 +496,7 @@ def crawl_group_resumable(
             logger.error("  失败并记录: %s", code)
 
         if len(pending_codes) >= batch_size:
-            changed_logs += flush_batch(
+            batch_changed_logs, batch_changed_caches = flush_batch(
                 db,
                 state,
                 args.state_file,
@@ -424,11 +505,13 @@ def crawl_group_resumable(
                 pending_completed,
                 today_str,
             )
+            changed_logs += batch_changed_logs
+            merge_changed_cache_summary(group_changed_caches, batch_changed_caches)
             pending_logs = []
             pending_codes = []
             pending_completed = {}
 
-    changed_logs += flush_batch(
+    batch_changed_logs, batch_changed_caches = flush_batch(
         db,
         state,
         args.state_file,
@@ -437,6 +520,8 @@ def crawl_group_resumable(
         pending_completed,
         today_str,
     )
+    changed_logs += batch_changed_logs
+    merge_changed_cache_summary(group_changed_caches, batch_changed_caches)
 
     logger.info(
         "%s 组处理完成: 成功 %s, 失败 %s, changed logs %s",
@@ -445,10 +530,12 @@ def crawl_group_resumable(
         failed_count,
         changed_logs,
     )
+    log_changed_cache_summary(f"{group_name} group", group_changed_caches)
     return {
         "success_count": success_count,
         "failed_count": failed_count,
         "logs_count": changed_logs,
+        "changed_caches": group_changed_caches,
     }
 
 
@@ -493,6 +580,7 @@ def main() -> None:
         total_success = 0
         total_failed = 0
         total_changed_logs = 0
+        total_changed_caches: ChangedCacheSummary = {}
 
         if args.only in {"all", "premium"}:
             premium_stats = crawl_group_resumable(
@@ -506,6 +594,7 @@ def main() -> None:
             total_success += premium_stats["success_count"]
             total_failed += premium_stats["failed_count"]
             total_changed_logs += premium_stats["logs_count"]
+            merge_changed_cache_summary(total_changed_caches, premium_stats.get("changed_caches", {}))
 
         if args.only in {"all", "nonpremium"}:
             nonpremium_stats = crawl_group_resumable(
@@ -519,6 +608,7 @@ def main() -> None:
             total_success += nonpremium_stats["success_count"]
             total_failed += nonpremium_stats["failed_count"]
             total_changed_logs += nonpremium_stats["logs_count"]
+            merge_changed_cache_summary(total_changed_caches, nonpremium_stats.get("changed_caches", {}))
 
         save_state(args.state_file, state)
         logger.info(
@@ -527,6 +617,7 @@ def main() -> None:
             total_failed,
             total_changed_logs,
         )
+        log_changed_cache_summary("Archived logs run total", total_changed_caches)
     finally:
         db.close()
 

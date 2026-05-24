@@ -68,6 +68,7 @@ from crawl_logs import (  # noqa: E402
     get_coordinates,
     get_logbook_token,
     logger,
+    normalize_log_date_for_compare,
 )
 
 
@@ -228,13 +229,8 @@ def summarize_changed_logs_by_cache(
             continue
 
         old_record = existing_logs[key]
-        db_visited = old_record["visited"]
-        if hasattr(db_visited, "isoformat"):
-            db_visited_str = db_visited.isoformat()[:10]
-        else:
-            db_visited_str = str(db_visited)[:10]
-
-        api_visited_str = str(log["Visited"])[:10]
+        db_visited_str = normalize_log_date_for_compare(old_record["visited"])
+        api_visited_str = normalize_log_date_for_compare(log["Visited"])
         fields_match = (
             db_visited_str == api_visited_str
             and bool(old_record["favorite_point_used"]) == bool(log.get("FavoritePointUsed", False))

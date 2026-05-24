@@ -78,6 +78,16 @@ def format_date(raw_date: str) -> str:
         return raw_date
 
 
+def normalize_log_date_for_compare(value) -> str:
+    """Normalize DB/API log dates to YYYY-MM-DD when possible."""
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()[:10]
+    formatted = format_date(str(value))
+    return str(formatted)[:10]
+
+
 def is_ftf_log_text(log_content: str) -> bool:
     """Return True when log text contains an FTF marker inside brackets."""
     return bool(FTF_MARKER_RE.search(log_content or ""))
@@ -300,13 +310,8 @@ class DatabaseManager:
                 old_record = existing_logs[key]
 
                 # 标准化 visited 字段为字符串进行比较
-                db_visited = old_record["visited"]
-                if hasattr(db_visited, "isoformat"):
-                    db_visited_str = db_visited.isoformat()[:10]
-                else:
-                    db_visited_str = str(db_visited)[:10]
-
-                api_visited_str = str(new_record["visited"])[:10]
+                db_visited_str = normalize_log_date_for_compare(old_record["visited"])
+                api_visited_str = normalize_log_date_for_compare(new_record["visited"])
 
                 # 比较所有关键字段
                 fields_match = (
@@ -329,8 +334,7 @@ class DatabaseManager:
             inserted_count = len(to_insert)
 
         if to_update:
-            self._batch_update_logs(to_update)
-            updated_count = len(to_update)
+            updated_count = self._batch_update_logs(to_update)
 
         return (inserted_count, updated_count)
 
@@ -356,8 +360,9 @@ class DatabaseManager:
             ],
         )
 
-    def _batch_update_logs(self, logs: List[dict]):
+    def _batch_update_logs(self, logs: List[dict]) -> int:
         """执行批量 UPDATE 操作，根据 (gc_code, user_name) 匹配并更新其他字段。"""
+        changed_count = 0
         for log in logs:
             self.cursor.execute(
                 """
@@ -379,6 +384,7 @@ class DatabaseManager:
                     log["UserName"],
                 ),
             )
+            deleted_duplicates = max(0, self.cursor.rowcount or 0)
             self.cursor.execute(
                 """
                 UPDATE logs
@@ -387,6 +393,12 @@ class DatabaseManager:
                     is_ftf = %s,
                     log_type = %s
                 WHERE gc_code = %s AND user_name = %s
+                  AND (
+                      visited IS DISTINCT FROM %s::date
+                      OR COALESCE(favorite_point_used, false) IS DISTINCT FROM %s::boolean
+                      OR COALESCE(is_ftf, false) IS DISTINCT FROM %s::boolean
+                      OR COALESCE(log_type, %s) IS DISTINCT FROM %s
+                  )
                 """,
                 (
                     log["Visited"],
@@ -395,8 +407,16 @@ class DatabaseManager:
                     log.get("LogType", FOUND_LOG_TYPE),
                     log["GCCode"],
                     log["UserName"],
+                    log["Visited"],
+                    log.get("FavoritePointUsed", False),
+                    log.get("IsFTF", False),
+                    FOUND_LOG_TYPE,
+                    log.get("LogType", FOUND_LOG_TYPE),
                 ),
             )
+            if deleted_duplicates > 0 or (self.cursor.rowcount or 0) > 0:
+                changed_count += 1
+        return changed_count
 
     def update_cache_coordinates(self, code: str, lat: float, lng: float):
         """更新 cache 坐标。"""

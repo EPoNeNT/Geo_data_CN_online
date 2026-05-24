@@ -324,15 +324,23 @@ def log_changed_cache_summary(
             counts.get("updated", 0),
         )
         for detail in counts.get("details", [])[:detail_limit_per_cache]:
+            changes = []
+            db_record = detail.get("db") or {}
+            api_record = detail.get("api") or {}
+            for field in detail.get("reasons", []):
+                if field == "duplicate_count":
+                    changes.append(f"duplicate_count={db_record.get('duplicate_count')}")
+                elif field == "missing":
+                    changes.append("missing")
+                else:
+                    changes.append(f"{field}: {db_record.get(field)} -> {api_record.get(field)}")
             logger.info(
-                "%s changed log: %s user=%s action=%s reasons=%s db=%s api=%s",
+                "%s changed log: %s user=%s action=%s changes=%s",
                 prefix,
                 code,
                 detail.get("user"),
                 detail.get("action"),
-                ",".join(detail.get("reasons", [])),
-                detail.get("db"),
-                detail.get("api"),
+                "; ".join(changes),
             )
 
 

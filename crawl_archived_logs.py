@@ -64,6 +64,7 @@ from crawl_logs import (  # noqa: E402
     PROFILES,
     AuthenticationError,
     DatabaseManager,
+    deduplicate_logs_by_cache_user,
     fetch_logs_for_cache,
     get_coordinates,
     get_logbook_token,
@@ -214,6 +215,7 @@ def summarize_changed_logs_by_cache(
     if not new_logs:
         return {}
 
+    new_logs = deduplicate_logs_by_cache_user(new_logs)
     gc_codes = list({log["GCCode"] for log in new_logs})
     existing_logs = db.get_existing_logs_for_caches(gc_codes)
     summary: ChangedCacheSummary = defaultdict(

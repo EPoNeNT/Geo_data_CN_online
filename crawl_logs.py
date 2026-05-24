@@ -88,6 +88,42 @@ def normalize_log_date_for_compare(value) -> str:
     return str(formatted)[:10]
 
 
+def log_date_sort_key(value) -> str:
+    """Return a sortable YYYY-MM-DD key; invalid dates sort first."""
+    normalized = normalize_log_date_for_compare(value)
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", normalized):
+        return normalized
+    return "0001-01-01"
+
+
+def deduplicate_logs_by_cache_user(logs: List[dict]) -> List[dict]:
+    """Keep only the latest visited date for each (GCCode, UserName)."""
+    deduped: Dict[Tuple[str, str], dict] = {}
+
+    for log in logs:
+        key = (log.get("GCCode"), log.get("UserName"))
+        if not key[0] or not key[1]:
+            continue
+
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = log
+            continue
+
+        current_date = log_date_sort_key(log.get("Visited"))
+        existing_date = log_date_sort_key(existing.get("Visited"))
+        if current_date > existing_date:
+            deduped[key] = log
+        elif current_date == existing_date:
+            merged = dict(existing)
+            merged["FavoritePointUsed"] = bool(existing.get("FavoritePointUsed", False)) or bool(log.get("FavoritePointUsed", False))
+            merged["IsFTF"] = bool(existing.get("IsFTF", False)) or bool(log.get("IsFTF", False))
+            merged["LogType"] = existing.get("LogType") or log.get("LogType") or FOUND_LOG_TYPE
+            deduped[key] = merged
+
+    return list(deduped.values())
+
+
 def is_ftf_log_text(log_content: str) -> bool:
     """Return True when log text contains an FTF marker inside brackets."""
     return bool(FTF_MARKER_RE.search(log_content or ""))
@@ -282,6 +318,15 @@ class DatabaseManager:
         """
         if not new_logs:
             return (0, 0)
+
+        deduped_logs = deduplicate_logs_by_cache_user(new_logs)
+        if len(deduped_logs) != len(new_logs):
+            logger.info(
+                "Deduplicated logs before upsert: raw %s, unique cache/user %s",
+                len(new_logs),
+                len(deduped_logs),
+            )
+        new_logs = deduped_logs
 
         # 批量查询这些 cache 的现有日志
         gc_codes = list(set(log["GCCode"] for log in new_logs))

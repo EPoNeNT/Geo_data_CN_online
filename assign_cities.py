@@ -74,6 +74,7 @@ SET city = CASE
 END
 WHERE (
       p.city IS NULL
+      OR NULLIF(TRIM(p.city), '') IS NULL
       OR p.country = 'Taiwan'
   )
   AND (
@@ -82,6 +83,18 @@ WHERE (
   )
   AND p.longitude IS NOT NULL
   AND p.latitude IS NOT NULL;
+"""
+
+UNASSIGNED_DIAGNOSTIC_SQL = """
+SELECT
+    country,
+    COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE longitude IS NULL OR latitude IS NULL) AS missing_coords,
+    COUNT(*) FILTER (WHERE longitude IS NOT NULL AND latitude IS NOT NULL) AS has_coords
+FROM caches
+WHERE (city IS NULL OR NULLIF(TRIM(city), '') IS NULL)
+GROUP BY country
+ORDER BY total DESC;
 """
 
 
@@ -125,6 +138,18 @@ def update_cities(cursor) -> int:
     return int(cursor.rowcount or 0)
 
 
+def log_diagnostics(cursor) -> None:
+    cursor.execute(UNASSIGNED_DIAGNOSTIC_SQL)
+    rows = cursor.fetchall()
+    if rows:
+        logger.info("未分配城市的缓存诊断（按 country 分组）:")
+        for country, total, missing_coords, has_coords in rows:
+            logger.info(
+                "  country=%s | 未分配总数=%s | 缺少坐标=%s | 有坐标但未分配=%s",
+                country, total, missing_coords, has_coords,
+            )
+
+
 def safe_rollback(conn) -> None:
     if not conn or conn.closed:
         return
@@ -151,6 +176,7 @@ def run_once(database_url: str) -> None:
             ensure_schema(cursor)
             ensure_boundaries_exist(cursor)
             updated = update_cities(cursor)
+            log_diagnostics(cursor)
         conn.commit()
         logger.info("城市划分完成，更新了 %s 条 caches.city 记录", updated)
     except Exception:

@@ -950,6 +950,98 @@ def cache_metadata_changed(existing: dict, latest: dict) -> bool:
     return False
 
 
+def backfill_missing_coordinates(db: DatabaseManager) -> int:
+    """对缺少坐标的缓存，通过详情页 JSON-LD 获取坐标并回填。"""
+    db.cursor.execute(
+        """
+        SELECT code FROM caches
+        WHERE (latitude IS NULL OR longitude IS NULL)
+          AND country IN ('China', 'Hong Kong', 'Macao', 'Taiwan')
+        ORDER BY code
+        """
+    )
+    codes = [row[0] for row in db.cursor.fetchall()]
+    if not codes:
+        logger.info("坐标回填：没有缺少坐标的缓存")
+        return 0
+
+    logger.info("坐标回填：发现 %s 个缺少坐标的缓存", len(codes))
+    updated = 0
+
+    for i, code in enumerate(codes):
+        detail_url = f"https://www.geocaching.com/geocache/{code}"
+        headers = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "cookie": _RAW_PREMIUM_COOKIE or "",
+            "referer": "https://www.geocaching.com/play/map",
+            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        }
+
+        try:
+            resp = session.get(detail_url, headers=headers, timeout=15, allow_redirects=True)
+            if resp.status_code != 200 or "geocache" not in resp.url:
+                logger.warning("坐标回填 [%s/%s] %s: HTTP %s 或非详情页", i + 1, len(codes), code, resp.status_code)
+                time.sleep(random.uniform(0.5, 1.0))
+                continue
+
+            text = resp.text
+            jsonld_match = re.search(
+                r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                text, re.DOTALL | re.IGNORECASE,
+            )
+            if not jsonld_match:
+                logger.warning("坐标回填 [%s/%s] %s: 未找到 JSON-LD", i + 1, len(codes), code)
+                time.sleep(random.uniform(0.5, 1.0))
+                continue
+
+            ld = json.loads(jsonld_match.group(1))
+            if not isinstance(ld, dict):
+                continue
+
+            loc = ld.get("location")
+            if not isinstance(loc, dict):
+                logger.warning("坐标回填 [%s/%s] %s: JSON-LD 中无 location", i + 1, len(codes), code)
+                time.sleep(random.uniform(0.5, 1.0))
+                continue
+
+            lat = loc.get("latitude")
+            lng = loc.get("longitude")
+            if lat is None or lng is None:
+                logger.warning("坐标回填 [%s/%s] %s: location 中无坐标", i + 1, len(codes), code)
+                time.sleep(random.uniform(0.5, 1.0))
+                continue
+
+            lat = float(lat)
+            lng = float(lng)
+            db.cursor.execute(
+                "UPDATE caches SET latitude = %s, longitude = %s WHERE code = %s",
+                (round(lat, 6), round(lng, 6), code),
+            )
+            updated += 1
+            logger.info("坐标回填 [%s/%s] %s: 坐标更新为 (%s, %s)", i + 1, len(codes), code, lat, lng)
+
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning("坐标回填 [%s/%s] %s: 解析失败 - %s", i + 1, len(codes), code, e)
+        except Exception as e:
+            logger.warning("坐标回填 [%s/%s] %s: 请求失败 - %s", i + 1, len(codes), code, e)
+
+        time.sleep(random.uniform(0.5, 1.0))
+
+    if updated:
+        db.commit()
+    logger.info("坐标回填：完成，成功更新 %s/%s 个缓存", updated, len(codes))
+    return updated
+
+
 def run_crawler():
     """运行爬虫"""
     # 连接数据库
@@ -1237,6 +1329,8 @@ def run_crawler():
                     f"预览失败 {failed_preview_count} 个"
                 )
         
+        backfill_missing_coordinates(db)
+
         logger.info("=" * 50)
         logger.info(f"本轮爬取完成! 新增: {len(new_codes)}, 更新: {len(updated_codes)}")
         logger.info("=" * 50)

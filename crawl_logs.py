@@ -58,12 +58,10 @@ PROFILES = {
     "nonpremium": {
         "COOKIES": NONPREMIUM_COOKIE,
         "page_sleep": 0.4,
-        "update_coordinates": False,
     },
     "premium": {
         "COOKIES": PREMIUM_COOKIE,
         "page_sleep": 2.0,
-        "update_coordinates": True,
     },
 }
 
@@ -463,30 +461,6 @@ class DatabaseManager:
                 changed_count += 1
         return changed_count
 
-    def update_cache_coordinates(self, code: str, lat: float, lng: float):
-        """更新 cache 坐标。"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self.cursor.execute(
-                    """
-                    UPDATE caches
-                    SET latitude = %s, longitude = %s
-                    WHERE code = %s
-                    """,
-                    (lat, lng, code),
-                )
-                return
-            except psycopg2.OperationalError as e:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"更新坐标失败，尝试重新连接 ({attempt + 1}/{max_retries})..."
-                    )
-                    self.reconnect()
-                else:
-                    logger.error(f"更新坐标失败: {e}")
-                    raise
-
     def commit(self):
         """提交事务。"""
         max_retries = 3
@@ -690,36 +664,16 @@ def fetch_logs_for_cache(
     return logs
 
 
-def get_coordinates(gc_code: str, cookie: str) -> Tuple[Optional[float], Optional[float]]:
-    """获取 cache 坐标。"""
-    api_url = f"https://www.geocaching.com/api/live/v1/search/geocachepreview/{gc_code}"
-    headers = make_headers(cookie)
-    headers["accept"] = "application/json"
-
-    try:
-        resp = session.get(api_url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            lat = data.get("postedCoordinates", {}).get("latitude")
-            lng = data.get("postedCoordinates", {}).get("longitude")
-            return lat, lng
-    except Exception as e:
-        logger.error(f"获取坐标失败 {gc_code}: {e}")
-
-    return None, None
-
-
 def crawl_cache_group(
     db: DatabaseManager,
     group_name: str,
-    caches: List[Tuple[str, Optional[float], Optional[float], Optional[int]]],
+    caches: List[Tuple[str, Optional[int]]],
     today_str: str,
 ) -> Dict[str, int]:
     """按指定配置爬取一组 cache。"""
     cfg = PROFILES[group_name]
     cookie = cfg["COOKIES"]
     page_sleep = cfg["page_sleep"]
-    update_coordinates = cfg["update_coordinates"]
 
     success_count = 0
     logs_count = 0
@@ -734,7 +688,7 @@ def crawl_cache_group(
 
     logger.info(f"开始处理 {group_name} 组，共 {len(caches)} 个 cache")
 
-    for i, (code, old_lat, old_lng, geocache_type) in enumerate(caches):
+    for i, (code, geocache_type) in enumerate(caches):
         logger.info(f"[{group_name} {i + 1}/{len(caches)}] 处理: {code}")
         accepted_log_types = (
             {ATTENDED_LOG_TYPE}
@@ -749,16 +703,6 @@ def crawl_cache_group(
 
         while retry_count <= max_retries and not success:
             try:
-                if update_coordinates:
-                    new_lat, new_lng = get_coordinates(code, cookie)
-                    if new_lat and new_lng:
-                        lat_changed = abs(float(new_lat or 0) - float(old_lat or 0)) > 1e-6
-                        lng_changed = abs(float(new_lng or 0) - float(old_lng or 0)) > 1e-6
-                        if lat_changed or lng_changed:
-                            db.update_cache_coordinates(code, new_lat, new_lng)
-                            logger.info(f"  更新坐标: ({new_lat}, {new_lng})")
-                    time.sleep(1)
-
                 try:
                     token = get_logbook_token(code, cookie)
                 except AuthenticationError as e:
@@ -900,13 +844,13 @@ def run_logs_crawler():
         logger.info("加载全部 cache 列表...")
         caches = db.get_all_caches_to_crawl()
         premium_caches = [
-            (code, lat, lng, geocache_type)
-            for code, lat, lng, premium_only, geocache_type in caches
+            (code, geocache_type)
+            for code, _lat, _lng, premium_only, geocache_type in caches
             if premium_only
         ]
         nonpremium_caches = [
-            (code, lat, lng, geocache_type)
-            for code, lat, lng, premium_only, geocache_type in caches
+            (code, geocache_type)
+            for code, _lat, _lng, premium_only, geocache_type in caches
             if not premium_only
         ]
         logger.info(

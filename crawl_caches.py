@@ -1263,6 +1263,9 @@ def run_crawler():
             failed_preview_count = 0
 
             for gc_code in archived_codes:
+                existing = scanned_data.get(gc_code)
+                if existing and existing.get('cache_status') == 404:
+                    continue
                 preview_data = fetch_cache_preview(gc_code)
                 if not preview_data:
                     failed_preview_count += 1

@@ -6,7 +6,13 @@
       "Bash(dir /s /b \"c:\\\\Users\\\\cjyte\\\\Documents\\\\trae_projects\\\\Geo_data_v3.0\\\\*.html\")",
       "Bash(dir /s /b \"c:\\\\Users\\\\cjyte\\\\Documents\\\\trae_projects\\\\Geo_data_v3.0\\\\*.vue\")",
       "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_logs.py', doraise=True\\); print\\('crawl_logs.py: OK'\\)\")",
-      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_caches.py', doraise=True\\); print\\('crawl_caches.py: OK'\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_caches.py', doraise=True\\); print\\('crawl_caches.py: OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_caches.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('test/test_coordinate_backfill.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python test/test_coordinate_backfill.py)",
+      "Bash(python test/test_coordinate_backfill.py GCBPR5N)",
+      "Bash(python test/test_coordinate_backfill.py --inspect GCBPR5N)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_caches.py', doraise=True\\); py_compile.compile\\('test/test_coordinate_backfill.py', doraise=True\\); print\\('OK'\\)\")"
     ]
   }
 }

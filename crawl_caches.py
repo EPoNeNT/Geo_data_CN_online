@@ -950,6 +950,76 @@ def cache_metadata_changed(existing: dict, latest: dict) -> bool:
     return False
 
 
+def _fetch_detail_page_jsonld(code: str) -> Optional[dict]:
+    """访问缓存详情页并提取 JSON-LD。依次尝试 nonpremium / premium cookie。"""
+    urls = [
+        f"https://www.geocaching.com/geocache/{code}",
+        f"https://www.geocaching.com/seek/cache_details.aspx?wp={code}",
+    ]
+    cookies = [
+        ("nonpremium", _RAW_NONPREMIUM_COOKIE),
+        ("premium", _RAW_PREMIUM_COOKIE),
+    ]
+
+    for url in urls:
+        for label, cookie in cookies:
+            if not cookie:
+                continue
+            headers = {
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "cookie": cookie,
+                "referer": "https://www.geocaching.com/play/map",
+                "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-user": "?1",
+                "upgrade-insecure-requests": "1",
+                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            }
+
+            try:
+                resp = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+                if resp.status_code == 404:
+                    return None
+                if resp.status_code != 200:
+                    continue
+                if looks_like_login_page(resp.url, resp.text):
+                    continue
+
+                jsonld_match = re.search(
+                    r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                    resp.text, re.DOTALL | re.IGNORECASE,
+                )
+                if jsonld_match:
+                    ld = json.loads(jsonld_match.group(1))
+                    if isinstance(ld, dict) and isinstance(ld.get("location"), dict):
+                        return ld
+
+                # 旧版 ASP.NET 页面：从 JS 变量提取坐标 (var lat=X, lng=Y)
+                js_match = re.search(
+                    r"var\s+lat\s*=\s*([\d.]+)\s*,\s*lng\s*=\s*([\d.]+)",
+                    resp.text, re.IGNORECASE,
+                )
+                if js_match:
+                    return {
+                        "name": "",
+                        "location": {
+                            "latitude": float(js_match.group(1)),
+                            "longitude": float(js_match.group(2)),
+                        },
+                    }
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            except Exception:
+                continue
+
+    return None
+
+
 def backfill_missing_coordinates(db: DatabaseManager) -> int:
     """对缺少坐标的缓存，通过详情页 JSON-LD 获取坐标并回填。"""
     db.cursor.execute(
@@ -969,71 +1039,21 @@ def backfill_missing_coordinates(db: DatabaseManager) -> int:
     updated = 0
 
     for i, code in enumerate(codes):
-        detail_url = f"https://www.geocaching.com/geocache/{code}"
-        headers = {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "cookie": _RAW_PREMIUM_COOKIE or "",
-            "referer": "https://www.geocaching.com/play/map",
-            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        }
+        ld = _fetch_detail_page_jsonld(code)
+        if ld is None:
+            logger.warning("坐标回填 [%s/%s] %s: 未能获取到坐标", i + 1, len(codes), code)
+            time.sleep(random.uniform(0.5, 1.0))
+            continue
 
-        try:
-            resp = session.get(detail_url, headers=headers, timeout=15, allow_redirects=True)
-            if resp.status_code != 200 or "geocache" not in resp.url:
-                logger.warning("坐标回填 [%s/%s] %s: HTTP %s 或非详情页", i + 1, len(codes), code, resp.status_code)
-                time.sleep(random.uniform(0.5, 1.0))
-                continue
-
-            text = resp.text
-            jsonld_match = re.search(
-                r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-                text, re.DOTALL | re.IGNORECASE,
-            )
-            if not jsonld_match:
-                logger.warning("坐标回填 [%s/%s] %s: 未找到 JSON-LD", i + 1, len(codes), code)
-                time.sleep(random.uniform(0.5, 1.0))
-                continue
-
-            ld = json.loads(jsonld_match.group(1))
-            if not isinstance(ld, dict):
-                continue
-
-            loc = ld.get("location")
-            if not isinstance(loc, dict):
-                logger.warning("坐标回填 [%s/%s] %s: JSON-LD 中无 location", i + 1, len(codes), code)
-                time.sleep(random.uniform(0.5, 1.0))
-                continue
-
-            lat = loc.get("latitude")
-            lng = loc.get("longitude")
-            if lat is None or lng is None:
-                logger.warning("坐标回填 [%s/%s] %s: location 中无坐标", i + 1, len(codes), code)
-                time.sleep(random.uniform(0.5, 1.0))
-                continue
-
-            lat = float(lat)
-            lng = float(lng)
-            db.cursor.execute(
-                "UPDATE caches SET latitude = %s, longitude = %s WHERE code = %s",
-                (round(lat, 6), round(lng, 6), code),
-            )
-            updated += 1
-            logger.info("坐标回填 [%s/%s] %s: 坐标更新为 (%s, %s)", i + 1, len(codes), code, lat, lng)
-
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
-            logger.warning("坐标回填 [%s/%s] %s: 解析失败 - %s", i + 1, len(codes), code, e)
-        except Exception as e:
-            logger.warning("坐标回填 [%s/%s] %s: 请求失败 - %s", i + 1, len(codes), code, e)
-
+        loc = ld["location"]
+        lat = float(loc["latitude"])
+        lng = float(loc["longitude"])
+        db.cursor.execute(
+            "UPDATE caches SET latitude = %s, longitude = %s WHERE code = %s",
+            (round(lat, 6), round(lng, 6), code),
+        )
+        updated += 1
+        logger.info("坐标回填 [%s/%s] %s: 坐标更新为 (%s, %s)", i + 1, len(codes), code, lat, lng)
         time.sleep(random.uniform(0.5, 1.0))
 
     if updated:

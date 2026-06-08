@@ -66,7 +66,6 @@ from crawl_logs import (  # noqa: E402
     DatabaseManager,
     deduplicate_logs_by_cache_user,
     fetch_logs_for_cache,
-    get_coordinates,
     get_logbook_token,
     logger,
     normalize_log_date_for_compare,
@@ -462,23 +461,12 @@ def crawl_one_cache(
     db: DatabaseManager,
     group_name: str,
     code: str,
-    old_lat: Optional[float],
-    old_lng: Optional[float],
+    _old_lat: Optional[float],
+    _old_lng: Optional[float],
 ) -> List[dict]:
     cfg = PROFILES[group_name]
     cookie = cfg["COOKIES"]
     page_sleep = cfg["page_sleep"]
-    update_coordinates = cfg["update_coordinates"]
-
-    if update_coordinates:
-        new_lat, new_lng = get_coordinates(code, cookie)
-        if new_lat and new_lng:
-            lat_changed = abs(float(new_lat or 0) - float(old_lat or 0)) > 1e-6
-            lng_changed = abs(float(new_lng or 0) - float(old_lng or 0)) > 1e-6
-            if lat_changed or lng_changed:
-                db.update_cache_coordinates(code, new_lat, new_lng)
-                logger.info("  Coordinates updated: %s (%s, %s)", code, new_lat, new_lng)
-        time.sleep(1)
 
     token = get_logbook_token(code, cookie)
     if not token:
@@ -508,13 +496,13 @@ def crawl_group_resumable(
     max_attempts = max(1, args.cache_retries)
     batch_size = max(1, args.batch_size)
 
-    for index, (code, old_lat, old_lng) in enumerate(caches, start=1):
+    for index, (code, _lat, _lng) in enumerate(caches, start=1):
         logger.info("[%s %s/%s] 处理: %s", group_name, index, len(caches), code)
 
         last_error = ""
         for attempt in range(1, max_attempts + 1):
             try:
-                cache_logs = crawl_one_cache(db, group_name, code, old_lat, old_lng)
+                cache_logs = crawl_one_cache(db, group_name, code, _lat, _lng)
                 if cache_logs:
                     pending_logs.extend(cache_logs)
                     logger.info("  获取 %s 条 logs", len(cache_logs))

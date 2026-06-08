@@ -12,7 +12,8 @@
       "Bash(python test/test_coordinate_backfill.py)",
       "Bash(python test/test_coordinate_backfill.py GCBPR5N)",
       "Bash(python test/test_coordinate_backfill.py --inspect GCBPR5N)",
-      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_caches.py', doraise=True\\); py_compile.compile\\('test/test_coordinate_backfill.py', doraise=True\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_caches.py', doraise=True\\); py_compile.compile\\('test/test_coordinate_backfill.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_archived_logs.py', doraise=True\\); print\\('OK'\\)\")"
     ]
   }
 }

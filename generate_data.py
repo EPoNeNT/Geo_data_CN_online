@@ -163,7 +163,8 @@ DEFAULT_AVATAR_URL = "https://www.geocaching.com/images/default_avatar.png"
 AVATAR_PROFILE_URL = "https://www.geocaching.com/p/default.aspx"
 AVATAR_MAX_RETRIES = int(os.getenv("AVATAR_MAX_RETRIES", "3"))
 AVATAR_FETCH_DELAY_SECONDS = float(os.getenv("AVATAR_FETCH_DELAY_SECONDS", "0.4"))
-AVATAR_REQUEST_TIMEOUT_SECONDS = int(os.getenv("AVATAR_REQUEST_TIMEOUT_SECONDS", "15"))
+AVATAR_REQUEST_TIMEOUT_SECONDS = int(os.getenv("AVATAR_REQUEST_TIMEOUT_SECONDS", "45"))
+AVATAR_STREAM_MAX_BYTES = int(os.getenv("AVATAR_STREAM_MAX_BYTES", "102400"))  # 100KB
 AVATAR_UPSERT_BATCH_SIZE = int(os.getenv("AVATAR_UPSERT_BATCH_SIZE", "100"))
 AVATAR_URL_PATTERNS = [
     re.compile(
@@ -434,10 +435,14 @@ class DataGenerator:
         return DEFAULT_AVATAR_URL
 
     def fetch_avatar_url(self, user_name: str, session: Optional[requests.Session] = None) -> Tuple[str, str]:
-        """Fetch one user's avatar URL from their Geocaching profile."""
+        """Fetch one user's avatar URL from their Geocaching profile.
+
+        Streams only the first ~100 KB — the avatar URL is in the page header.
+        """
         active_session = session or self.build_avatar_session()
 
         for attempt in range(AVATAR_MAX_RETRIES):
+            response = None
             try:
                 if attempt > 0:
                     time.sleep(2)
@@ -450,13 +455,26 @@ class DataGenerator:
                     AVATAR_PROFILE_URL,
                     params={"u": user_name},
                     timeout=AVATAR_REQUEST_TIMEOUT_SECONDS,
+                    stream=True,
                 )
+
                 if response.status_code == 200:
-                    if looks_like_login_page(response.url, response.text):
+                    accumulated = b""
+                    try:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                accumulated += chunk
+                                if len(accumulated) >= AVATAR_STREAM_MAX_BYTES:
+                                    break
+                    finally:
+                        response.close()
+
+                    html = accumulated.decode("utf-8", errors="replace")
+                    if looks_like_login_page(response.url, html):
                         logger.warning(f"Avatar request for {user_name} returned a login page")
                         continue
 
-                    avatar_url = self.parse_avatar_url(response.text)
+                    avatar_url = self.parse_avatar_url(html)
                     result = "real" if is_real_avatar_url(avatar_url) else "default"
                     logger.info(
                         f"Avatar request finished for {user_name} "
@@ -469,6 +487,9 @@ class DataGenerator:
                 )
             except Exception as e:
                 logger.warning(f"Avatar request for {user_name} failed: {e}")
+            finally:
+                if response is not None:
+                    response.close()
 
         return (DEFAULT_AVATAR_URL, "failed")
 

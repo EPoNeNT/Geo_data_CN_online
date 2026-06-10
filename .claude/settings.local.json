@@ -32,7 +32,9 @@
       "Bash(python test/debug_owner_field.py)",
       "Bash(python test/debug_cookie_status.py)",
       "Bash(python backfill_guids.py --dry-run --limit=5)",
-      "Bash(python crawl_user_regdates.py --dry-run)"
+      "Bash(python crawl_user_regdates.py --dry-run)",
+      "Bash(python test/backfill_guids.py --dry-run)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('test/backfill_guids.py', doraise=True\\); print\\('OK'\\)\")"
     ]
   }
 }

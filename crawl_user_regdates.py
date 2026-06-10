@@ -34,7 +34,8 @@ logger = setup_logging("crawl_user_regdates.log")
 
 DATABASE_URL = require_env("DATABASE_URL")
 PROFILE_URL = "https://www.geocaching.com/p/default.aspx"
-DEFAULT_TIMEOUT_SECONDS = int(os.getenv("USER_REGDATE_TIMEOUT_SECONDS", "15"))
+DEFAULT_TIMEOUT_SECONDS = int(os.getenv("USER_REGDATE_TIMEOUT_SECONDS", "45"))
+STREAM_MAX_BYTES = int(os.getenv("USER_REGDATE_STREAM_MAX_BYTES", "204800"))  # 200KB
 DEFAULT_MAX_RETRIES = int(os.getenv("USER_REGDATE_MAX_RETRIES", "3"))
 DEFAULT_DELAY_SECONDS = float(os.getenv("USER_REGDATE_DELAY_SECONDS", "1.6"))
 DEFAULT_BATCH_SIZE = int(os.getenv("USER_REGDATE_BATCH_SIZE", "50"))
@@ -266,6 +267,25 @@ def parse_registration_date(html: str) -> Tuple[Optional[str], Optional[str]]:
     return None, raw_value
 
 
+def _stream_profile_html(session: requests.Session, url: str, timeout_seconds: int) -> Tuple[str, requests.Response]:
+    """Stream the first STREAM_MAX_BYTES of a profile page and close the connection.
+
+    The registration date and avatar live in the page header (~10 KB).
+    Reading only the first chunk avoids downloading multi-MB About sections.
+    """
+    response = session.get(url, timeout=timeout_seconds, stream=True)
+    accumulated = b""
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                accumulated += chunk
+                if len(accumulated) >= STREAM_MAX_BYTES:
+                    break
+    finally:
+        response.close()
+    return accumulated.decode("utf-8", errors="replace"), response
+
+
 def fetch_registration_date(
     session: requests.Session,
     user_name: str,
@@ -277,37 +297,38 @@ def fetch_registration_date(
     last_status = "request_failed"
 
     for attempt in range(1, max_retries + 1):
+        response = None
         try:
             logger.info("Fetching %s attempt %s/%s", user_name, attempt, max_retries)
-            response = session.get(url, timeout=timeout_seconds)
+            text, response = _stream_profile_html(session, url, timeout_seconds)
 
             if response.status_code != 200:
                 last_status = f"http_{response.status_code}"
                 logger.warning("%s returned %s", user_name, last_status)
                 continue
 
-            if looks_like_login_page(response.url, response.text):
+            if looks_like_login_page(response.url, text):
                 logger.warning("%s returned a login page", user_name)
                 return None, None, "login_required"
 
-            parsed_date, raw_date = parse_registration_date(response.text)
+            parsed_date, raw_date = parse_registration_date(text)
             if parsed_date:
                 return parsed_date, raw_date, "ok"
             if raw_date:
                 return None, raw_date, "parse_failed"
 
-            summary = summarize_profile_response(response.text)
+            summary = summarize_profile_response(text)
             logger.warning(
                 "%s registration date not found: final_url=%s length=%s title=%r profile_name=%r markers=%s context=%r",
                 user_name,
                 response.url,
-                len(response.text or ""),
+                len(text),
                 summary["title"],
                 summary["profile_name"],
                 summary["markers"],
                 summary["joined_context"],
             )
-            maybe_save_debug_html(user_name, response.text)
+            maybe_save_debug_html(user_name, text)
             if summary["looks_like_profile"] or "lblMemberSinceDate" in summary["markers"]:
                 return None, None, "parse_failed"
             return None, None, "not_found"
@@ -501,9 +522,15 @@ def get_distinct_log_user_count(conn) -> int:
 
 
 def upsert_results(conn, results: list[dict]) -> None:
-    """Write a batch of user registration results (keyed by guid)."""
+    """Write a batch of user registration results (keyed by user_name)."""
     if not results:
         return
+
+    # 按 user_name 去重（同批次内同一用户名只保留最后一条）
+    deduped: dict[str, dict] = {}
+    for r in results:
+        deduped[r["user_name"]] = r
+    results = list(deduped.values())
 
     query = """
     INSERT INTO "user" (user_name, guid, registration_date, fetch_status)

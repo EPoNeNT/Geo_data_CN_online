@@ -34,7 +34,9 @@
       "Bash(python backfill_guids.py --dry-run --limit=5)",
       "Bash(python crawl_user_regdates.py --dry-run)",
       "Bash(python test/backfill_guids.py --dry-run)",
-      "Bash(python -c \"import py_compile; py_compile.compile\\('test/backfill_guids.py', doraise=True\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\('test/backfill_guids.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(cd /d c:\\\\Users\\\\cjyte\\\\Documents\\\\trae_projects\\\\Geo_data_v3.0)",
+      "Bash(python test/debug_airq_timeout.py --timeout 30)"
     ]
   }
 }

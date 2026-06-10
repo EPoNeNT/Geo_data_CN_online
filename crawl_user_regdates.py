@@ -508,9 +508,9 @@ def upsert_results(conn, results: list[dict]) -> None:
     query = """
     INSERT INTO "user" (user_name, guid, registration_date, fetch_status)
     VALUES (%(user_name)s, %(guid)s, %(registration_date)s, %(fetch_status)s)
-    ON CONFLICT (guid) DO UPDATE
-    SET user_name = EXCLUDED.user_name,
-        registration_date = EXCLUDED.registration_date,
+    ON CONFLICT (user_name) DO UPDATE
+    SET guid = COALESCE("user".guid, EXCLUDED.guid),
+        registration_date = COALESCE(EXCLUDED.registration_date, "user".registration_date),
         fetch_status = EXCLUDED.fetch_status;
     """
     with conn.cursor() as cur:

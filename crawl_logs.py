@@ -158,6 +158,12 @@ class DatabaseManager:
             ADD COLUMN IF NOT EXISTS log_type TEXT NOT NULL DEFAULT 'Found it'
             """
         )
+        self.cursor.execute(
+            """
+            ALTER TABLE logs
+            ADD COLUMN IF NOT EXISTS user_guid TEXT
+            """
+        )
         self.conn.commit()
 
     def reconnect(self):
@@ -249,8 +255,8 @@ class DatabaseManager:
                 execute_batch(
                     self.cursor,
                     """
-                    INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     """,
                     [
@@ -261,6 +267,7 @@ class DatabaseManager:
                             log.get("FavoritePointUsed", False),
                             log.get("IsFTF", False),
                             log.get("LogType", FOUND_LOG_TYPE),
+                            log.get("AccountGuid"),
                         )
                         for log in logs
                     ],
@@ -283,7 +290,7 @@ class DatabaseManager:
 
         self.cursor.execute(
             """
-            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf, log_type,
+            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid,
                    COUNT(*) OVER (PARTITION BY gc_code, user_name) AS duplicate_count
             FROM logs
             WHERE gc_code = ANY(%s)
@@ -299,7 +306,8 @@ class DatabaseManager:
                 "favorite_point_used": row[3],
                 "is_ftf": row[4],
                 "log_type": row[5],
-                "duplicate_count": row[6],
+                "user_guid": row[6],
+                "duplicate_count": row[7],
             }
         return existing
 
@@ -343,6 +351,7 @@ class DatabaseManager:
                 "favorite_point_used": log.get("FavoritePointUsed", False),
                 "is_ftf": log.get("IsFTF", False),
                 "log_type": log.get("LogType", FOUND_LOG_TYPE),
+                "user_guid": log.get("AccountGuid"),
             }
 
             if key not in existing_logs:
@@ -362,6 +371,7 @@ class DatabaseManager:
                     and bool(old_record["favorite_point_used"]) == bool(new_record["favorite_point_used"])
                     and bool(old_record["is_ftf"]) == bool(new_record["is_ftf"])
                     and (old_record.get("log_type") or FOUND_LOG_TYPE) == new_record["log_type"]
+                    and old_record.get("user_guid") == new_record.get("user_guid")
                 )
 
                 if not fields_match or int(old_record.get("duplicate_count") or 1) > 1:
@@ -386,8 +396,8 @@ class DatabaseManager:
         execute_batch(
             self.cursor,
             """
-            INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
             [
@@ -398,6 +408,7 @@ class DatabaseManager:
                     log.get("FavoritePointUsed", False),
                     log.get("IsFTF", False),
                     log.get("LogType", FOUND_LOG_TYPE),
+                    log.get("AccountGuid"),
                 )
                 for log in logs
             ],
@@ -434,13 +445,15 @@ class DatabaseManager:
                 SET visited = %s,
                     favorite_point_used = %s,
                     is_ftf = %s,
-                    log_type = %s
+                    log_type = %s,
+                    user_guid = %s
                 WHERE gc_code = %s AND user_name = %s
                   AND (
                       visited IS DISTINCT FROM %s::date
                       OR COALESCE(favorite_point_used, false) IS DISTINCT FROM %s::boolean
                       OR COALESCE(is_ftf, false) IS DISTINCT FROM %s::boolean
                       OR COALESCE(log_type, %s) IS DISTINCT FROM %s
+                      OR user_guid IS DISTINCT FROM %s
                   )
                 """,
                 (
@@ -448,6 +461,7 @@ class DatabaseManager:
                     log.get("FavoritePointUsed", False),
                     log.get("IsFTF", False),
                     log.get("LogType", FOUND_LOG_TYPE),
+                    log.get("AccountGuid"),
                     log["GCCode"],
                     log["UserName"],
                     log["Visited"],
@@ -455,6 +469,7 @@ class DatabaseManager:
                     log.get("IsFTF", False),
                     FOUND_LOG_TYPE,
                     log.get("LogType", FOUND_LOG_TYPE),
+                    log.get("AccountGuid"),
                 ),
             )
             if deleted_duplicates > 0 or (self.cursor.rowcount or 0) > 0:
@@ -633,6 +648,7 @@ def fetch_logs_for_cache_result(
                     "FavoritePointUsed": item.get("FavoritePointUsed", False),
                     "IsFTF": is_ftf_log_text(log_content),
                     "LogType": log_type,
+                    "AccountGuid": item.get("AccountGuid"),
                 }
             )
 

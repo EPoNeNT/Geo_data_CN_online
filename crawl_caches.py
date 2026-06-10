@@ -195,7 +195,7 @@ class DatabaseManager:
                        geocache_type, container_type, difficulty, terrain,
                        cache_status, latitude, longitude, details_url,
                        placed_date, owner_username, last_found_date,
-                       trackable_count, region, country, attributes
+                       trackable_count, region, country, attributes, owner_guid
                 FROM caches
                 ORDER BY code
                 LIMIT %s OFFSET %s
@@ -215,7 +215,8 @@ class DatabaseManager:
                     'longitude': row[11], 'details_url': row[12],
                     'placed_date': row[13], 'owner_username': row[14],
                     'last_found_date': row[15], 'trackable_count': row[16],
-                    'region': row[17], 'country': row[18], 'attributes': row[19]
+                    'region': row[17], 'country': row[18], 'attributes': row[19],
+                    'owner_guid': row[20],
                 }
 
             offset += batch_size
@@ -231,9 +232,9 @@ class DatabaseManager:
                 geocache_type, container_type, difficulty, terrain,
                 cache_status, latitude, longitude, details_url,
                 placed_date, owner_username, last_found_date,
-                trackable_count, region, country, attributes
+                trackable_count, region, country, attributes, owner_guid
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             ON CONFLICT (code) DO UPDATE SET
                 name = EXCLUDED.name,
@@ -253,7 +254,8 @@ class DatabaseManager:
                 trackable_count = EXCLUDED.trackable_count,
                 region = EXCLUDED.region,
                 country = EXCLUDED.country,
-                attributes = EXCLUDED.attributes
+                attributes = EXCLUDED.attributes,
+                owner_guid = EXCLUDED.owner_guid
         """, (
             cache_data['id'], cache_data['name'], cache_data['code'],
             cache_data['premium_only'], cache_data['favorite_points'],
@@ -264,7 +266,8 @@ class DatabaseManager:
             cache_data['placed_date'], cache_data['owner_username'],
             cache_data['last_found_date'], cache_data['trackable_count'],
             cache_data['region'], cache_data['country'],
-            json.dumps(cache_data['attributes']) if cache_data['attributes'] else None
+            json.dumps(cache_data['attributes']) if cache_data['attributes'] else None,
+            cache_data.get('owner_guid'),
         ))
 
     def upsert_caches_batch(self, caches: List[dict]):
@@ -279,8 +282,8 @@ class DatabaseManager:
                 geocache_type, container_type, difficulty, terrain,
                 cache_status, latitude, longitude, details_url,
                 placed_date, owner_username, last_found_date,
-                trackable_count, region, country, attributes
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                trackable_count, region, country, attributes, owner_guid
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (code) DO UPDATE SET
                 name = EXCLUDED.name,
                 premium_only = EXCLUDED.premium_only,
@@ -299,7 +302,8 @@ class DatabaseManager:
                 trackable_count = EXCLUDED.trackable_count,
                 region = EXCLUDED.region,
                 country = EXCLUDED.country,
-                attributes = EXCLUDED.attributes
+                attributes = EXCLUDED.attributes,
+                owner_guid = EXCLUDED.owner_guid
         """
 
         # 分批处理
@@ -317,7 +321,8 @@ class DatabaseManager:
                     cache_data['placed_date'], cache_data['owner_username'],
                     cache_data['last_found_date'], cache_data['trackable_count'],
                     cache_data['region'], cache_data['country'],
-                    json.dumps(cache_data['attributes']) if cache_data['attributes'] else None
+                    json.dumps(cache_data['attributes']) if cache_data['attributes'] else None,
+                    cache_data.get('owner_guid'),
                 ))
 
             max_retries = 3
@@ -823,6 +828,9 @@ def process_cache_item(
     attr_list = item.get('attributes', [])
     filtered_attrs = [{"id": a['id'], "name": a['name']} for a in attr_list if a.get('isApplicable')]
     
+    owner = item.get('owner', {}) or {}
+    owner_guid = None  # map API does not expose owner GUID; backfilled from detail page
+
     return {
         'id': item.get('id'),
         'name': item.get('name'),
@@ -838,7 +846,8 @@ def process_cache_item(
         'longitude': cache_lng,
         'details_url': item.get('detailsUrl'),
         'placed_date': item.get('placedDate'),
-        'owner_username': item.get('owner', {}).get('username'),
+        'owner_username': owner.get('username'),
+        'owner_guid': owner_guid,
         'last_found_date': item.get('lastFoundDate'),
         'trackable_count': item.get('trackableCount'),
         'region': item.get('region'),
@@ -938,6 +947,7 @@ def cache_metadata_changed(existing: dict, latest: dict) -> bool:
         'geocache_type', 'container_type', 'difficulty', 'terrain',
         'cache_status', 'details_url', 'placed_date', 'owner_username',
         'last_found_date', 'trackable_count', 'region', 'country', 'attributes',
+        'owner_guid',
     ]
 
     if not latest.get('premium_only', False):
@@ -950,8 +960,14 @@ def cache_metadata_changed(existing: dict, latest: dict) -> bool:
     return False
 
 
+def _extract_owner_guid_from_html(html: str) -> Optional[str]:
+    """从详情页 HTML 中提取 owner 的 GUID（从 profile 链接）。"""
+    m = re.search(r'/p/\?guid=([a-f0-9-]+)', html, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
 def _fetch_detail_page_jsonld(code: str) -> Optional[dict]:
-    """访问缓存详情页并提取 JSON-LD。依次尝试 nonpremium / premium cookie。"""
+    """访问缓存详情页并提取坐标和 owner GUID。依次尝试 nonpremium / premium cookie。"""
     urls = [
         f"https://www.geocaching.com/geocache/{code}",
         f"https://www.geocaching.com/seek/cache_details.aspx?wp={code}",
@@ -997,6 +1013,7 @@ def _fetch_detail_page_jsonld(code: str) -> Optional[dict]:
                 if jsonld_match:
                     ld = json.loads(jsonld_match.group(1))
                     if isinstance(ld, dict) and isinstance(ld.get("location"), dict):
+                        ld.setdefault("owner_guid", _extract_owner_guid_from_html(resp.text))
                         return ld
 
                 # 旧版 ASP.NET 页面：从 JS 变量提取坐标 (var lat=X, lng=Y)
@@ -1011,6 +1028,7 @@ def _fetch_detail_page_jsonld(code: str) -> Optional[dict]:
                             "latitude": float(js_match.group(1)),
                             "longitude": float(js_match.group(2)),
                         },
+                        "owner_guid": _extract_owner_guid_from_html(resp.text),
                     }
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
@@ -1048,12 +1066,20 @@ def backfill_missing_coordinates(db: DatabaseManager) -> int:
         loc = ld["location"]
         lat = float(loc["latitude"])
         lng = float(loc["longitude"])
-        db.cursor.execute(
-            "UPDATE caches SET latitude = %s, longitude = %s WHERE code = %s",
-            (round(lat, 6), round(lng, 6), code),
-        )
+        owner_guid = ld.get("owner_guid")
+        if owner_guid:
+            db.cursor.execute(
+                "UPDATE caches SET latitude = %s, longitude = %s, owner_guid = %s WHERE code = %s",
+                (round(lat, 6), round(lng, 6), owner_guid, code),
+            )
+        else:
+            db.cursor.execute(
+                "UPDATE caches SET latitude = %s, longitude = %s WHERE code = %s",
+                (round(lat, 6), round(lng, 6), code),
+            )
         updated += 1
-        logger.info("坐标回填 [%s/%s] %s: 坐标更新为 (%s, %s)", i + 1, len(codes), code, lat, lng)
+        logger.info("坐标回填 [%s/%s] %s: 坐标更新为 (%s, %s)%s", i + 1, len(codes), code, lat, lng,
+                    f" owner_guid={owner_guid}" if owner_guid else "")
         time.sleep(random.uniform(0.5, 1.0))
 
     if updated:

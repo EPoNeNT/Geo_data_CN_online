@@ -343,6 +343,7 @@ def ensure_user_table(conn) -> None:
         )
         cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS registration_date DATE;')
         cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS fetch_status TEXT NOT NULL DEFAULT \'pending\';')
+        cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS guid TEXT;')
         cur.execute(
             'ALTER TABLE "user" '
             'DROP COLUMN IF EXISTS registration_date_raw, '
@@ -351,83 +352,148 @@ def ensure_user_table(conn) -> None:
             'DROP COLUMN IF EXISTS updated_at;'
         )
         cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS user_user_name_unique_idx ON "user" (user_name);')
+        cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS user_guid_unique_idx ON "user" (guid);')
     conn.commit()
 
 
-def get_usernames_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> list[str]:
-    """Read active log users and all cache owners that need a registration date fetch."""
+def get_users_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> tuple[list[dict], list[dict]]:
+    """通过 GUID 聚合 caches 和 logs 中的用户。返回 (待抓取列表, 冲突列表)。
+
+    待抓取: [{"guid": ..., "user_name": ..., "log_count": ...}, ...]
+    冲突:   [{"guid": ..., "usernames": [...], "count": ...}, ...]
+    冲突指同一 GUID 对应多个不同用户名（中间改过名），暂不处理。
+    """
     if include_non_ok:
         user_filter = "(u.user_name IS NULL OR COALESCE(u.fetch_status, '') <> 'ok')"
     else:
         user_filter = "u.user_name IS NULL"
 
-    limit_clause = ""
-    params = []
+    limit_clause = "LIMIT %s" if limit is not None else ""
+    params = [MIN_LOG_COUNT_FOR_REGDATE_FETCH]
     if limit is not None:
-        limit_clause = "LIMIT %s"
         params.append(limit)
 
+    # Step 1: 按 GUID 聚合所有用户数据
     query = f"""
     WITH log_users AS (
-      SELECT TRIM(user_name) AS user_name, COUNT(*)::int AS log_count
-      FROM logs
-      WHERE user_name IS NOT NULL
-        AND TRIM(user_name) <> ''
-      GROUP BY TRIM(user_name)
+      SELECT
+        l.user_guid AS guid,
+        MAX(TRIM(l.user_name)) AS user_name,
+        COUNT(*)::int AS log_count
+      FROM logs l
+      WHERE l.user_guid IS NOT NULL
+        AND TRIM(l.user_name) IS NOT NULL
+        AND TRIM(l.user_name) <> ''
+      GROUP BY l.user_guid
       HAVING COUNT(*) > %s
     ),
     owner_users AS (
-      SELECT DISTINCT TRIM(owner_username) AS user_name
-      FROM caches
-      WHERE owner_username IS NOT NULL
-        AND TRIM(owner_username) <> ''
+      SELECT
+        c.owner_guid AS guid,
+        MAX(TRIM(c.owner_username)) AS user_name,
+        0::int AS log_count
+      FROM caches c
+      WHERE c.owner_guid IS NOT NULL
+        AND c.owner_username IS NOT NULL
+        AND TRIM(c.owner_username) <> ''
+      GROUP BY c.owner_guid
     ),
-    candidate_users AS (
-      SELECT user_name FROM log_users
+    candidates AS (
+      SELECT guid, user_name, log_count FROM log_users
       UNION
-      SELECT user_name FROM owner_users
+      SELECT guid, user_name, log_count FROM owner_users
+      WHERE guid NOT IN (SELECT guid FROM log_users)
     )
-    SELECT candidate_users.user_name
-    FROM candidate_users
-    LEFT JOIN "user" u ON u.user_name = candidate_users.user_name
-    WHERE 1 = 1
-      AND {user_filter}
-      AND candidate_users.user_name <> '[DELETED_USER]'
-    ORDER BY candidate_users.user_name
+    SELECT candidates.guid, candidates.user_name, candidates.log_count
+    FROM candidates
+    LEFT JOIN "user" u ON u.guid = candidates.guid
+    WHERE {user_filter}
+    ORDER BY candidates.log_count DESC, candidates.user_name
     {limit_clause};
     """
+
     with conn.cursor() as cur:
-        cur.execute(query, [MIN_LOG_COUNT_FOR_REGDATE_FETCH, *params])
-        return [row["user_name"] for row in cur.fetchall()]
+        cur.execute(query, params)
+        all_rows = [dict(row) for row in cur.fetchall()]
+
+    if not all_rows:
+        return [], []
+
+    # Step 2: 检测 GUID 是否对应多个不同用户名（改名冲突）
+    guids = [r["guid"] for r in all_rows]
+    if not guids:
+        return [], []
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH guid_usernames AS (
+              SELECT l.user_guid AS guid, TRIM(l.user_name) AS user_name
+              FROM logs l
+              WHERE l.user_guid = ANY(%s)
+                AND l.user_guid IS NOT NULL
+                AND TRIM(l.user_name) IS NOT NULL
+                AND TRIM(l.user_name) <> ''
+              UNION
+              SELECT c.owner_guid AS guid, TRIM(c.owner_username) AS user_name
+              FROM caches c
+              WHERE c.owner_guid = ANY(%s)
+                AND c.owner_guid IS NOT NULL
+                AND c.owner_username IS NOT NULL
+                AND TRIM(c.owner_username) <> ''
+            )
+            SELECT guid, ARRAY_AGG(DISTINCT user_name ORDER BY user_name) AS usernames
+            FROM guid_usernames
+            GROUP BY guid
+            HAVING COUNT(DISTINCT user_name) > 1
+            """,
+            (guids, guids),
+        )
+        conflict_map = {row["guid"]: row["usernames"] for row in cur.fetchall()}
+
+    to_fetch = []
+    conflicts = []
+    for row in all_rows:
+        if row["guid"] in conflict_map:
+            conflicts.append({
+                "guid": row["guid"],
+                "usernames": conflict_map[row["guid"]],
+                "count": len(conflict_map[row["guid"]]),
+            })
+        else:
+            to_fetch.append(row)
+
+    return to_fetch, conflicts
 
 
 def get_distinct_log_user_count(conn) -> int:
-    """Count candidate users from active log users and all cache owners."""
+    """通过 GUID 统计唯一候选用户数。"""
     with conn.cursor() as cur:
         cur.execute(
             """
             WITH log_users AS (
-              SELECT TRIM(user_name) AS user_name
-              FROM logs
-              WHERE user_name IS NOT NULL
-                AND TRIM(user_name) <> ''
-              GROUP BY TRIM(user_name)
+              SELECT l.user_guid AS guid
+              FROM logs l
+              WHERE l.user_guid IS NOT NULL
+                AND TRIM(l.user_name) IS NOT NULL
+                AND TRIM(l.user_name) <> ''
+              GROUP BY l.user_guid
               HAVING COUNT(*) > %s
             ),
             owner_users AS (
-              SELECT DISTINCT TRIM(owner_username) AS user_name
-              FROM caches
-              WHERE owner_username IS NOT NULL
-                AND TRIM(owner_username) <> ''
-            ),
-            candidate_users AS (
-              SELECT user_name FROM log_users
-              UNION
-              SELECT user_name FROM owner_users
+              SELECT c.owner_guid AS guid
+              FROM caches c
+              WHERE c.owner_guid IS NOT NULL
+                AND c.owner_username IS NOT NULL
+                AND TRIM(c.owner_username) <> ''
+              GROUP BY c.owner_guid
             )
             SELECT COUNT(*)::int AS count
-            FROM candidate_users
-            WHERE candidate_users.user_name <> '[DELETED_USER]';
+            FROM (
+              SELECT guid FROM log_users
+              UNION
+              SELECT guid FROM owner_users
+            ) sub;
             """,
             (MIN_LOG_COUNT_FOR_REGDATE_FETCH,),
         )
@@ -435,15 +501,16 @@ def get_distinct_log_user_count(conn) -> int:
 
 
 def upsert_results(conn, results: list[dict]) -> None:
-    """Write a batch of user registration results."""
+    """Write a batch of user registration results (keyed by guid)."""
     if not results:
         return
 
     query = """
-    INSERT INTO "user" (user_name, registration_date, fetch_status)
-    VALUES (%(user_name)s, %(registration_date)s, %(fetch_status)s)
-    ON CONFLICT (user_name) DO UPDATE
-    SET registration_date = EXCLUDED.registration_date,
+    INSERT INTO "user" (user_name, guid, registration_date, fetch_status)
+    VALUES (%(user_name)s, %(guid)s, %(registration_date)s, %(fetch_status)s)
+    ON CONFLICT (guid) DO UPDATE
+    SET user_name = EXCLUDED.user_name,
+        registration_date = EXCLUDED.registration_date,
         fetch_status = EXCLUDED.fetch_status;
     """
     with conn.cursor() as cur:
@@ -468,6 +535,7 @@ def main() -> None:
     conn = connect_db()
     pending_results = []
     login_required_count = 0
+    all_conflicts: list[dict] = []
 
     try:
         if args.dry_run:
@@ -480,12 +548,13 @@ def main() -> None:
             return
 
         ensure_user_table(conn)
-        user_names = get_usernames_to_fetch(
+        to_fetch, conflicts = get_users_to_fetch(
             conn,
             include_non_ok=not args.missing_only,
             limit=args.limit,
         )
-        logger.info("Users to fetch: %s", len(user_names))
+        all_conflicts = conflicts
+        logger.info("Users to fetch: %s (skipped %s with username conflicts)", len(to_fetch), len(conflicts))
 
         session = build_authenticated_session(timeout_seconds=max(1, args.timeout))
         if session is None:
@@ -493,7 +562,9 @@ def main() -> None:
             return
 
         with session:
-            for index, user_name in enumerate(user_names, start=1):
+            for index, row in enumerate(to_fetch, start=1):
+                guid = row["guid"]
+                user_name = row["user_name"]
                 started_at = time.monotonic()
                 registration_date, raw_date, status = fetch_registration_date(
                     session,
@@ -504,10 +575,11 @@ def main() -> None:
                 elapsed = time.monotonic() - started_at
 
                 logger.info(
-                    "[%s/%s] %s status=%s registration_date=%s raw=%s elapsed=%.1fs",
+                    "[%s/%s] %s guid=%s status=%s registration_date=%s raw=%s elapsed=%.1fs",
                     index,
-                    len(user_names),
+                    len(to_fetch),
                     user_name,
+                    guid,
                     status,
                     registration_date,
                     raw_date,
@@ -519,6 +591,7 @@ def main() -> None:
 
                 pending_results.append(
                     {
+                        "guid": guid,
                         "user_name": user_name,
                         "registration_date": registration_date,
                         "fetch_status": status,
@@ -538,12 +611,19 @@ def main() -> None:
                     logger.info("Wrote %s results", len(pending_results))
                     pending_results = []
 
-                if index < len(user_names) and args.delay > 0:
+                if index < len(to_fetch) and args.delay > 0:
                     time.sleep(args.delay)
 
         if pending_results:
             upsert_results(conn, pending_results)
             logger.info("Wrote final %s results", len(pending_results))
+
+        # 输出冲突报告
+        if all_conflicts:
+            logger.info("=" * 60)
+            logger.info("GUID 对应多个用户名的冲突（跳过，可能是改名）: %s 个", len(all_conflicts))
+            for c in all_conflicts:
+                logger.info("  guid=%s usernames=%s", c["guid"], c["usernames"])
 
         logger.info("User registration date crawl complete")
     finally:

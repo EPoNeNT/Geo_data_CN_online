@@ -113,6 +113,7 @@ def connect_db(database_url: str):
 def ensure_schema(cursor) -> None:
     cursor.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
     cursor.execute("ALTER TABLE caches ADD COLUMN IF NOT EXISTS city TEXT;")
+    cursor.execute("ALTER TABLE caches ADD COLUMN IF NOT EXISTS owner_guid TEXT;")
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS map_cities (

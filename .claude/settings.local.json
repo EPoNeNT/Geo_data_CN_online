@@ -13,7 +13,26 @@
       "Bash(python test/test_coordinate_backfill.py GCBPR5N)",
       "Bash(python test/test_coordinate_backfill.py --inspect GCBPR5N)",
       "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_caches.py', doraise=True\\); py_compile.compile\\('test/test_coordinate_backfill.py', doraise=True\\); print\\('OK'\\)\")",
-      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_archived_logs.py', doraise=True\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_archived_logs.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(pip install *)",
+      "Bash(python analysis/monthly_registrations.py)",
+      "Bash(python -c ' *)",
+      "Bash(python analysis/fetch_all_user_regdates.py --delay 0.2)",
+      "Bash(sleep 30 && tail -20 \"C:\\\\Users\\\\cjyte\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-cjyte-Documents-trae_projects-Geo_data-v3-0\\\\3adcf408-2a8d-444f-917f-dd69a98cb63e\\\\tasks\\\\bw46veai8.output\")",
+      "Read(//c/Users/cjyte/AppData/Local/Temp/claude/c--Users-cjyte-Documents-trae_projects-Geo_data-v3-0/3adcf408-2a8d-444f-917f-dd69a98cb63e/tasks/**)",
+      "Bash(cat \"C:\\\\Users\\\\cjyte\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-cjyte-Documents-trae_projects-Geo-data-v3-0\\\\3adcf408-2a8d-444f-917f-dd69a98cb63e\\\\tasks\\\\bslkj78pu.output\" 2>/dev/null || echo \"File gone, trying to read directly...\")",
+      "Read(//c/Users/cjyte/AppData/Local/Temp/claude/c--Users-cjyte-Documents-trae_projects-Geo-data-v3-0/3adcf408-2a8d-444f-917f-dd69a98cb63e/tasks/**)",
+      "Bash(python analysis/fetch_all_user_regdates.py --delay 0.2 --limit 3)",
+      "Bash(python test/debug_user_id.py GCBPR5N)",
+      "Bash(python test/debug_user_id.py)",
+      "Bash(python test/debug_user_id.py GCAGKVE)",
+      "Bash(python test/debug_owner_id.py)",
+      "Bash(python test/debug_owner_html.py)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_caches.py', doraise=True\\); py_compile.compile\\('crawl_logs.py', doraise=True\\); py_compile.compile\\('assign_cities.py', doraise=True\\); print\\('All OK'\\)\")",
+      "Bash(python test/debug_owner_field.py)",
+      "Bash(python test/debug_cookie_status.py)",
+      "Bash(python backfill_guids.py --dry-run --limit=5)",
+      "Bash(python crawl_user_regdates.py --dry-run)"
     ]
   }
 }

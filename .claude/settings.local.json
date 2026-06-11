@@ -52,7 +52,9 @@
       "Bash(rm -f test/verify_stream_fix.py test/check_large_profiles.py test/test_postback_finds.py)",
       "Bash(rm -rf test/first_find_debug test/airq_debug)",
       "Bash(python fetch_first_find.py --limit 3)",
-      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_user_regdates.py', doraise=True\\); py_compile.compile\\('test/fetch_first_find.py', doraise=True\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_user_regdates.py', doraise=True\\); py_compile.compile\\('test/fetch_first_find.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python test/backfill_guids.py --cache=GC1T000 --dry-run)",
+      "Bash(python test/backfill_guids.py --cache=GC1T000)"
     ]
   }
 }

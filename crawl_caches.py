@@ -718,12 +718,13 @@ def _fetch_archived_cache_page_data(gc_code: str) -> Optional[dict]:
                     pass
 
             if "owner" not in result:
-                author_match = re.search(
-                    r'<meta[^>]*name="author"[^>]*content="([^"]*)"',
+                # 从 profile 链接提取 owner 用户名（兜底，不依赖 <meta author>）
+                profile_match = re.search(
+                    r'<a\s[^>]*?/p/\?guid=[a-f0-9-]+[^>]*?>\s*([^<]+)\s*</a>',
                     text, re.IGNORECASE,
                 )
-                if author_match:
-                    result["owner"] = {"username": author_match.group(1).strip()}
+                if profile_match:
+                    result["owner"] = {"username": profile_match.group(1).strip()}
 
             if "name" not in result:
                 title_match = re.search(
@@ -731,7 +732,14 @@ def _fetch_archived_cache_page_data(gc_code: str) -> Optional[dict]:
                     text, re.IGNORECASE,
                 )
                 if title_match:
-                    result["name"] = title_match.group(1).strip()
+                    name = title_match.group(1).strip()
+                    # 去掉 title 中的 "GC{code} " 前缀（无 dash 的情况）
+                    name = re.sub(r'^GC\w+\s+', '', name)
+                    # 去掉首部的 " - "（原 title 格式 GC{code} - name）
+                    name = re.sub(r'^\s*-\s*', '', name)
+                    # 去掉尾部 " (Type) in Country created by Owner"
+                    name = re.sub(r'\s*\([^)]*\)\s*in\s+[^<]+$', '', name)
+                    result["name"] = name.strip()
                 else:
                     og_match = re.search(
                         r'<meta[^>]*property="og:title"[^>]*content="[^"]*-\s*([^"]*)"',

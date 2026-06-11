@@ -39,7 +39,20 @@
       "Bash(python test/debug_airq_timeout.py --timeout 30)",
       "Bash(python test/analyze_airq_html.py)",
       "Bash(python test/verify_stream_fix.py)",
-      "Bash(python test/fix_corrupted_caches.py --dry-run --limit=3)"
+      "Bash(python test/fix_corrupted_caches.py --dry-run --limit=3)",
+      "Bash(python test/probe_first_find.py \"Nicky_goforit\" --timeout 45)",
+      "Bash(python test/test_postback_finds.py \"asakosachben\")",
+      "Bash(python fetch_first_find.py AirQ asakosachben Nicky_goforit --delay 0.5)",
+      "Bash(python fetch_first_find.py AirQ NonExistentUser12345 asakosachben --delay 0.5)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_user_regdates.py', doraise=True\\); print\\('Syntax OK'\\)\")",
+      "Bash(python crawl_user_regdates.py --limit 3 --delay 0.5)",
+      "Bash(python fetch_first_find.py AirQ asakosachben Nicky_goforit)",
+      "Bash(python crawl_user_regdates.py --limit 1)",
+      "Bash(python fetch_first_find.py AirQ asakosachben)",
+      "Bash(rm -f test/verify_stream_fix.py test/check_large_profiles.py test/test_postback_finds.py)",
+      "Bash(rm -rf test/first_find_debug test/airq_debug)",
+      "Bash(python fetch_first_find.py --limit 3)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('crawl_user_regdates.py', doraise=True\\); py_compile.compile\\('test/fetch_first_find.py', doraise=True\\); print\\('OK'\\)\")"
     ]
   }
 }

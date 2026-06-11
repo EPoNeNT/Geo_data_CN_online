@@ -36,6 +36,21 @@ DATABASE_URL = require_env("DATABASE_URL")
 PROFILE_URL = "https://www.geocaching.com/p/default.aspx"
 DEFAULT_TIMEOUT_SECONDS = int(os.getenv("USER_REGDATE_TIMEOUT_SECONDS", "45"))
 STREAM_MAX_BYTES = int(os.getenv("USER_REGDATE_STREAM_MAX_BYTES", "204800"))  # 200KB
+
+# nearest.aspx 对美国 cache 只显示州名，需映射为 United States
+_US_STATES = frozenset({
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+    "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+    "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+    "New Hampshire", "New Jersey", "New Mexico", "New York",
+    "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+    "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+    "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+    "West Virginia", "Wisconsin", "Wyoming",
+})
+
 DEFAULT_MAX_RETRIES = int(os.getenv("USER_REGDATE_MAX_RETRIES", "3"))
 DEFAULT_DELAY_SECONDS = float(os.getenv("USER_REGDATE_DELAY_SECONDS", "1.6"))
 DEFAULT_BATCH_SIZE = int(os.getenv("USER_REGDATE_BATCH_SIZE", "50"))
@@ -340,6 +355,69 @@ def fetch_registration_date(
     return None, None, last_status
 
 
+def fetch_first_find_country(
+    session: requests.Session,
+    user_name: str,
+    timeout_seconds: int,
+) -> str | None:
+    """Return the country of a user's first found cache, or None.
+
+    Uses the old-style nearest.aspx page which works with any valid cookie
+    (no Premium required).  Results are sorted by found date ascending.
+    """
+    # Geocaching 对查询参数做双重解码，+ 号需双重编码（%2B → %252B）
+    url = (
+        "https://www.geocaching.com/seek/nearest.aspx"
+        f"?ul={quote(user_name).replace('%2B', '%252B')}"
+        f"&sort=lastfound&sortdir=asc"
+    )
+
+    try:
+        html, response = _stream_profile_html(session, url, timeout_seconds)
+
+        if "signin" in response.url.lower() or "login" in response.url.lower():
+            logger.warning("%s first-find: redirected to login", user_name)
+            return None
+
+        if response.status_code != 200:
+            logger.warning("%s first-find: HTTP %s", user_name, response.status_code)
+            return None
+
+        # 检查用户是否存在 / finds 是否私密
+        html_lower = html.lower()
+        if "does not exist" in html_lower:
+            logger.info("%s first-find: user does not exist", user_name)
+            return None
+        if "this content is private" in html_lower:
+            logger.info("%s first-find: finds are private", user_name)
+            return None
+
+        # nearest.aspx renders cache info in <span class="small"> elements:
+        #   by OwnerName | GCXXXXX | CountryName
+        for span_match in re.finditer(
+            r'<span\s+class="small">(.*?)</span>', html, re.DOTALL
+        ):
+            text = re.sub(r"<[^>]+>", "", span_match.group(1)).strip()
+            parts = [p.strip() for p in text.split("|")]
+            if len(parts) >= 3 and re.match(r"GC[A-Z0-9]+$", parts[1]):
+                country = parts[2].rsplit(",", 1)[-1].strip()
+                if country in _US_STATES:
+                    country = "United States"
+                if country:
+                    logger.info(
+                        "%s first-find: %s (%s)", user_name, parts[1], country
+                    )
+                return country or None
+
+        # No matching cache row found (user may have 0 finds or profile is private)
+        logger.info("%s first-find: no cache rows found", user_name)
+        return None
+
+    except requests.RequestException as exc:
+        logger.warning("%s first-find request failed: %s", user_name, exc)
+        return None
+
+
 def connect_db():
     """Connect to Neon."""
     return connect_postgres(
@@ -365,6 +443,7 @@ def ensure_user_table(conn) -> None:
         cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS registration_date DATE;')
         cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS fetch_status TEXT NOT NULL DEFAULT \'pending\';')
         cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS guid TEXT;')
+        cur.execute('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS reg_place TEXT;')
         cur.execute(
             'ALTER TABLE "user" '
             'DROP COLUMN IF EXISTS registration_date_raw, '
@@ -533,12 +612,13 @@ def upsert_results(conn, results: list[dict]) -> None:
     results = list(deduped.values())
 
     query = """
-    INSERT INTO "user" (user_name, guid, registration_date, fetch_status)
-    VALUES (%(user_name)s, %(guid)s, %(registration_date)s, %(fetch_status)s)
+    INSERT INTO "user" (user_name, guid, registration_date, fetch_status, reg_place)
+    VALUES (%(user_name)s, %(guid)s, %(registration_date)s, %(fetch_status)s, %(reg_place)s)
     ON CONFLICT (user_name) DO UPDATE
     SET guid = COALESCE("user".guid, EXCLUDED.guid),
         registration_date = COALESCE(EXCLUDED.registration_date, "user".registration_date),
-        fetch_status = EXCLUDED.fetch_status;
+        fetch_status = EXCLUDED.fetch_status,
+        reg_place = COALESCE(EXCLUDED.reg_place, "user".reg_place);
     """
     with conn.cursor() as cur:
         execute_batch(cur, query, results)
@@ -599,10 +679,17 @@ def main() -> None:
                     max_retries=max(1, args.max_retries),
                     timeout_seconds=max(1, args.timeout),
                 )
+
+                reg_place: str | None = None
+                if status == "ok":
+                    reg_place = fetch_first_find_country(
+                        session, user_name, timeout_seconds=max(1, args.timeout)
+                    )
+
                 elapsed = time.monotonic() - started_at
 
                 logger.info(
-                    "[%s/%s] %s guid=%s status=%s registration_date=%s raw=%s elapsed=%.1fs",
+                    "[%s/%s] %s guid=%s status=%s registration_date=%s raw=%s reg_place=%s elapsed=%.1fs",
                     index,
                     len(to_fetch),
                     user_name,
@@ -610,6 +697,7 @@ def main() -> None:
                     status,
                     registration_date,
                     raw_date,
+                    reg_place,
                     elapsed,
                 )
 
@@ -622,6 +710,7 @@ def main() -> None:
                         "user_name": user_name,
                         "registration_date": registration_date,
                         "fetch_status": status,
+                        "reg_place": reg_place,
                     }
                 )
 

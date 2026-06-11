@@ -954,6 +954,8 @@ def cache_metadata_changed(existing: dict, latest: dict) -> bool:
         compare_keys.extend(['latitude', 'longitude'])
 
     for key in compare_keys:
+        if latest.get(key) is None:
+            continue  # API 无此字段，不比较也不覆盖已有值
         if normalize_cache_field(key, latest.get(key)) != normalize_cache_field(key, existing.get(key)):
             return True
 
@@ -964,6 +966,38 @@ def _extract_owner_guid_from_html(html: str) -> Optional[str]:
     """从详情页 HTML 中提取 owner 的 GUID（从 profile 链接）。"""
     m = re.search(r'/p/\?guid=([a-f0-9-]+)', html, re.IGNORECASE)
     return m.group(1) if m else None
+
+
+def _extract_owner_guid_from_detail_page(code: str, premium_only: bool = False) -> Optional[str]:
+    """请求详情页并提取 owner GUID。premium 缓存优先用 premium cookie。"""
+    urls = [
+        f"https://www.geocaching.com/seek/cache_details.aspx?wp={code}",
+        f"https://www.geocaching.com/geocache/{code}",
+    ]
+    if premium_only:
+        cookie_order = [("premium", _RAW_PREMIUM_COOKIE), ("nonpremium", _RAW_NONPREMIUM_COOKIE)]
+    else:
+        cookie_order = [("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)]
+
+    for url in urls:
+        for _label, cookie in cookie_order:
+            if not cookie:
+                continue
+            try:
+                resp = session.get(url, headers={
+                    "accept": "text/html,application/xhtml+xml",
+                    "cookie": cookie,
+                    "referer": "https://www.geocaching.com/play/map",
+                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                }, timeout=10, allow_redirects=True)
+                if resp.status_code != 200:
+                    continue
+                guid = _extract_owner_guid_from_html(resp.text)
+                if guid:
+                    return guid
+            except Exception:
+                continue
+    return None
 
 
 def _fetch_detail_page_jsonld(code: str) -> Optional[dict]:
@@ -1187,6 +1221,12 @@ def run_crawler():
                     if not is_new and cache_record.get('premium_only', False):
                         cache_record['latitude'] = scanned_data[code].get('latitude')
                         cache_record['longitude'] = scanned_data[code].get('longitude')
+
+                    # owner_username 变化 → 缓存可能被转移，从详情页获取新 owner GUID
+                    if not is_new and cache_record.get('owner_username') != scanned_data[code].get('owner_username'):
+                        new_guid = _extract_owner_guid_from_detail_page(code, cache_record.get('premium_only', False))
+                        if new_guid:
+                            cache_record['owner_guid'] = new_guid
 
                     updated_caches.append(cache_record)
                     if is_new:

@@ -95,11 +95,18 @@ def log_date_sort_key(value) -> str:
 
 
 def deduplicate_logs_by_cache_user(logs: List[dict]) -> List[dict]:
-    """Keep only the latest visited date for each (GCCode, UserName)."""
+    """Keep only the latest visited date for each (GCCode, AccountGuid).
+
+    When GUID is available it serves as the primary key (survives renames).
+    Falls back to (GCCode, UserName) for logs without a GUID.
+    """
     deduped: Dict[Tuple[str, str], dict] = {}
 
     for log in logs:
-        key = (log.get("GCCode"), log.get("UserName"))
+        gc_code = log.get("GCCode")
+        guid = log.get("AccountGuid")
+        user_name = log.get("UserName")
+        key = (gc_code, guid) if guid else (gc_code, user_name)
         if not key[0] or not key[1]:
             continue
 
@@ -162,6 +169,12 @@ class DatabaseManager:
             """
             ALTER TABLE logs
             ADD COLUMN IF NOT EXISTS user_guid TEXT
+            """
+        )
+        self.cursor.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS logs_gc_user_guid_unique
+            ON logs(gc_code, user_guid) WHERE user_guid IS NOT NULL AND user_guid <> 'deleted'
             """
         )
         self.conn.commit()
@@ -284,43 +297,42 @@ class DatabaseManager:
                     raise
 
     def get_existing_logs_for_caches(self, gc_codes: List[str]) -> Dict[Tuple[str, str], dict]:
-        """查询指定 caches 的现有日志记录，返回 {(gc_code, user_name): record} 字典。"""
+        """返回 {(gc_code, user_guid): record} 索引，仅包含已有 GUID 的记录。"""
         if not gc_codes:
             return {}
 
         self.cursor.execute(
             """
-            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid,
-                   COUNT(*) OVER (PARTITION BY gc_code, user_name) AS duplicate_count
+            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid
             FROM logs
-            WHERE gc_code = ANY(%s)
+            WHERE gc_code = ANY(%s) AND user_guid IS NOT NULL AND user_guid <> 'deleted'
             """,
             (gc_codes,),
         )
 
         existing = {}
         for row in self.cursor.fetchall():
-            key = (row[0], row[1])
-            existing[key] = {
+            existing[(row[0], row[6])] = {
+                "user_name": row[1],
                 "visited": row[2],
                 "favorite_point_used": row[3],
                 "is_ftf": row[4],
                 "log_type": row[5],
                 "user_guid": row[6],
-                "duplicate_count": row[7],
             }
         return existing
 
     def smart_upsert_logs(self, new_logs: List[dict]) -> Tuple[int, int]:
         """
         智能日志更新：比较新旧记录，决定插入或替换。
-        
+
         返回: (inserted_count, updated_count)
-        
+
         逻辑：
-        - 如果 (gc_code, user_name) 不存在于数据库 → INSERT
-        - 如果存在且所有字段完全相同 → 跳过（去重）
-        - 如果存在但有字段不同 → UPDATE（替换旧记录）
+        - 用 (gc_code, user_guid) 匹配
+        - 匹配到但用户名变了 → UPDATE（覆盖旧用户名）
+        - 不存在 → INSERT
+        - 字段完全相同 → 跳过
         """
         if not new_logs:
             return (0, 0)
@@ -334,9 +346,8 @@ class DatabaseManager:
             )
         new_logs = deduped_logs
 
-        # 批量查询这些 cache 的现有日志
         gc_codes = list(set(log["GCCode"] for log in new_logs))
-        existing_logs = self.get_existing_logs_for_caches(gc_codes)
+        existing_by_guid = self.get_existing_logs_for_caches(gc_codes)
 
         to_insert = []
         to_update = []
@@ -344,39 +355,40 @@ class DatabaseManager:
         for log in new_logs:
             gc_code = log["GCCode"]
             user_name = log["UserName"]
-            key = (gc_code, user_name)
+            guid = log.get("AccountGuid")
 
             new_record = {
                 "visited": log["Visited"],
                 "favorite_point_used": log.get("FavoritePointUsed", False),
                 "is_ftf": log.get("IsFTF", False),
                 "log_type": log.get("LogType", FOUND_LOG_TYPE),
-                "user_guid": log.get("AccountGuid"),
+                "user_guid": guid,
             }
 
-            if key not in existing_logs:
-                # 新记录，需要插入
+            # 只用 GUID 匹配
+            old_record = existing_by_guid.get((gc_code, guid)) if guid else None
+
+            if old_record is None:
                 to_insert.append(log)
-            else:
-                # 已存在，比较字段
-                old_record = existing_logs[key]
+                continue
 
-                # 标准化 visited 字段为字符串进行比较
-                db_visited_str = normalize_log_date_for_compare(old_record["visited"])
-                api_visited_str = normalize_log_date_for_compare(new_record["visited"])
+            # 已存在，比较字段
+            db_visited_str = normalize_log_date_for_compare(old_record["visited"])
+            api_visited_str = normalize_log_date_for_compare(new_record["visited"])
 
-                # 比较所有关键字段
-                fields_match = (
-                    db_visited_str == api_visited_str
-                    and bool(old_record["favorite_point_used"]) == bool(new_record["favorite_point_used"])
-                    and bool(old_record["is_ftf"]) == bool(new_record["is_ftf"])
-                    and (old_record.get("log_type") or FOUND_LOG_TYPE) == new_record["log_type"]
-                    and old_record.get("user_guid") == new_record.get("user_guid")
-                )
+            fields_match = (
+                db_visited_str == api_visited_str
+                and bool(old_record["favorite_point_used"]) == bool(new_record["favorite_point_used"])
+                and bool(old_record["is_ftf"]) == bool(new_record["is_ftf"])
+                and (old_record.get("log_type") or FOUND_LOG_TYPE) == new_record["log_type"]
+                and old_record.get("user_guid") == new_record.get("user_guid")
+            )
 
-                if not fields_match or int(old_record.get("duplicate_count") or 1) > 1:
-                    # 字段有变化，需要更新
-                    to_update.append(log)
+            # 用户名变了（改名）→ 需要更新
+            name_changed = old_record.get("user_name") != user_name
+
+            if not fields_match or name_changed:
+                to_update.append(log)
 
         # 执行批量操作
         inserted_count = 0
@@ -415,44 +427,51 @@ class DatabaseManager:
         )
 
     def _batch_update_logs(self, logs: List[dict]) -> int:
-        """执行批量 UPDATE 操作，根据 (gc_code, user_name) 匹配并更新其他字段。"""
+        """执行批量 UPDATE 操作。优先用 (gc_code, user_guid) 匹配，回退用 user_name。"""
         changed_count = 0
         for log in logs:
+            gc_code = log["GCCode"]
+            user_name = log["UserName"]
+            guid = log.get("AccountGuid")
+
+            if guid:
+                where_clause = "gc_code = %s AND user_guid = %s"
+                where_params = (gc_code, guid)
+            else:
+                where_clause = "gc_code = %s AND user_name = %s"
+                where_params = (gc_code, user_name)
+
             self.cursor.execute(
-                """
+                f"""
                 DELETE FROM logs
-                WHERE gc_code = %s
-                  AND user_name = %s
+                WHERE {where_clause}
                   AND ctid NOT IN (
                       SELECT ctid
                       FROM logs
-                      WHERE gc_code = %s AND user_name = %s
+                      WHERE {where_clause}
                       ORDER BY visited DESC
                       LIMIT 1
                   )
                 """,
-                (
-                    log["GCCode"],
-                    log["UserName"],
-                    log["GCCode"],
-                    log["UserName"],
-                ),
+                where_params + where_params,
             )
             deleted_duplicates = max(0, self.cursor.rowcount or 0)
             self.cursor.execute(
-                """
+                f"""
                 UPDATE logs
                 SET visited = %s,
                     favorite_point_used = %s,
                     is_ftf = %s,
                     log_type = %s,
+                    user_name = %s,
                     user_guid = %s
-                WHERE gc_code = %s AND user_name = %s
+                WHERE {where_clause}
                   AND (
                       visited IS DISTINCT FROM %s::date
                       OR COALESCE(favorite_point_used, false) IS DISTINCT FROM %s::boolean
                       OR COALESCE(is_ftf, false) IS DISTINCT FROM %s::boolean
                       OR COALESCE(log_type, %s) IS DISTINCT FROM %s
+                      OR COALESCE(user_name, '') IS DISTINCT FROM %s
                       OR user_guid IS DISTINCT FROM %s
                   )
                 """,
@@ -461,15 +480,16 @@ class DatabaseManager:
                     log.get("FavoritePointUsed", False),
                     log.get("IsFTF", False),
                     log.get("LogType", FOUND_LOG_TYPE),
-                    log.get("AccountGuid"),
-                    log["GCCode"],
-                    log["UserName"],
+                    user_name,
+                    guid,
+                ) + where_params + (
                     log["Visited"],
                     log.get("FavoritePointUsed", False),
                     log.get("IsFTF", False),
                     FOUND_LOG_TYPE,
                     log.get("LogType", FOUND_LOG_TYPE),
-                    log.get("AccountGuid"),
+                    user_name,
+                    guid,
                 ),
             )
             if deleted_duplicates > 0 or (self.cursor.rowcount or 0) > 0:

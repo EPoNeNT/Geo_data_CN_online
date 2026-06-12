@@ -613,13 +613,15 @@ class DataGenerator:
             log_where = (
                 f"WHERE COALESCE(c2.cache_status, 0) != 404 "
                 f"AND c2.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES}) "
-                f"AND c2.country = {country_value}"
+                f"AND c2.country = {country_value} "
+                f"AND l.log_type != 'deleted'"
             )
         else:
             cache_where = f"WHERE {EXCLUDE_CACHE_WHERE}"
             log_where = (
                 f"WHERE COALESCE(c2.cache_status, 0) != 404 "
-                f"AND c2.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES})"
+                f"AND c2.geocache_type NOT IN ({EXCLUDED_CACHE_TYPES}) "
+                f"AND l.log_type != 'deleted'"
             )
 
         query = f"""
@@ -1047,6 +1049,7 @@ class DataGenerator:
                 AND {date_condition}
                 AND {cache_join_condition}
                 {country_condition}
+                AND l.log_type != 'deleted'
               GROUP BY l.user_name
               HAVING COUNT(DISTINCT l.gc_code) > 0
             ) ranked;
@@ -1064,6 +1067,7 @@ class DataGenerator:
                 AND {date_condition}
                 AND {cache_join_condition}
                 {country_condition}
+                AND l.log_type != 'deleted'
               GROUP BY l.user_name
               HAVING COUNT(*) > 0
             ) ranked;
@@ -1097,6 +1101,7 @@ class DataGenerator:
                 AND {date_condition}
                 AND {cache_join_condition}
                 {country_condition}
+                AND l.log_type != 'deleted'
               GROUP BY c.owner_username
               HAVING COUNT(l.*) > 0
             ) ranked;
@@ -1114,6 +1119,7 @@ class DataGenerator:
                 AND {date_condition}
                 AND {cache_join_condition}
                 {country_condition}
+                AND l.log_type != 'deleted'
               GROUP BY c.owner_username
               HAVING COUNT(l.*) > 0
             ) ranked;
@@ -1184,6 +1190,7 @@ class DataGenerator:
                     AND {visited_date_condition}
                     AND {cache_join_condition}
                     {country_condition}
+                    AND l.log_type != 'deleted'
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1198,6 +1205,7 @@ class DataGenerator:
                   AND {visited_date_condition}
                   AND {cache_join_condition}
                   {country_condition}
+                  AND l.log_type != 'deleted'
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
                 LIMIT {limit};
@@ -1216,6 +1224,7 @@ class DataGenerator:
               AND {visited_date_condition}
               AND {cache_join_condition}
               {country_condition}
+              AND l.log_type != 'deleted'
             GROUP BY l.user_name
             ORDER BY score DESC, l.user_name ASC
             LIMIT {limit};
@@ -1236,6 +1245,7 @@ class DataGenerator:
                     AND {visited_date_condition}
                     AND {cache_join_condition}
                     {country_condition}
+                    AND l.log_type != 'deleted'
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1251,6 +1261,7 @@ class DataGenerator:
                   AND {visited_date_condition}
                   AND {cache_join_condition}
                   {country_condition}
+                  AND l.log_type != 'deleted'
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1270,6 +1281,7 @@ class DataGenerator:
                     AND {visited_date_condition}
                     AND {cache_join_condition}
                   {country_condition}
+                    AND l.log_type != 'deleted'
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1288,6 +1300,7 @@ class DataGenerator:
                   AND {visited_date_condition}
                   AND {cache_join_condition}
                   {country_condition}
+                  AND l.log_type != 'deleted'
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1371,6 +1384,7 @@ class DataGenerator:
                     {date_filter}
                     AND {cache_join_condition}
                     {country_condition}
+                    AND l.log_type != 'deleted'
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1385,6 +1399,7 @@ class DataGenerator:
                   {date_filter}
                   AND {cache_join_condition}
                   {country_condition}
+                  AND l.log_type != 'deleted'
                 GROUP BY l.user_name
                 ORDER BY score DESC, l.user_name ASC
                 LIMIT {limit};
@@ -1403,6 +1418,7 @@ class DataGenerator:
               {date_filter}
               AND {cache_join_condition}
               {country_condition}
+              AND l.log_type != 'deleted'
             GROUP BY l.user_name
             ORDER BY score DESC, l.user_name ASC
             LIMIT {limit};
@@ -1423,6 +1439,7 @@ class DataGenerator:
                     {date_filter}
                     AND {cache_join_condition}
                     {country_condition}
+                    AND l.log_type != 'deleted'
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1438,6 +1455,7 @@ class DataGenerator:
                   {date_filter}
                   AND {cache_join_condition}
                   {country_condition}
+                  AND l.log_type != 'deleted'
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1457,6 +1475,7 @@ class DataGenerator:
                     {date_filter}
                     AND {cache_join_condition}
                     {country_condition}
+                    AND l.log_type != 'deleted'
                 ) AS sub
                 GROUP BY name, subtitle
                 ORDER BY score DESC, name ASC
@@ -1475,6 +1494,7 @@ class DataGenerator:
                   {date_filter}
                   AND {cache_join_condition}
                   {country_condition}
+                  AND l.log_type != 'deleted'
                 GROUP BY c.owner_username
                 ORDER BY score DESC, c.owner_username ASC
                 LIMIT {limit};
@@ -1676,6 +1696,7 @@ class DataGenerator:
               AND {NEWBIE_REGISTRATION_FILTER}
               AND {EXCLUDE_CACHE_JOIN}
               {country_condition}
+              AND l.log_type != 'deleted'
             GROUP BY l.user_name
             ORDER BY score DESC, l.user_name ASC
             LIMIT {limit};
@@ -1725,6 +1746,7 @@ class DataGenerator:
                 AND {registration_filter}
                 AND {EXCLUDE_CACHE_JOIN}
                 {country_condition}
+                AND l.log_type != 'deleted'
               GROUP BY l.user_name
               HAVING COUNT(DISTINCT l.gc_code) > 0
             ) ranked;
@@ -1901,6 +1923,7 @@ class DataGenerator:
             JOIN caches c ON c.code = l.gc_code
             WHERE l.user_name IS NOT NULL AND l.user_name <> ''
               AND l.log_type = 'Attended'
+              AND l.log_type != 'deleted'
               AND {EVENT_CACHE_JOIN}
               {country_condition}
               {date_condition}
@@ -2106,6 +2129,7 @@ class DataGenerator:
         FROM logs l
         JOIN caches c ON c.code = l.gc_code
         WHERE l.visited::date >= CURRENT_DATE - INTERVAL '30 day'
+          AND l.log_type != 'deleted'
           AND {EXCLUDE_CACHE_JOIN};
         """
         active_result = self.execute_query(active_query)
@@ -2118,6 +2142,7 @@ class DataGenerator:
         JOIN caches c ON c.code = l.gc_code
         WHERE l.visited::date >= CURRENT_DATE - INTERVAL '60 day'
           AND l.visited::date < CURRENT_DATE - INTERVAL '30 day'
+          AND l.log_type != 'deleted'
           AND {EXCLUDE_CACHE_JOIN};
         """
         prev_active_result = self.execute_query(prev_active_query)
@@ -2138,7 +2163,8 @@ class DataGenerator:
         SELECT COUNT(DISTINCT l.gc_code)::int AS total_found
         FROM logs l
         JOIN caches c ON c.code = l.gc_code
-        WHERE {EXCLUDE_CACHE_JOIN};
+        WHERE l.log_type != 'deleted'
+          AND {EXCLUDE_CACHE_JOIN};
         """
         found_result = self.execute_query(found_query)
         total_found = found_result[0]["total_found"] if found_result else 0
@@ -2247,6 +2273,7 @@ class DataGenerator:
           AND {cache_condition}
           {cache_type_condition}
           {country_condition}
+          AND l.log_type != 'deleted'
         GROUP BY c.code, c.name, c.owner_username, c.geocache_type
         ORDER BY score DESC, c.code ASC
         LIMIT {limit};
@@ -2302,6 +2329,7 @@ class DataGenerator:
             AND {cache_condition}
             {cache_type_condition}
             {country_condition}
+            AND l.log_type != 'deleted'
           GROUP BY c.code
           HAVING COUNT(l.*) > 0
         ) ranked;

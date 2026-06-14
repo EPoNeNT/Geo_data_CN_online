@@ -104,13 +104,14 @@ DATE_FORMATS = (
 
 
 def parse_optional_int(value: Optional[str]) -> Optional[int]:
-    """Parse an optional positive integer from env or CLI defaults."""
+    """Parse an optional positive integer from env or CLI defaults.
+    0 or negative means no limit (returns None)."""
     if value is None or not str(value).strip():
         return None
 
     parsed = int(value)
     if parsed <= 0:
-        raise ValueError("limit must be a positive integer")
+        return None
     return parsed
 
 
@@ -494,8 +495,11 @@ def get_users_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> tupl
         0::int AS log_count
       FROM caches c
       WHERE c.owner_guid IS NOT NULL
+        AND c.owner_guid <> 'no guid'
         AND c.owner_username IS NOT NULL
+        AND c.owner_username <> '[DELETED_USER]'
         AND TRIM(c.owner_username) <> ''
+        AND COALESCE(c.cache_status, 0) != 404
       GROUP BY c.owner_guid
     ),
     candidates AS (
@@ -584,8 +588,11 @@ def get_distinct_log_user_count(conn) -> int:
               SELECT c.owner_guid AS guid
               FROM caches c
               WHERE c.owner_guid IS NOT NULL
+                AND c.owner_guid <> 'no guid'
                 AND c.owner_username IS NOT NULL
+                AND c.owner_username <> '[DELETED_USER]'
                 AND TRIM(c.owner_username) <> ''
+                AND COALESCE(c.cache_status, 0) != 404
               GROUP BY c.owner_guid
             )
             SELECT COUNT(*)::int AS count
@@ -627,7 +634,7 @@ def upsert_results(conn, results: list[dict]) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fetch registration dates for logs users not ready in the user table.")
-    parser.add_argument("--limit", type=int, default=parse_optional_int(DEFAULT_LIMIT), help="Optional maximum number of users to process.")
+    parser.add_argument("--limit", type=lambda v: None if int(v) <= 0 else int(v), default=parse_optional_int(DEFAULT_LIMIT), help="Optional maximum number of users to process. 0 or negative = no limit.")
     parser.add_argument("--missing-only", action="store_true", help="Only fetch users absent from the user table.")
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, help="Per-user request retry count.")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="Per-request timeout in seconds.")

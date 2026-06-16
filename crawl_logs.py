@@ -721,6 +721,8 @@ def crawl_cache_group(
     consecutive_token_failures = 0
     MAX_CONSECUTIVE_TOKEN_FAILURES = 5
     MAX_PUBLIC_PAGE_RETRIES = 3
+    consecutive_public_page_failures = 0
+    MAX_CONSECUTIVE_PUBLIC_PAGE_FAILURES = 5
 
     logger.info(f"开始处理 {group_name} 组，共 {len(caches)} 个 cache")
 
@@ -754,9 +756,16 @@ def crawl_cache_group(
                         time.sleep(2)
                         continue
 
+                    consecutive_public_page_failures += 1
                     logger.error(
-                        f"  返回游客页，已重试 {MAX_PUBLIC_PAGE_RETRIES} 次，跳过: {code}"
+                        f"  返回游客页，已重试 {MAX_PUBLIC_PAGE_RETRIES} 次，跳过: {code} "
+                        f"(连续 {consecutive_public_page_failures}/{MAX_CONSECUTIVE_PUBLIC_PAGE_FAILURES})"
                     )
+                    if consecutive_public_page_failures >= MAX_CONSECUTIVE_PUBLIC_PAGE_FAILURES:
+                        raise AuthenticationError(
+                            f"Authentication failure detected: {consecutive_public_page_failures} consecutive "
+                            f"caches returned public logbook page in {group_name} group. Cookie may be expired."
+                        )
                     failed_caches.append(
                         {
                             "code": code,
@@ -787,6 +796,7 @@ def crawl_cache_group(
                     break
 
                 consecutive_token_failures = 0
+                consecutive_public_page_failures = 0
 
                 cache_logs, crawl_complete = fetch_logs_for_cache_result(
                     code,

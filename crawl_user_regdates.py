@@ -457,7 +457,7 @@ def ensure_user_table(conn) -> None:
     conn.commit()
 
 
-def get_users_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> tuple[list[dict], list[dict]]:
+def get_users_to_fetch(conn, include_non_ok: bool, limit: Optional[int], min_logs: int = MIN_LOG_COUNT_FOR_REGDATE_FETCH) -> tuple[list[dict], list[dict]]:
     """通过 GUID 聚合 caches 和 logs 中的用户。返回 (待抓取列表, 冲突列表)。
 
     待抓取: [{"guid": ..., "user_name": ..., "log_count": ...}, ...]
@@ -470,7 +470,7 @@ def get_users_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> tupl
         user_filter = "u.user_name IS NULL"
 
     limit_clause = "LIMIT %s" if limit is not None else ""
-    params = [MIN_LOG_COUNT_FOR_REGDATE_FETCH]
+    params = [min_logs]
     if limit is not None:
         params.append(limit)
 
@@ -570,7 +570,7 @@ def get_users_to_fetch(conn, include_non_ok: bool, limit: Optional[int]) -> tupl
     return to_fetch, conflicts
 
 
-def get_distinct_log_user_count(conn) -> int:
+def get_distinct_log_user_count(conn, min_logs: int = MIN_LOG_COUNT_FOR_REGDATE_FETCH) -> int:
     """通过 GUID 统计唯一候选用户数。"""
     with conn.cursor() as cur:
         cur.execute(
@@ -602,7 +602,7 @@ def get_distinct_log_user_count(conn) -> int:
               SELECT guid FROM owner_users
             ) sub;
             """,
-            (MIN_LOG_COUNT_FOR_REGDATE_FETCH,),
+            (min_logs,),
         )
         return cur.fetchone()["count"] or 0
 
@@ -640,6 +640,7 @@ def parse_args():
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="Per-request timeout in seconds.")
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY_SECONDS, help="Delay between users in seconds.")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Database write batch size.")
+    parser.add_argument("--min-logs", type=int, default=MIN_LOG_COUNT_FOR_REGDATE_FETCH, help=f"Minimum log count to include (default: {MIN_LOG_COUNT_FOR_REGDATE_FETCH}). 0 = all users.")
     parser.add_argument("--dry-run", action="store_true", help="Only count distinct logs users; do not create table, crawl, or write.")
     return parser.parse_args()
 
@@ -653,10 +654,10 @@ def main() -> None:
 
     try:
         if args.dry_run:
-            total_users = get_distinct_log_user_count(conn)
+            total_users = get_distinct_log_user_count(conn, min_logs=args.min_logs)
             logger.info(
                 "Candidate users from logs with more than %s logs or cache owners: %s",
-                MIN_LOG_COUNT_FOR_REGDATE_FETCH,
+                args.min_logs,
                 total_users,
             )
             return
@@ -666,6 +667,7 @@ def main() -> None:
             conn,
             include_non_ok=not args.missing_only,
             limit=args.limit,
+            min_logs=args.min_logs,
         )
         all_conflicts = conflicts
         logger.info("Users to fetch: %s (skipped %s with username conflicts)", len(to_fetch), len(conflicts))

@@ -61,6 +61,11 @@ AUTH_CHECK_USER = os.getenv("USER_REGDATE_AUTH_CHECK_USER", "asakosachben")
 DEBUG_NOT_FOUND_HTML = os.getenv("USER_REGDATE_DEBUG_NOT_FOUND_HTML", "").lower() in {"1", "true", "yes"}
 DEBUG_HTML_DIR = Path(os.getenv("USER_REGDATE_DEBUG_HTML_DIR", "test/regdate_debug_pages"))
 
+FIND_COUNT_RE = re.compile(
+    r'profile-stats.*?(\d[\d,]*)\s*finds?',
+    re.IGNORECASE | re.DOTALL,
+)
+
 JOINED_PATTERNS = (
     re.compile(
         r'<span\b[^>]*\bid=["\']ctl00_ProfileHead_ProfileHeader_lblMemberSinceDate["\'][^>]*>\s*Joined\s*(.*?)\s*</span>',
@@ -283,6 +288,14 @@ def parse_registration_date(html: str) -> Tuple[Optional[str], Optional[str]]:
     return None, raw_value
 
 
+def parse_find_count(html: str) -> int:
+    """从 profile 页面提取用户的 finds 数量。"""
+    m = FIND_COUNT_RE.search(html or "")
+    if m:
+        return int(m.group(1).replace(",", ""))
+    return 0
+
+
 def _stream_profile_html(session: requests.Session, url: str, timeout_seconds: int) -> Tuple[str, requests.Response]:
     """Stream the first STREAM_MAX_BYTES of a profile page and close the connection.
 
@@ -307,10 +320,14 @@ def fetch_registration_date(
     user_name: str,
     max_retries: int,
     timeout_seconds: int,
-) -> Tuple[Optional[str], Optional[str], str]:
-    """Fetch one user's registration date with per-user retries."""
+) -> Tuple[Optional[str], Optional[str], str, int]:
+    """Fetch one user's registration date with per-user retries.
+
+    Returns (parsed_date, raw_date, status, find_count).
+    """
     url = f"{PROFILE_URL}?u={quote(user_name)}"
     last_status = "request_failed"
+    find_count = 0
 
     for attempt in range(1, max_retries + 1):
         response = None
@@ -325,13 +342,14 @@ def fetch_registration_date(
 
             if looks_like_login_page(response.url, text):
                 logger.warning("%s returned a login page", user_name)
-                return None, None, "login_required"
+                return None, None, "login_required", 0
 
+            find_count = parse_find_count(text)
             parsed_date, raw_date = parse_registration_date(text)
             if parsed_date:
-                return parsed_date, raw_date, "ok"
+                return parsed_date, raw_date, "ok", find_count
             if raw_date:
-                return None, raw_date, "parse_failed"
+                return None, raw_date, "parse_failed", find_count
 
             summary = summarize_profile_response(text)
             logger.warning(
@@ -346,14 +364,14 @@ def fetch_registration_date(
             )
             maybe_save_debug_html(user_name, text)
             if summary["looks_like_profile"] or "lblMemberSinceDate" in summary["markers"]:
-                return None, None, "parse_failed"
-            return None, None, "not_found"
+                return None, None, "parse_failed", find_count
+            return None, None, "not_found", find_count
 
         except requests.RequestException as exc:
             last_status = "request_failed"
             logger.warning("%s request failed on attempt %s/%s: %s", user_name, attempt, max_retries, exc)
 
-    return None, None, last_status
+    return None, None, last_status, find_count
 
 
 def fetch_first_find_country(
@@ -391,7 +409,7 @@ def fetch_first_find_country(
             return None
         if "this content is private" in html_lower:
             logger.info("%s first-find: finds are private", user_name)
-            return None
+            return "private"
 
         # nearest.aspx renders cache info in <span class="small"> elements:
         #   by OwnerName | GCXXXXX | CountryName
@@ -410,9 +428,9 @@ def fetch_first_find_country(
                     )
                 return country or None
 
-        # No matching cache row found (user may have 0 finds or profile is private)
-        logger.info("%s first-find: no cache rows found", user_name)
-        return None
+        # find_count > 0 但拿不到 cache 行 → finds 设为私密
+        logger.info("%s first-find: no cache rows found (likely private)", user_name)
+        return "private"
 
     except requests.RequestException as exc:
         logger.warning("%s first-find request failed: %s", user_name, exc)
@@ -682,7 +700,7 @@ def main() -> None:
                 guid = row["guid"]
                 user_name = row["user_name"]
                 started_at = time.monotonic()
-                registration_date, raw_date, status = fetch_registration_date(
+                registration_date, raw_date, status, find_count = fetch_registration_date(
                     session,
                     user_name,
                     max_retries=max(1, args.max_retries),
@@ -691,9 +709,12 @@ def main() -> None:
 
                 reg_place: str | None = None
                 if status == "ok":
-                    reg_place = fetch_first_find_country(
-                        session, user_name, timeout_seconds=max(1, args.timeout)
-                    )
+                    if find_count == 0:
+                        reg_place = "no find record"
+                    else:
+                        reg_place = fetch_first_find_country(
+                            session, user_name, timeout_seconds=max(1, args.timeout)
+                        )
 
                 elapsed = time.monotonic() - started_at
 

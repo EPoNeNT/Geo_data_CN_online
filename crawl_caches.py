@@ -1248,7 +1248,21 @@ def run_crawler():
             # 将这一网格的变更数据批量写入数据库
             if updated_caches:
                 db.upsert_caches_batch(updated_caches)
-            
+
+            # 新 cache 的 owner_guid 在 map API 中不返回，需从详情页提取
+            new_without_guid = [c for c in updated_caches if c.get('code') in new_codes and not c.get('owner_guid')]
+            if new_without_guid:
+                for cache_record in new_without_guid:
+                    code = cache_record['code']
+                    guid = _extract_owner_guid_from_detail_page(code, cache_record.get('premium_only', False))
+                    if guid:
+                        cache_record['owner_guid'] = guid
+                        db.cursor.execute(
+                            "UPDATE caches SET owner_guid = %s WHERE code = %s AND owner_guid IS NULL",
+                            (guid, code))
+                db.conn.commit()
+                logger.info(f"  回填 {len([c for c in new_without_guid if c.get('owner_guid')])}/{len(new_without_guid)} 个新 cache 的 owner GUID")
+
             # 如果缓存数量超过800，需要切分网格
             if cache_count > 800:
                 logger.info(f"  网格 cache 数 {cache_count} > 800，需要切分为4个子网格")

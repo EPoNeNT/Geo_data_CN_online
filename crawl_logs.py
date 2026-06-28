@@ -207,7 +207,7 @@ class DatabaseManager:
         self.cursor.execute(
             """
             SELECT c.code, c.latitude, c.longitude, c.premium_only,
-                   c.geocache_type, c.logs_crawled_at, c.last_found_date
+                   c.geocache_type, c.logs_crawled_at, c.last_found_date, c.placed_date
             FROM caches c
             WHERE COALESCE(c.cache_status, 0) NOT IN (2, 404)
             ORDER BY c.code
@@ -216,19 +216,27 @@ class DatabaseManager:
 
         results = []
         for row in self.cursor.fetchall():
-            code, lat, lng, premium_only, geocache_type, logs_crawled_at, last_found_date = row
+            code, lat, lng, premium_only, geocache_type, logs_crawled_at, last_found_date, placed_date = row
 
-            # Convert to date for safe comparison (handle both datetime and date types)
             logs_crawled_date = (
                 logs_crawled_at.date() if hasattr(logs_crawled_at, 'date') else logs_crawled_at
             )
             last_found_cmp = (
                 last_found_date.date() if hasattr(last_found_date, 'date') else last_found_date
             )
+            placed_cmp = (
+                placed_date.date() if hasattr(placed_date, 'date') else placed_date
+            )
 
-            if logs_crawled_at is None or (
-                last_found_date is not None and last_found_cmp >= logs_crawled_date
-            ):
+            # 从未爬取过
+            if logs_crawled_at is None:
+                results.append((code, lat, lng, bool(premium_only), geocache_type))
+            # 有新的 find 日志（last_found >= 上次爬取时间）
+            elif last_found_date is not None and last_found_cmp >= logs_crawled_date:
+                results.append((code, lat, lng, bool(premium_only), geocache_type))
+            # last_found 早于 placed_date：用户可能 backdate 了日志，需重新爬取
+            elif (last_found_date is not None and placed_date is not None
+                  and last_found_cmp < placed_cmp):
                 results.append((code, lat, lng, bool(premium_only), geocache_type))
         return results
 

@@ -234,9 +234,10 @@ class DatabaseManager:
             # 有新的 find 日志（last_found >= 上次爬取时间）
             elif last_found_date is not None and last_found_cmp >= logs_crawled_date:
                 results.append((code, lat, lng, bool(premium_only), geocache_type))
-            # last_found <= placed_date：日志可能在发布当天或 backdate，需重新爬取
+            # last_found <= placed_date 且是真实日期（排除 0001-01-01 这种"无 find"默认值）
             elif (last_found_date is not None and placed_date is not None
-                  and last_found_cmp <= placed_cmp):
+                  and last_found_cmp <= placed_cmp
+                  and last_found_cmp.year > 1):
                 results.append((code, lat, lng, bool(premium_only), geocache_type))
         return results
 

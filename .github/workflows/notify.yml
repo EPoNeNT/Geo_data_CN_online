@@ -1,0 +1,27 @@
+name: Notify Series Requests
+
+on:
+  schedule:
+    - cron: "0 * * * *"  # 每小时整点
+  workflow_dispatch:      # 也可手动触发
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary python-dotenv requests
+
+      - name: Notify
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NOTIFY_SENDER: ${{ secrets.NOTIFY_SENDER }}
+          NOTIFY_PASSWORD: ${{ secrets.NOTIFY_PASSWORD }}
+          NOTIFY_RECEIVER: ${{ secrets.NOTIFY_RECEIVER }}
+        run: python notify_series_requests.py

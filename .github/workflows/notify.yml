@@ -2,7 +2,7 @@ name: Notify Series Requests
 
 on:
   schedule:
-    - cron: "0 * * * *"  # 每小时整点
+    - cron: "0 */4 * * *"  # 每4小时整点
   workflow_dispatch:      # 也可手动触发
 
 jobs:

@@ -65,7 +65,18 @@ def build_email_body(requests: list[dict]) -> str:
 
 
 def main():
-    conn = connect_postgres(DATABASE_URL, connect_timeout=10)
+    import time
+    last_error = None
+    for attempt in range(3):
+        try:
+            conn = connect_postgres(DATABASE_URL, connect_timeout=10)
+            break
+        except Exception as e:
+            last_error = e
+            print(f"连接失败 (尝试 {attempt+1}/3): {e}")
+            time.sleep(5)
+    else:
+        raise last_error
     try:
         requests = get_unnotified_requests(conn)
         if not requests:

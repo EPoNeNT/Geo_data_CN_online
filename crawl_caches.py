@@ -10,6 +10,7 @@ import time
 import random
 import re
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Set, Optional
 
 import requests
@@ -656,8 +657,15 @@ def normalize_cache_field(field: str, value):
 
     if field in {'latitude', 'longitude', 'difficulty', 'terrain'}:
         try:
+            # 与数据库 numeric 列一致的舍入（ROUND_HALF_UP）。
+            # Python round() 是银行家舍入，对 .5 边界向下取偶，会与数据库
+            # 的四舍五入不一致，导致坐标值永不收敛、每次运行都被判定有更新。
             precision = 6 if field in {'latitude', 'longitude'} else 1
-            return round(float(value), precision)
+            return float(
+                Decimal(str(value)).quantize(
+                    Decimal('1e-%d' % precision), rounding=ROUND_HALF_UP
+                )
+            )
         except (TypeError, ValueError):
             return str(value).strip()
 

@@ -10,7 +10,7 @@ import time
 import random
 import re
 from datetime import datetime, timezone
-from typing import List, Dict, Set, Optional, Tuple
+from typing import List, Dict, Set, Optional
 
 import requests
 import psycopg2
@@ -53,8 +53,18 @@ MAP_PAGE_URL = (
 ALLOWED_COUNTRIES = ["China", "Hong Kong", "Taiwan", "Macao"]
 MAX_RETRIES = 3
 CACHE_DELETED_STATUS = 404
+PAGE_SIZE = 1000  # map API 单页返回上限
+PAGE_COUNT_LIMIT = 10  # 单网格 skip 分页上限（10 页 = 10000 个，API 硬限制）
+PAGE_SLEEP = 6  # 网格之间、skip 分页之间的节流间隔（秒）
 CACHE_COUNT_RETRY_MAX = 3  # 网格 0 结果重试次数
 CACHE_COUNT_RETRY_DELAY = 10  # 网格 0 结果重试间隔（秒）
+# 固定爬取网格（大网格 + skip 分页，覆盖中国区全部 cache，实测 total 均 < 10000）
+CRAWL_GRIDS = [
+    ("G1 36-55N, 72-137E", (55.0, 72.0, 36.0, 137.0)),
+    ("G2 17-36N, 72-120.75E", (36.0, 72.0, 17.0, 120.75)),
+    ("G3 17-31.25N, 120.75-137E", (31.25, 120.75, 17.0, 137.0)),
+    ("G4 31.25-36N, 120.75-134.96875E", (36.0, 120.75, 31.25, 134.96875)),
+]
 _DETECTED_MAP_VERSION = None
 
 # 设置重试策略
@@ -398,107 +408,7 @@ class DatabaseManager:
         self.conn.commit()
 
 
-def get_pending_grids_from_db(db: DatabaseManager) -> List[Tuple[int, List[float], Optional[int]]]:
-    """从数据库获取待处理的网格配置 (返回 id、bounds、cache_count 列表)"""
-    logger.info("执行 SQL 查询: SELECT id, grid_bounds FROM crawl_progress WHERE status = 'pending'")
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # grid_bounds 现在只存储 bounds 数组，不是整个 grid 对象
-            db.cursor.execute("SELECT id, grid_bounds, cache_count FROM crawl_progress WHERE status = 'pending' ORDER BY id")
-            rows = db.cursor.fetchall()
-            logger.info(f"SQL 查询完成，返回 {len(rows)} 行数据")
-            return [(row[0], row[1], row[2]) for row in rows]
-        except psycopg2.OperationalError as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"数据库连接断开，尝试重新连接 ({attempt + 1}/{max_retries})...")
-                db.reconnect()
-            else:
-                logger.error(f"从数据库获取待处理网格失败: {e}")
-                return []
-        except Exception as e:
-            logger.error(f"从数据库获取待处理网格失败: {e}")
-            return []
-    return []
-
-
-def mark_grid_completed(db: DatabaseManager, grid_id: int, cache_count: int):
-    """标记网格为已完成，并更新 cache_count"""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            db.cursor.execute("""
-                UPDATE crawl_progress 
-                SET status = 'completed', cache_count = %s
-                WHERE id = %s
-            """, (cache_count, grid_id))
-            return
-        except psycopg2.OperationalError as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"数据库连接断开，尝试重新连接 ({attempt + 1}/{max_retries})...")
-                db.reconnect()
-            else:
-                raise
-
-
-def add_new_grids_to_db(db: DatabaseManager, grids: List[dict]):
-    """将新的网格添加到数据库（用于第二轮爬取）
-    grids 是 [{"bounds": [...], "count": None}, ...] 格式
-    """
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            for grid in grids:
-                bounds = grid["bounds"]
-                count = grid.get("count")
-                db.cursor.execute("""
-                    INSERT INTO crawl_progress (grid_bounds, cache_count, status)
-                    VALUES (%s, %s, 'pending')
-                """, (json.dumps(bounds), count))
-            logger.info(f"添加了 {len(grids)} 个新网格到数据库")
-            return
-        except psycopg2.OperationalError as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"数据库连接断开，尝试重新连接 ({attempt + 1}/{max_retries})...")
-                db.reconnect()
-            else:
-                raise
-
-
-def reset_all_grids_to_pending(db: DatabaseManager) -> int:
-    """将所有已完成的网格重置为 pending 状态，返回重置的数量"""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            db.cursor.execute("UPDATE crawl_progress SET status = 'pending'")
-            count = db.cursor.rowcount
-            db.commit()
-            logger.info(f"已将 {count} 个网格重置为待处理状态")
-            return count
-        except psycopg2.OperationalError as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"数据库连接断开，尝试重新连接 ({attempt + 1}/{max_retries})...")
-                db.reconnect()
-            else:
-                raise
-    return 0
-
-
-def split_grid(grid_bounds: List[float]) -> List[dict]:
-    """将网格切分为四个子网格"""
-    max_lat, min_lng, min_lat, max_lng = grid_bounds
-    mid_lat = (max_lat + min_lat) / 2
-    mid_lng = (max_lng + min_lng) / 2
-    
-    return [
-        {"bounds": [max_lat, min_lng, mid_lat, mid_lng], "count": None},
-        {"bounds": [mid_lat, min_lng, min_lat, mid_lng], "count": None},
-        {"bounds": [max_lat, mid_lng, mid_lat, max_lng], "count": None},
-        {"bounds": [mid_lat, mid_lng, min_lat, max_lng], "count": None},
-    ]
-
-
-def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float) -> Optional[dict]:
+def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float, skip: int = 0) -> Optional[dict]:
     """安全地获取 API 数据"""
     box_str = f"{max_lat},{min_lng},{min_lat},{max_lng}"
 
@@ -516,7 +426,7 @@ def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float) -
     for attempt in range(MAX_RETRIES):
         try:
             base_url = f"https://www.geocaching.com/_next/data/release-{version}/en/play/map.json"
-            full_url = f"{base_url}?box={box_str}"
+            full_url = f"{base_url}?box={box_str}&skip={skip}"
             response = session.get(full_url, headers=headers, timeout=25)
             
             if response.status_code == 200:
@@ -972,236 +882,188 @@ def run_crawler():
         }
         logger.info(f"记录原始数据中的 code 数量: {len(original_codes)}")
         
-        # 从数据库获取待处理的网格
-        logger.info("开始从数据库加载待处理网格...")
-        pending_grids = get_pending_grids_from_db(db)
-        logger.info(f"从数据库加载了 {len(pending_grids)} 个待处理网格")
-        
-        if not pending_grids:
-            logger.info("没有待处理的网格，自动重置所有网格为待处理状态...")
-            reset_count = reset_all_grids_to_pending(db)
-            if reset_count > 0:
-                pending_grids = get_pending_grids_from_db(db)
-                logger.info(f"重新加载了 {len(pending_grids)} 个待处理网格")
-            else:
-                logger.info("数据库中没有网格数据，请先运行 init_db.py")
-                return False
-        
         current_crawl_codes = set()
         new_codes = set()
         updated_codes = set()
         crawled_bounds: list[tuple[float, float, float, float]] = []
-        commit_counter = 0  # 提交计数器
-        COMMIT_INTERVAL = 10  # 每10个网格提交一次
-        
-        # 处理待处理网格（支持动态添加子网格）
-        processed_grids = set()
-        grids_to_process = pending_grids.copy()
         loop_start = time.perf_counter()
         loop_stats = {
             'fetch': 0.0, 'process': 0.0, 'upsert': 0.0, 'guid': 0.0,
             'fetch_count': 0, 'process_count': 0, 'upsert_count': 0, 'guid_count': 0,
         }
-        retry_failed_grids: list[int] = []
 
-        while grids_to_process:
-            # 取出第一个网格进行处理
-            grid_id, bounds, grid_expected_count = grids_to_process.pop(0)
-
-            # 检查是否已处理过
-            if grid_id in processed_grids:
-                continue
-            processed_grids.add(grid_id)
-            grid_start = time.perf_counter()
-            
-            # bounds 现在是直接的数组 [max_lat, min_lng, min_lat, max_lng]
+        # 固定 4 个网格 + skip 分页全量爬取（不依赖数据库进度表，每次全量）
+        grid_index = 0
+        for grid_name, bounds in CRAWL_GRIDS:
+            grid_index += 1
             max_lat, min_lng, min_lat, max_lng = bounds
-            
+            grid_start = time.perf_counter()
             logger.info(
-                f"[已处理 {len(processed_grids)} 个 | 队列剩余 {len(grids_to_process)} 个] 扫描网格: "
+                f"[{grid_index}/{len(CRAWL_GRIDS)}] 扫描网格 {grid_name}: "
                 f"Lat {min_lat:.4f}~{max_lat:.4f}, Lng {min_lng:.4f}~{max_lng:.4f}"
             )
-            
-            fetch_start = time.perf_counter()
-            data = safe_fetch(max_lat, max_lng, min_lat, min_lng)
-            fetch_elapsed = time.perf_counter() - fetch_start
-            loop_stats['fetch'] += fetch_elapsed
-            loop_stats['fetch_count'] += 1
-            if not data:
-                logger.warning("无响应，跳过此网格（fetch 耗时 %.2fs）", fetch_elapsed)
-                # 标记为已完成（无数据）
-                mark_grid_completed(db, grid_id, 0)
-                continue
-            
-            results = data.get('pageProps', {}).get('searchResults', {}).get('results', [])
-            cache_count = len(results)
 
-            # 爬取到 0 个 cache 但数据库预期非 0 → 说明出现错误，等待后重试
-            retry_count = 0
-            while (
-                cache_count == 0
-                and grid_expected_count not in (None, 0)
-                and retry_count < CACHE_COUNT_RETRY_MAX
-            ):
-                retry_count += 1
-                logger.warning(
-                    f"  网格 {grid_id} 预期 {grid_expected_count} 个 cache 但爬取到 0 个，"
-                    f"{CACHE_COUNT_RETRY_DELAY}s 后重试 ({retry_count}/{CACHE_COUNT_RETRY_MAX})"
-                )
-                time.sleep(CACHE_COUNT_RETRY_DELAY)
-                data = safe_fetch(max_lat, max_lng, min_lat, min_lng)
-                if not data:
-                    continue
-                results = data.get('pageProps', {}).get('searchResults', {}).get('results', [])
-                cache_count = len(results)
-
-            if cache_count == 0 and grid_expected_count not in (None, 0):
-                # 重试后仍为 0：记录网格，保持 pending，脚本最后统一输出
-                retry_failed_grids.append(grid_id)
-                logger.error(
-                    f"  网格 {grid_id} 重试 {CACHE_COUNT_RETRY_MAX} 次后仍爬取到 0 个 cache，"
-                    f"保持 pending 状态，将在脚本结束前列出"
-                )
-                continue
-
-            crawled_bounds.append((max_lat, min_lng, min_lat, max_lng))
-            logger.info(f"  获取到 {cache_count} 个结果")
-            
+            skip = 0
+            grid_total = None  # API 声明的网格总 cache 数
+            grid_crawled = 0  # 本网格已爬取累计
             new_in_grid = 0
             updated_in_grid = 0
-            
-            updated_caches = []
-            process_start = time.perf_counter()
-            for item in results:
-                cache_data = process_cache_item(item, min_lat, max_lat, min_lng, max_lng)
-                if not cache_data:
-                    continue
 
-                code = cache_data['code']
-                current_crawl_codes.add(code)
+            while True:
+                fetch_start = time.perf_counter()
+                data = safe_fetch(max_lat, max_lng, min_lat, min_lng, skip)
+                fetch_elapsed = time.perf_counter() - fetch_start
+                loop_stats['fetch'] += fetch_elapsed
+                loop_stats['fetch_count'] += 1
 
-                # 检查是否为新数据或已更改
-                is_new = code not in scanned_data
-                is_different = False
+                if data:
+                    sr = data.get('pageProps', {}).get('searchResults', {})
+                    results = sr.get('results', [])
+                    if sr.get('total') is not None:
+                        grid_total = sr.get('total')
+                else:
+                    results = []
 
-                if not is_new:
-                    is_different = cache_metadata_changed(scanned_data[code], cache_data)
+                # 网格总 cache 数达到 API 上限（10000）→ 无法取全，让 action 失败以便邮件通知
+                if grid_total is not None and grid_total >= PAGE_SIZE * PAGE_COUNT_LIMIT:
+                    raise RuntimeError(
+                        f"网格 {grid_name} 的 cache 总数达到 {grid_total}（≥ {PAGE_SIZE * PAGE_COUNT_LIMIT}），"
+                        f"已超过 API 单查询 10000 上限，无法完整爬取，请拆分网格后重试"
+                    )
 
-                if is_new or is_different:
-                    cache_record = dict(cache_data)
-                    if not is_new and cache_record.get('premium_only', False):
-                        cache_record['latitude'] = scanned_data[code].get('latitude')
-                        cache_record['longitude'] = scanned_data[code].get('longitude')
+                # 0 结果重试（可能是网络原因）：sleep 10 后重试，最多 3 次
+                retry_count = 0
+                while not results and retry_count < CACHE_COUNT_RETRY_MAX:
+                    retry_count += 1
+                    logger.warning(
+                        f"  网格 {grid_name} skip={skip} 返回 0 个结果，"
+                        f"{CACHE_COUNT_RETRY_DELAY}s 后重试 ({retry_count}/{CACHE_COUNT_RETRY_MAX})"
+                    )
+                    time.sleep(CACHE_COUNT_RETRY_DELAY)
+                    retry_start = time.perf_counter()
+                    data = safe_fetch(max_lat, max_lng, min_lat, min_lng, skip)
+                    loop_stats['fetch'] += time.perf_counter() - retry_start
+                    loop_stats['fetch_count'] += 1
+                    if not data:
+                        results = []
+                        continue
+                    sr = data.get('pageProps', {}).get('searchResults', {})
+                    results = sr.get('results', [])
 
-                    # owner_username 变化 → 缓存可能被转移，从详情页获取新 owner GUID
-                    if not is_new and cache_record.get('owner_username') != scanned_data[code].get('owner_username'):
-                        new_guid = _extract_owner_guid_from_detail_page(code, cache_record.get('premium_only', False))
-                        if new_guid:
-                            cache_record['owner_guid'] = new_guid
+                if not results:
+                    # 重试 3 次后仍为 0：数据不完整，失败退出以便邮件通知
+                    raise RuntimeError(
+                        f"网格 {grid_name} skip={skip} 重试 {CACHE_COUNT_RETRY_MAX} 次后仍返回 0 个结果，"
+                        f"疑似网络异常，请检查后重试"
+                    )
 
-                    updated_caches.append(cache_record)
-                    if is_new:
-                        new_in_grid += 1
-                        new_codes.add(code)
-                    else:
-                        updated_in_grid += 1
-                        updated_codes.add(code)
-                    scanned_data[code] = cache_record
+                cache_count = len(results)
+                grid_crawled += cache_count
+                if skip == 0:
+                    crawled_bounds.append((max_lat, min_lng, min_lat, max_lng))
+                logger.info(
+                    f"  [skip={skip}] 获取到 {cache_count} 个结果"
+                    f"（累计 {grid_crawled}，网格 total {grid_total}）"
+                )
 
-            process_elapsed = time.perf_counter() - process_start
-            loop_stats['process'] += process_elapsed
-            loop_stats['process_count'] += 1
+                updated_caches = []
+                process_start = time.perf_counter()
+                for item in results:
+                    cache_data = process_cache_item(item, min_lat, max_lat, min_lng, max_lng)
+                    if not cache_data:
+                        continue
 
-            # 将这一网格的变更数据批量写入数据库
-            upsert_start = time.perf_counter()
-            if updated_caches:
-                db.upsert_caches_batch(updated_caches)
-            upsert_elapsed = time.perf_counter() - upsert_start
-            loop_stats['upsert'] += upsert_elapsed
-            loop_stats['upsert_count'] += 1
+                    code = cache_data['code']
+                    current_crawl_codes.add(code)
 
-            # 新 cache 的 owner_guid 在 map API 中不返回，需从详情页提取
-            guid_start = time.perf_counter()
-            new_without_guid = [c for c in updated_caches if c.get('code') in new_codes and not c.get('owner_guid')]
-            if new_without_guid:
-                for cache_record in new_without_guid:
-                    code = cache_record['code']
-                    guid = _extract_owner_guid_from_detail_page(code, cache_record.get('premium_only', False))
-                    if guid:
-                        cache_record['owner_guid'] = guid
-                        db.cursor.execute(
-                            "UPDATE caches SET owner_guid = %s WHERE code = %s AND owner_guid IS NULL",
-                            (guid, code))
-                db.conn.commit()
-                logger.info(f"  回填 {len([c for c in new_without_guid if c.get('owner_guid')])}/{len(new_without_guid)} 个新 cache 的 owner GUID")
-            guid_elapsed = time.perf_counter() - guid_start
-            loop_stats['guid'] += guid_elapsed
-            loop_stats['guid_count'] += 1
+                    # 检查是否为新数据或已更改
+                    is_new = code not in scanned_data
+                    is_different = False
 
-            # 如果缓存数量超过800，需要切分网格
-            if cache_count > 800:
-                logger.info(f"  网格 cache 数 {cache_count} > 800，需要切分为4个子网格")
-                sub_grids = split_grid(bounds)
-                
-                # 删除原网格（从数据库中真正删除）
-                db.cursor.execute("DELETE FROM crawl_progress WHERE id = %s", (grid_id,))
-                logger.info(f"  已删除原网格 ID: {grid_id}")
-                
-                # 添加子网格到数据库并立即处理
-                for sub_grid in sub_grids:
-                    # 添加子网格到数据库
-                    db.cursor.execute("""
-                        INSERT INTO crawl_progress (grid_bounds, cache_count, status)
-                        VALUES (%s, %s, 'pending')
-                    """, (json.dumps(sub_grid["bounds"]), sub_grid.get("count")))
-                    
-                    # 获取新插入的子网格 ID
-                    db.cursor.execute("SELECT lastval()")
-                    sub_grid_id = db.cursor.fetchone()[0]
-                    
-                    # 将子网格添加到当前处理队列
-                    grids_to_process.append((sub_grid_id, sub_grid["bounds"], None))
-                
-                logger.info(f"  已添加 {len(sub_grids)} 个子网格到当前爬取队列")
-            else:
-                # 标记原网格为已完成
-                mark_grid_completed(db, grid_id, cache_count)
-            
-            commit_counter += 1
-            
-            # 每处理 COMMIT_INTERVAL 个网格提交一次
-            if commit_counter >= COMMIT_INTERVAL:
-                db.commit()
-                logger.info(f"已提交 {commit_counter} 个网格的事务")
-                commit_counter = 0
-            
-            logger.info(f"  新增: {new_in_grid}, 更新: {updated_in_grid}")
+                    if not is_new:
+                        is_different = cache_metadata_changed(scanned_data[code], cache_data)
 
-            # 随机延迟（固定 6s；间隔过短会导致大量网格无响应）
-            time.sleep(6)
+                    if is_new or is_different:
+                        cache_record = dict(cache_data)
+                        if not is_new and cache_record.get('premium_only', False):
+                            cache_record['latitude'] = scanned_data[code].get('latitude')
+                            cache_record['longitude'] = scanned_data[code].get('longitude')
 
-            grid_elapsed = time.perf_counter() - grid_start
-            logger.info(
-                f"  [耗时] fetch={fetch_elapsed:.2f}s process={process_elapsed:.2f}s "
-                f"upsert={upsert_elapsed:.2f}s guid={guid_elapsed:.2f}s 总计={grid_elapsed:.2f}s"
-            )
-        
-        # 处理剩余的提交
-        if commit_counter > 0:
+                        # owner_username 变化 → 缓存可能被转移，从详情页获取新 owner GUID
+                        if not is_new and cache_record.get('owner_username') != scanned_data[code].get('owner_username'):
+                            new_guid = _extract_owner_guid_from_detail_page(code, cache_record.get('premium_only', False))
+                            if new_guid:
+                                cache_record['owner_guid'] = new_guid
+
+                        updated_caches.append(cache_record)
+                        if is_new:
+                            new_in_grid += 1
+                            new_codes.add(code)
+                        else:
+                            updated_in_grid += 1
+                            updated_codes.add(code)
+                        scanned_data[code] = cache_record
+
+                process_elapsed = time.perf_counter() - process_start
+                loop_stats['process'] += process_elapsed
+                loop_stats['process_count'] += 1
+
+                # 将这一网格的变更数据批量写入数据库
+                upsert_start = time.perf_counter()
+                if updated_caches:
+                    db.upsert_caches_batch(updated_caches)
+                upsert_elapsed = time.perf_counter() - upsert_start
+                loop_stats['upsert'] += upsert_elapsed
+                loop_stats['upsert_count'] += 1
+
+                # 新 cache 的 owner_guid 在 map API 中不返回，需从详情页提取
+                guid_start = time.perf_counter()
+                new_without_guid = [c for c in updated_caches if c.get('code') in new_codes and not c.get('owner_guid')]
+                if new_without_guid:
+                    for cache_record in new_without_guid:
+                        code = cache_record['code']
+                        guid = _extract_owner_guid_from_detail_page(code, cache_record.get('premium_only', False))
+                        if guid:
+                            cache_record['owner_guid'] = guid
+                            db.cursor.execute(
+                                "UPDATE caches SET owner_guid = %s WHERE code = %s AND owner_guid IS NULL",
+                                (guid, code))
+                    db.conn.commit()
+                    logger.info(f"  回填 {len([c for c in new_without_guid if c.get('owner_guid')])}/{len(new_without_guid)} 个新 cache 的 owner GUID")
+                guid_elapsed = time.perf_counter() - guid_start
+                loop_stats['guid'] += guid_elapsed
+                loop_stats['guid_count'] += 1
+
+                if len(results) < PAGE_SIZE:
+                    break
+                skip += PAGE_SIZE
+                # skip 已达上限仍未爬完 → 与 API 10000 上限冲突，失败退出以便通知
+                if skip >= PAGE_SIZE * (PAGE_COUNT_LIMIT - 1):
+                    raise RuntimeError(
+                        f"网格 {grid_name} skip 已达 {skip} 但仍未爬完，超过 API 上限，请拆分网格后重试"
+                    )
+                time.sleep(PAGE_SLEEP)  # skip 分页间节流
+
+            # 完整性检查：爬取总数与 API total 不一致时告警（total 动态波动，不硬失败）
+            if (
+                grid_total is not None
+                and grid_total < PAGE_SIZE * PAGE_COUNT_LIMIT
+                and grid_crawled != grid_total
+            ):
+                logger.warning(
+                    f"  网格 {grid_name} 爬取 {grid_crawled} 与 API total {grid_total} 不一致"
+                )
+
             db.commit()
-            logger.info(f"已提交 {commit_counter} 个网格的事务")
-
-        if retry_failed_grids:
-            logger.error(
-                f"以下 {len(retry_failed_grids)} 个网格爬取到 0 个 cache 但数据库预期非 0"
-                f"（重试 {CACHE_COUNT_RETRY_MAX} 次仍失败，已保持 pending，下次运行将重试）: "
-                f"{', '.join(map(str, retry_failed_grids))}"
-            )
+            grid_elapsed = time.perf_counter() - grid_start
+            logger.info(f"  网格 {grid_name} 完成: 爬取 {grid_crawled} 个（total {grid_total}），耗时 {grid_elapsed:.1f}s")
+            logger.info(f"  新增: {new_in_grid}, 更新: {updated_in_grid}")
+            time.sleep(PAGE_SLEEP)  # 网格间节流
 
         loop_elapsed = time.perf_counter() - loop_start
-        grid_count = max(len(processed_grids), 1)
+        grid_count = max(len(CRAWL_GRIDS), 1)
         logger.info(
-            f"[耗时] 主循环网格爬取共 {loop_elapsed:.1f}s（{len(processed_grids)} 个网格，"
+            f"[耗时] 主循环网格爬取共 {loop_elapsed:.1f}s（{len(CRAWL_GRIDS)} 个网格，"
             f"平均 {loop_elapsed / grid_count:.2f}s/网格）"
         )
         logger.info(
@@ -1322,7 +1184,7 @@ def run_crawler():
         logger.info(f"本轮爬取完成! 新增: {len(new_codes)}, 更新: {len(updated_codes)}")
         logger.info(
             f"[耗时汇总] 加载数据={load_elapsed:.1f}s | 网格爬取={loop_elapsed:.1f}s "
-            f"({len(processed_grids)}网格, 平均{loop_elapsed / grid_count:.2f}s/网格) | "
+            f"({len(CRAWL_GRIDS)}网格, 平均{loop_elapsed / grid_count:.2f}s/网格) | "
             f"归档检查={archive_elapsed:.1f}s | 坐标回填={backfill_elapsed:.1f}s | "
             f"全程总计={total_elapsed:.1f}s"
         )

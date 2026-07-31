@@ -58,6 +58,7 @@ PAGE_COUNT_LIMIT = 10  # 单网格 skip 分页上限（10 页 = 10000 个，API 
 PAGE_SLEEP = 4  # 网格之间、skip 分页之间的节流间隔（秒）
 CACHE_COUNT_RETRY_MAX = 3  # 网格 0 结果重试次数
 CACHE_COUNT_RETRY_DELAY = 10  # 网格 0 结果重试间隔（秒）
+ARCHIVED_CHECK_LIMIT = 100  # 潜在归档检查数量上限，超过则跳过（防大量误判）
 # 固定爬取网格（大网格 + skip 分页，覆盖中国区全部 cache，实测 total 均 < 10000）
 CRAWL_GRIDS = [
     ("G1 36-55N, 72-137E", (55.0, 72.0, 36.0, 137.0)),
@@ -1110,7 +1111,14 @@ def run_crawler():
 
         archive_start = time.perf_counter()
         archive_elapsed = 0.0
-        if archived_codes:
+        if len(archived_codes) > ARCHIVED_CHECK_LIMIT:
+            # 兜底：数量异常大说明本次爬取可能有问题（如大量网格未成功），
+            # 跳过归档检查，避免浪费大量请求和误判
+            logger.warning(
+                f"Potential Archived 数量 {len(archived_codes)} 超过上限 "
+                f"{ARCHIVED_CHECK_LIMIT}，跳过归档检查（疑似本次爬取异常）"
+            )
+        elif archived_codes:
             logger.info("逐个检查潜在归档缓存的最新状态...")
 
             status_only_updates = []

@@ -10,7 +10,7 @@ import time
 import random
 import re
 from datetime import datetime, timezone
-from typing import Any, List, Dict, Set, Optional, Tuple
+from typing import List, Dict, Set, Optional, Tuple
 
 import requests
 import psycopg2
@@ -53,7 +53,6 @@ MAP_PAGE_URL = (
 ALLOWED_COUNTRIES = ["China", "Hong Kong", "Taiwan", "Macao"]
 MAX_RETRIES = 3
 CACHE_DELETED_STATUS = 404
-DELETED_PREVIEW_MARKER = "__deleted_cache"
 _DETECTED_MAP_VERSION = None
 
 # 设置重试策略
@@ -557,87 +556,6 @@ def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float) -
     return None
 
 
-def is_deleted_cache_preview(data: Optional[dict]) -> bool:
-    return bool(data and data.get(DELETED_PREVIEW_MARKER))
-
-
-def fetch_cache_preview(gc_code: str) -> Optional[dict]:
-    """按 GC code 获取单个 cache 的预览数据。"""
-    api_url = f"https://www.geocaching.com/api/live/v1/search/geocachepreview/{gc_code}"
-
-    cookie_candidates = []
-    seen_cookies = set()
-    for label, cookie in (("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)):
-        if not cookie or cookie in seen_cookies:
-            continue
-        cookie_candidates.append((label, cookie))
-        seen_cookies.add(cookie)
-
-    all_candidates_returned_404 = bool(cookie_candidates)
-
-    for label, cookie in cookie_candidates:
-        headers = {
-            "accept": "*/*",
-            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "cache-control": "no-cache",
-            "cookie": cookie,
-            "pragma": "no-cache",
-            "referer": "https://www.geocaching.com/play/map",
-            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-            "x-nextjs-data": "1",
-        }
-
-        cookie_404_count = 0
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = session.get(api_url, headers=headers, timeout=15)
-                if response.status_code == 200:
-                    return response.json()
-                if response.status_code in {401, 403}:
-                    all_candidates_returned_404 = False
-                    logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 返回 HTTP {response.status_code}")
-                    break
-                if response.status_code == CACHE_DELETED_STATUS:
-                    cookie_404_count += 1
-                    logger.warning(
-                        f"  {gc_code} 预览接口使用 {label} cookie 返回 HTTP 404 "
-                        f"({cookie_404_count}/{MAX_RETRIES})"
-                    )
-                    time.sleep(5 * (attempt + 1))
-                    continue
-                if response.status_code == 429:
-                    all_candidates_returned_404 = False
-                    time.sleep(60)
-                    continue
-                all_candidates_returned_404 = False
-                logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 返回 HTTP {response.status_code}")
-                time.sleep(5 * (attempt + 1))
-            except Exception as exc:
-                all_candidates_returned_404 = False
-                logger.warning(f"  {gc_code} 预览接口使用 {label} cookie 请求失败: {exc}")
-                time.sleep(10 * (attempt + 1))
-
-        if cookie_404_count != MAX_RETRIES:
-            all_candidates_returned_404 = False
-
-    if len(cookie_candidates) >= 2 and all_candidates_returned_404:
-        logger.warning(f"  {gc_code} 两个 cookie 均连续 {MAX_RETRIES} 次返回 404")
-        page_data = _fetch_archived_cache_page_data(gc_code)
-        if page_data is not None:
-            fields = [k for k in page_data if k != "code"]
-            logger.info(f"  {gc_code} 预览接口返回 404 但网页可访问，从详情页提取 {len(fields)} 个字段")
-            return page_data
-        logger.warning(f"  {gc_code} 网页也不可访问，本次爬取跳过")
-
-    return None
-
-
 def _page_marks_cache_archived(text: str) -> bool:
     """检测详情页 HTML 是否明确标记 cache 为已归档。
 
@@ -655,164 +573,40 @@ def _page_marks_cache_archived(text: str) -> bool:
     )
 
 
-def _fetch_archived_cache_page_data(gc_code: str) -> Optional[dict]:
-    """从 cache 详情页提取 preview API 返回 404 的 cache 元数据。
+def check_cache_status_via_detail_page(gc_code: str) -> Optional[int]:
+    """直接请求 cache 详情页判断状态（preview API 已失效，详情页为唯一可靠来源）。
 
-    返回 API 格式的 dict（code, name, owner->username 等）；
-    cacheStatus 仅在页面明确标记已归档时设置，否则不设置，
-    以免把仍有效的 cache 误标为 Archive。
+    返回: 2=已归档, 404=已删除, 0=有效/其它；全部请求失败返回 None。
+    判断依据（实测验证）：
+      - HTTP 200 + 归档横幅元素 ctl00_ContentBody_archivedMessage → 已归档
+      - HTTP 200 + 无横幅 → 有效
+      - HTTP 404 → 已删除
     """
-    detail_url = f"https://www.geocaching.com/geocache/{gc_code}"
-
-    type_names = {
-        "traditional": 2, "traditional cache": 2,
-        "multi": 3, "multi-cache": 3, "multicache": 3,
-        "mystery": 8, "puzzle": 8, "unknown": 8,
-        "earthcache": 13, "earth": 13,
-        "letterbox": 5, "letterbox hybrid": 5,
-        "wherigo": 19,
-        "virtual": 4,
-        "webcam": 11,
-        "event": 6, "cito": 7, "mega": 453, "giga": 4732,
-    }
-    container_names = {
-        "micro": 2, "small": 3, "regular": 4, "large": 5,
-        "other": 8, "not chosen": 8, "virtual": 6,
-    }
-
-    for label, cookie in (("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)):
-        if not cookie:
-            continue
-        headers = {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "cookie": cookie,
-            "referer": "https://www.geocaching.com/play/map",
-            "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        }
-        try:
-            resp = session.get(detail_url, headers=headers, timeout=15, allow_redirects=True)
-            if resp.status_code == 404:
-                return None
-            if resp.status_code != 200 or "geocache" not in resp.url:
+    urls = [
+        f"https://www.geocaching.com/geocache/{gc_code}",
+        f"https://www.geocaching.com/seek/cache_details.aspx?wp={gc_code}",
+    ]
+    for url in urls:
+        for label, cookie in (("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)):
+            if not cookie:
                 continue
-
-            text = resp.text
-            result: dict[str, Any] = {"code": gc_code}
-
-            jsonld_match = re.search(
-                r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-                text, re.DOTALL | re.IGNORECASE,
-            )
-            if jsonld_match:
-                try:
-                    ld = json.loads(jsonld_match.group(1))
-                    if isinstance(ld, dict):
-                        if ld.get("name"):
-                            result["name"] = ld["name"]
-                        if ld.get("placedBy"):
-                            result["owner"] = {"username": ld["placedBy"]}
-                        if ld.get("datePublished"):
-                            result["placedDate"] = ld["datePublished"]
-                        loc = ld.get("location")
-                        if isinstance(loc, dict):
-                            lat = loc.get("latitude")
-                            lng = loc.get("longitude")
-                            if lat is not None and lng is not None:
-                                result["postedCoordinates"] = {"latitude": float(lat), "longitude": float(lng)}
-                        contained = ld.get("containedInPlace")
-                        if isinstance(contained, dict) and contained.get("name"):
-                            result["country"] = contained["name"]
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    pass
-
-            if "owner" not in result:
-                # 从 profile 链接提取 owner 用户名（兜底，不依赖 <meta author>）
-                profile_match = re.search(
-                    r'<a\s[^>]*?/p/\?guid=[a-f0-9-]+[^>]*?>\s*([^<]+)\s*</a>',
-                    text, re.IGNORECASE,
-                )
-                if profile_match:
-                    result["owner"] = {"username": profile_match.group(1).strip()}
-
-            if "name" not in result:
-                title_match = re.search(
-                    r'<title>(?:GC\w+\s*-\s*)?([^<]+)</title>',
-                    text, re.IGNORECASE,
-                )
-                if title_match:
-                    name = title_match.group(1).strip()
-                    # 去掉 title 中的 "GC{code} " 前缀（无 dash 的情况）
-                    name = re.sub(r'^GC\w+\s+', '', name)
-                    # 去掉首部的 " - "（原 title 格式 GC{code} - name）
-                    name = re.sub(r'^\s*-\s*', '', name)
-                    # 去掉尾部 " (Type) in Country created by Owner"
-                    name = re.sub(r'\s*\([^)]*\)\s*in\s+[^<]+$', '', name)
-                    result["name"] = name.strip()
-                else:
-                    og_match = re.search(
-                        r'<meta[^>]*property="og:title"[^>]*content="[^"]*-\s*([^"]*)"',
-                        text, re.IGNORECASE,
-                    )
-                    if og_match:
-                        result["name"] = og_match.group(1).strip()
-
-            diff_match = re.search(r'[Dd]ifficulty[:\s]*([\d.]+)', text)
-            if diff_match:
-                try:
-                    result["difficulty"] = round(float(diff_match.group(1)), 1)
-                except (TypeError, ValueError):
-                    pass
-
-            terr_match = re.search(r'[Tt]errain[:\s]*([\d.]+)', text)
-            if terr_match:
-                try:
-                    result["terrain"] = round(float(terr_match.group(1)), 1)
-                except (TypeError, ValueError):
-                    pass
-
-            type_match = re.search(r'[Tt]ype[:\s]*([^<]+)', text)
-            if type_match:
-                type_text = type_match.group(1).strip().lower()
-                for key, type_id in type_names.items():
-                    if key in type_text:
-                        result["geocacheType"] = type_id
-                        break
-
-            size_match = re.search(r'(?:[Ss]ize|[Cc]ontainer)[:\s]*([^<]+)', text)
-            if size_match:
-                size_text = size_match.group(1).strip().lower()
-                for key, type_id in container_names.items():
-                    if key in size_text:
-                        result["containerType"] = type_id
-                        break
-
-            # 仅当页面明确标记归档时才设置 cacheStatus=2；
-            # preview API 404 也可能由其它原因导致，此时不设置状态，
-            # 下游不会因此把有效 cache 误标为 Archive。
-            if _page_marks_cache_archived(text):
-                result["cacheStatus"] = 2
-
-            return result
-        except Exception:
-            continue
+            try:
+                resp = session.get(url, headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "cookie": cookie,
+                    "referer": "https://www.geocaching.com/play/map",
+                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                }, timeout=15, allow_redirects=True)
+                if resp.status_code == 404:
+                    return CACHE_DELETED_STATUS
+                if resp.status_code != 200 or "geocache" not in resp.url:
+                    continue
+                if _page_marks_cache_archived(resp.text):
+                    return 2
+                return 0
+            except Exception:
+                continue
     return None
-
-
-def check_cache_status(gc_code: str) -> Optional[int]:
-    """检查单个 cache 的状态"""
-    data = fetch_cache_preview(gc_code)
-    if not data:
-        return None
-    return data.get('cacheStatus')
 
 
 def process_cache_item(
@@ -1351,8 +1145,8 @@ def run_crawler():
             
             logger.info(f"  新增: {new_in_grid}, 更新: {updated_in_grid}")
 
-            # 随机延迟（固定 4s；间隔过短会导致大量网格无响应）
-            time.sleep(4)
+            # 随机延迟（固定 6s；间隔过短会导致大量网格无响应）
+            time.sleep(6)
 
             grid_elapsed = time.perf_counter() - grid_start
             logger.info(
@@ -1413,9 +1207,8 @@ def run_crawler():
         archive_start = time.perf_counter()
         archive_elapsed = 0.0
         if archived_codes:
-            logger.info("逐个检查潜在归档缓存的最新字段...")
+            logger.info("逐个检查潜在归档缓存的最新状态...")
 
-            potential_updates = []
             status_only_updates = []
             unchanged_potential = 0
             failed_preview_count = 0
@@ -1424,90 +1217,56 @@ def run_crawler():
                 existing = scanned_data.get(gc_code)
                 if existing and existing.get('cache_status') == 404:
                     continue
-                preview_data = fetch_cache_preview(gc_code)
-                if not preview_data:
+                status = check_cache_status_via_detail_page(gc_code)
+                if status is None:
                     failed_preview_count += 1
-                    logger.warning(f"  {gc_code} 获取预览数据失败，跳过字段更新")
+                    logger.warning(f"  {gc_code} 详情页检查失败，跳过状态更新")
                     time.sleep(random.uniform(0.5, 1.0))
                     continue
 
-                if is_deleted_cache_preview(preview_data):
-                    existing_cache = scanned_data.get(gc_code)
-                    if existing_cache and existing_cache.get('cache_status') != CACHE_DELETED_STATUS:
+                if status == CACHE_DELETED_STATUS:
+                    if existing and existing.get('cache_status') != CACHE_DELETED_STATUS:
                         status_only_updates.append((gc_code, CACHE_DELETED_STATUS))
                         updated_codes.add(gc_code)
-                        logger.info(f"  {gc_code} 已确认删除，仅更新状态为 {CACHE_DELETED_STATUS}")
+                        logger.info(f"  {gc_code} 已确认删除，更新状态为 {CACHE_DELETED_STATUS}")
                     else:
                         unchanged_potential += 1
                         logger.info(f"  {gc_code} 已确认删除，状态无变化")
-                    time.sleep(random.uniform(0.5, 1.0))
-                    continue
-
-                status = preview_data.get('cacheStatus')
-                existing_cache = scanned_data.get(gc_code)
-                cache_data = process_cache_item(preview_data, require_allowed_country=False)
-
-                if cache_data and existing_cache:
-                    cache_record = dict(cache_data)
-                    for key, existing_value in existing_cache.items():
-                        if cache_record.get(key) is None and existing_value is not None:
-                            cache_record[key] = existing_value
-
-                    if 'attributes' not in preview_data and existing_cache.get('attributes') is not None:
-                        cache_record['attributes'] = existing_cache.get('attributes')
-
-                    if (
-                        cache_record.get('premium_only', False)
-                        or cache_record.get('latitude') is None
-                        or cache_record.get('longitude') is None
-                    ):
-                        cache_record['latitude'] = existing_cache.get('latitude')
-                        cache_record['longitude'] = existing_cache.get('longitude')
-
-                    if cache_metadata_changed(existing_cache, cache_record):
-                        potential_updates.append(cache_record)
+                elif status == 2:
+                    if existing and existing.get('cache_status') != 2:
+                        status_only_updates.append((gc_code, 2))
                         updated_codes.add(gc_code)
-                        scanned_data[gc_code] = cache_record
-                        if cache_record.get('cache_status') == 2:
-                            logger.info(f"  {gc_code} 已确认 Archive，字段有更新")
-                        else:
-                            logger.info(f"  {gc_code} 状态: {status}，字段有更新")
+                        logger.info(f"  {gc_code} 已确认 Archive，更新状态为 2")
                     else:
                         unchanged_potential += 1
-                        if status == 2:
-                            logger.info(f"  {gc_code} 已确认 Archive，字段无变化")
-                        else:
-                            logger.info(f"  {gc_code} 状态: {status}，字段无变化")
-                elif status is not None and existing_cache and status != existing_cache.get('cache_status'):
-                    status_only_updates.append((gc_code, status))
-                    updated_codes.add(gc_code)
-                    logger.info(f"  {gc_code} 无法解析完整字段，仅更新状态为 {status}")
+                        logger.info(f"  {gc_code} 已确认 Archive，状态无变化")
                 else:
-                    unchanged_potential += 1
-                    logger.info(f"  {gc_code} 状态: {status}，未发现可更新字段")
+                    # 详情页无归档标记 → 有效 cache：若被误标为归档/删除，改回 0
+                    if existing and existing.get('cache_status') in (2, CACHE_DELETED_STATUS):
+                        status_only_updates.append((gc_code, 0))
+                        updated_codes.add(gc_code)
+                        logger.info(f"  {gc_code} 详情页无归档标记，将误标状态改回 0")
+                    else:
+                        unchanged_potential += 1
+                        logger.info(f"  {gc_code} 详情页无归档标记，状态无变化")
 
                 time.sleep(random.uniform(0.5, 1.0))
-
-            if potential_updates:
-                logger.info(f"批量更新 {len(potential_updates)} 个潜在归档缓存的完整字段...")
-                db.upsert_caches_batch(potential_updates)
 
             if status_only_updates:
                 logger.info(f"更新 {len(status_only_updates)} 个潜在归档缓存的状态字段...")
                 for gc_code, status in status_only_updates:
                     db.update_cache_status(gc_code, status)
 
-            if potential_updates or status_only_updates:
+            if status_only_updates:
                 db.commit()
                 logger.info(
-                    f"潜在归档缓存字段检查完成：完整更新 {len(potential_updates)} 个，"
-                    f"仅状态更新 {len(status_only_updates)} 个，无变化 {unchanged_potential} 个，"
-                    f"预览失败 {failed_preview_count} 个"
+                    f"潜在归档缓存状态检查完成：状态更新 {len(status_only_updates)} 个，"
+                    f"无变化 {unchanged_potential} 个，检查失败 {failed_preview_count} 个"
                 )
             else:
                 logger.info(
-                    f"潜在归档缓存字段检查完成：无变化 {unchanged_potential} 个，"
-                    f"预览失败 {failed_preview_count} 个"
+                    f"潜在归档缓存状态检查完成：无变化 {unchanged_potential} 个，"
+                    f"检查失败 {failed_preview_count} 个"
                 )
         archive_elapsed = time.perf_counter() - archive_start
         logger.info(f"[耗时] 归档检查阶段: {archive_elapsed:.1f}s")

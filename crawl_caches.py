@@ -53,6 +53,8 @@ MAP_PAGE_URL = (
 ALLOWED_COUNTRIES = ["China", "Hong Kong", "Taiwan", "Macao"]
 MAX_RETRIES = 3
 CACHE_DELETED_STATUS = 404
+CACHE_COUNT_RETRY_MAX = 3  # 网格 0 结果重试次数
+CACHE_COUNT_RETRY_DELAY = 10  # 网格 0 结果重试间隔（秒）
 _DETECTED_MAP_VERSION = None
 
 # 设置重试策略
@@ -396,17 +398,17 @@ class DatabaseManager:
         self.conn.commit()
 
 
-def get_pending_grids_from_db(db: DatabaseManager) -> List[Tuple[int, List[float]]]:
-    """从数据库获取待处理的网格配置 (返回 id 和 bounds 列表)"""
+def get_pending_grids_from_db(db: DatabaseManager) -> List[Tuple[int, List[float], Optional[int]]]:
+    """从数据库获取待处理的网格配置 (返回 id、bounds、cache_count 列表)"""
     logger.info("执行 SQL 查询: SELECT id, grid_bounds FROM crawl_progress WHERE status = 'pending'")
     max_retries = 3
     for attempt in range(max_retries):
         try:
             # grid_bounds 现在只存储 bounds 数组，不是整个 grid 对象
-            db.cursor.execute("SELECT id, grid_bounds FROM crawl_progress WHERE status = 'pending' ORDER BY id")
+            db.cursor.execute("SELECT id, grid_bounds, cache_count FROM crawl_progress WHERE status = 'pending' ORDER BY id")
             rows = db.cursor.fetchall()
             logger.info(f"SQL 查询完成，返回 {len(rows)} 行数据")
-            return [(row[0], row[1]) for row in rows]
+            return [(row[0], row[1], row[2]) for row in rows]
         except psycopg2.OperationalError as e:
             if attempt < max_retries - 1:
                 logger.warning(f"数据库连接断开，尝试重新连接 ({attempt + 1}/{max_retries})...")
@@ -1000,10 +1002,11 @@ def run_crawler():
             'fetch': 0.0, 'process': 0.0, 'upsert': 0.0, 'guid': 0.0,
             'fetch_count': 0, 'process_count': 0, 'upsert_count': 0, 'guid_count': 0,
         }
+        retry_failed_grids: list[int] = []
 
         while grids_to_process:
             # 取出第一个网格进行处理
-            grid_id, bounds = grids_to_process.pop(0)
+            grid_id, bounds, grid_expected_count = grids_to_process.pop(0)
 
             # 检查是否已处理过
             if grid_id in processed_grids:
@@ -1032,6 +1035,35 @@ def run_crawler():
             
             results = data.get('pageProps', {}).get('searchResults', {}).get('results', [])
             cache_count = len(results)
+
+            # 爬取到 0 个 cache 但数据库预期非 0 → 说明出现错误，等待后重试
+            retry_count = 0
+            while (
+                cache_count == 0
+                and grid_expected_count not in (None, 0)
+                and retry_count < CACHE_COUNT_RETRY_MAX
+            ):
+                retry_count += 1
+                logger.warning(
+                    f"  网格 {grid_id} 预期 {grid_expected_count} 个 cache 但爬取到 0 个，"
+                    f"{CACHE_COUNT_RETRY_DELAY}s 后重试 ({retry_count}/{CACHE_COUNT_RETRY_MAX})"
+                )
+                time.sleep(CACHE_COUNT_RETRY_DELAY)
+                data = safe_fetch(max_lat, max_lng, min_lat, min_lng)
+                if not data:
+                    continue
+                results = data.get('pageProps', {}).get('searchResults', {}).get('results', [])
+                cache_count = len(results)
+
+            if cache_count == 0 and grid_expected_count not in (None, 0):
+                # 重试后仍为 0：记录网格，保持 pending，脚本最后统一输出
+                retry_failed_grids.append(grid_id)
+                logger.error(
+                    f"  网格 {grid_id} 重试 {CACHE_COUNT_RETRY_MAX} 次后仍爬取到 0 个 cache，"
+                    f"保持 pending 状态，将在脚本结束前列出"
+                )
+                continue
+
             crawled_bounds.append((max_lat, min_lng, min_lat, max_lng))
             logger.info(f"  获取到 {cache_count} 个结果")
             
@@ -1128,7 +1160,7 @@ def run_crawler():
                     sub_grid_id = db.cursor.fetchone()[0]
                     
                     # 将子网格添加到当前处理队列
-                    grids_to_process.append((sub_grid_id, sub_grid["bounds"]))
+                    grids_to_process.append((sub_grid_id, sub_grid["bounds"], None))
                 
                 logger.info(f"  已添加 {len(sub_grids)} 个子网格到当前爬取队列")
             else:
@@ -1158,6 +1190,13 @@ def run_crawler():
         if commit_counter > 0:
             db.commit()
             logger.info(f"已提交 {commit_counter} 个网格的事务")
+
+        if retry_failed_grids:
+            logger.error(
+                f"以下 {len(retry_failed_grids)} 个网格爬取到 0 个 cache 但数据库预期非 0"
+                f"（重试 {CACHE_COUNT_RETRY_MAX} 次仍失败，已保持 pending，下次运行将重试）: "
+                f"{', '.join(map(str, retry_failed_grids))}"
+            )
 
         loop_elapsed = time.perf_counter() - loop_start
         grid_count = max(len(processed_grids), 1)
@@ -1216,6 +1255,8 @@ def run_crawler():
             for gc_code in archived_codes:
                 existing = scanned_data.get(gc_code)
                 if existing and existing.get('cache_status') == 404:
+                    logger.info(f"  {gc_code} 状态已为 404（已删除），跳过检查")
+                    unchanged_potential += 1
                     continue
                 status = check_cache_status_via_detail_page(gc_code)
                 if status is None:

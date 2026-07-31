@@ -527,7 +527,7 @@ def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float) -
                             f"Authentication failed: map API redirected to login page: {redirect_url}"
                         )
                     logger.warning(f"[Redirect] 地图接口返回重定向: {redirect_url}")
-                    time.sleep(2 * (attempt + 1))
+                    time.sleep(1)
                     continue
                 return data
             elif response.status_code == 404 and not refresh_attempted and not MAP_VERSION_OVERRIDE:
@@ -540,19 +540,19 @@ def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float) -
                     raise AuthenticationError(
                         "Authentication failed: map API returned HTTP 403 after retries"
                     )
-                logger.warning(f"[403 Forbidden] Cookie可能失效。等待{10 * (attempt + 1)}秒...")
-                time.sleep(10 * (attempt + 1))
+                logger.warning(f"[403 Forbidden] Cookie可能失效。等待{attempt + 1}秒...")
+                time.sleep(1)
             elif response.status_code == 429:
                 logger.warning("[429 Too Many Requests] 触发限流。休眠...")
                 time.sleep(60)
             else:
                 logger.warning(f"[Error {response.status_code}] 正在重试...")
-                time.sleep(5 * (attempt + 1))
+                time.sleep(1)
         except AuthenticationError:
             raise
         except Exception as e:
             logger.error(f"[网络异常] {e}. 正在重试 ({attempt + 1}/{MAX_RETRIES})...")
-            time.sleep(10 * (attempt + 1))
+            time.sleep(1)
     
     return None
 
@@ -1132,15 +1132,18 @@ def backfill_missing_coordinates(db: DatabaseManager) -> int:
 
 def run_crawler():
     """运行爬虫"""
+    run_start = time.perf_counter()
     # 连接数据库
     db = DatabaseManager(DATABASE_URL)
     db.connect()
-    
+
     try:
         # 加载已有数据
         logger.info("加载已有 cache 数据...")
+        step_start = time.perf_counter()
         scanned_data = db.get_existing_caches()
-        logger.info(f"已加载 {len(scanned_data)} 条记录")
+        load_elapsed = time.perf_counter() - step_start
+        logger.info(f"已加载 {len(scanned_data)} 条记录（耗时 {load_elapsed:.1f}s）")
         
         # 记录原始 code（排除已归档的）
         logger.info("开始筛选原始 code...")
@@ -1175,15 +1178,21 @@ def run_crawler():
         # 处理待处理网格（支持动态添加子网格）
         processed_grids = set()
         grids_to_process = pending_grids.copy()
-        
+        loop_start = time.perf_counter()
+        loop_stats = {
+            'fetch': 0.0, 'process': 0.0, 'upsert': 0.0, 'guid': 0.0,
+            'fetch_count': 0, 'process_count': 0, 'upsert_count': 0, 'guid_count': 0,
+        }
+
         while grids_to_process:
             # 取出第一个网格进行处理
             grid_id, bounds = grids_to_process.pop(0)
-            
+
             # 检查是否已处理过
             if grid_id in processed_grids:
                 continue
             processed_grids.add(grid_id)
+            grid_start = time.perf_counter()
             
             # bounds 现在是直接的数组 [max_lat, min_lng, min_lat, max_lng]
             max_lat, min_lng, min_lat, max_lng = bounds
@@ -1193,9 +1202,13 @@ def run_crawler():
                 f"Lat {min_lat:.4f}~{max_lat:.4f}, Lng {min_lng:.4f}~{max_lng:.4f}"
             )
             
+            fetch_start = time.perf_counter()
             data = safe_fetch(max_lat, max_lng, min_lat, min_lng)
+            fetch_elapsed = time.perf_counter() - fetch_start
+            loop_stats['fetch'] += fetch_elapsed
+            loop_stats['fetch_count'] += 1
             if not data:
-                logger.warning("无响应，跳过此网格")
+                logger.warning("无响应，跳过此网格（fetch 耗时 %.2fs）", fetch_elapsed)
                 # 标记为已完成（无数据）
                 mark_grid_completed(db, grid_id, 0)
                 continue
@@ -1209,6 +1222,7 @@ def run_crawler():
             updated_in_grid = 0
             
             updated_caches = []
+            process_start = time.perf_counter()
             for item in results:
                 cache_data = process_cache_item(item, min_lat, max_lat, min_lng, max_lng)
                 if not cache_data:
@@ -1245,11 +1259,20 @@ def run_crawler():
                         updated_codes.add(code)
                     scanned_data[code] = cache_record
 
+            process_elapsed = time.perf_counter() - process_start
+            loop_stats['process'] += process_elapsed
+            loop_stats['process_count'] += 1
+
             # 将这一网格的变更数据批量写入数据库
+            upsert_start = time.perf_counter()
             if updated_caches:
                 db.upsert_caches_batch(updated_caches)
+            upsert_elapsed = time.perf_counter() - upsert_start
+            loop_stats['upsert'] += upsert_elapsed
+            loop_stats['upsert_count'] += 1
 
             # 新 cache 的 owner_guid 在 map API 中不返回，需从详情页提取
+            guid_start = time.perf_counter()
             new_without_guid = [c for c in updated_caches if c.get('code') in new_codes and not c.get('owner_guid')]
             if new_without_guid:
                 for cache_record in new_without_guid:
@@ -1262,6 +1285,9 @@ def run_crawler():
                             (guid, code))
                 db.conn.commit()
                 logger.info(f"  回填 {len([c for c in new_without_guid if c.get('owner_guid')])}/{len(new_without_guid)} 个新 cache 的 owner GUID")
+            guid_elapsed = time.perf_counter() - guid_start
+            loop_stats['guid'] += guid_elapsed
+            loop_stats['guid_count'] += 1
 
             # 如果缓存数量超过800，需要切分网格
             if cache_count > 800:
@@ -1301,14 +1327,33 @@ def run_crawler():
                 commit_counter = 0
             
             logger.info(f"  新增: {new_in_grid}, 更新: {updated_in_grid}")
-            
-            # 随机延迟
-            time.sleep(random.uniform(5.0, 8.0))
+
+            # 随机延迟（经验上站点不限制爬虫，仅保留轻微节流）
+            time.sleep(0.2)
+
+            grid_elapsed = time.perf_counter() - grid_start
+            logger.info(
+                f"  [耗时] fetch={fetch_elapsed:.2f}s process={process_elapsed:.2f}s "
+                f"upsert={upsert_elapsed:.2f}s guid={guid_elapsed:.2f}s 总计={grid_elapsed:.2f}s"
+            )
         
         # 处理剩余的提交
         if commit_counter > 0:
             db.commit()
             logger.info(f"已提交 {commit_counter} 个网格的事务")
+
+        loop_elapsed = time.perf_counter() - loop_start
+        grid_count = max(len(processed_grids), 1)
+        logger.info(
+            f"[耗时] 主循环网格爬取共 {loop_elapsed:.1f}s（{len(processed_grids)} 个网格，"
+            f"平均 {loop_elapsed / grid_count:.2f}s/网格）"
+        )
+        logger.info(
+            f"[耗时] 子步骤累计: fetch={loop_stats['fetch']:.1f}s ({loop_stats['fetch_count']}次), "
+            f"process={loop_stats['process']:.1f}s ({loop_stats['process_count']}次), "
+            f"upsert={loop_stats['upsert']:.1f}s ({loop_stats['upsert_count']}次), "
+            f"guid={loop_stats['guid']:.1f}s ({loop_stats['guid_count']}次)"
+        )
         
         # 检查本次爬取中未出现的 cache（仅限爬取框内的）
         all_missing = list(original_codes - current_crawl_codes)
@@ -1341,7 +1386,9 @@ def run_crawler():
             archived_codes = all_missing
 
         logger.info(f"Potential Archived (within crawled grids): {len(archived_codes)}")
-        
+
+        archive_start = time.perf_counter()
+        archive_elapsed = 0.0
         if archived_codes:
             logger.info("逐个检查潜在归档缓存的最新字段...")
 
@@ -1439,11 +1486,23 @@ def run_crawler():
                     f"潜在归档缓存字段检查完成：无变化 {unchanged_potential} 个，"
                     f"预览失败 {failed_preview_count} 个"
                 )
-        
-        backfill_missing_coordinates(db)
+        archive_elapsed = time.perf_counter() - archive_start
+        logger.info(f"[耗时] 归档检查阶段: {archive_elapsed:.1f}s")
 
+        backfill_start = time.perf_counter()
+        backfill_missing_coordinates(db)
+        backfill_elapsed = time.perf_counter() - backfill_start
+        logger.info(f"[耗时] 坐标回填阶段: {backfill_elapsed:.1f}s")
+
+        total_elapsed = time.perf_counter() - run_start
         logger.info("=" * 50)
         logger.info(f"本轮爬取完成! 新增: {len(new_codes)}, 更新: {len(updated_codes)}")
+        logger.info(
+            f"[耗时汇总] 加载数据={load_elapsed:.1f}s | 网格爬取={loop_elapsed:.1f}s "
+            f"({len(processed_grids)}网格, 平均{loop_elapsed / grid_count:.2f}s/网格) | "
+            f"归档检查={archive_elapsed:.1f}s | 坐标回填={backfill_elapsed:.1f}s | "
+            f"全程总计={total_elapsed:.1f}s"
+        )
         logger.info("=" * 50)
         
         # 返回是否还有待处理的网格

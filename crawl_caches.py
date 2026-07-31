@@ -55,7 +55,7 @@ MAX_RETRIES = 3
 CACHE_DELETED_STATUS = 404
 PAGE_SIZE = 1000  # map API 单页返回上限
 PAGE_COUNT_LIMIT = 10  # 单网格 skip 分页上限（10 页 = 10000 个，API 硬限制）
-PAGE_SLEEP = 6  # 网格之间、skip 分页之间的节流间隔（秒）
+PAGE_SLEEP = 4  # 网格之间、skip 分页之间的节流间隔（秒）
 CACHE_COUNT_RETRY_MAX = 3  # 网格 0 结果重试次数
 CACHE_COUNT_RETRY_DELAY = 10  # 网格 0 结果重试间隔（秒）
 # 固定爬取网格（大网格 + skip 分页，覆盖中国区全部 cache，实测 total 均 < 10000）
@@ -919,7 +919,8 @@ def run_crawler():
                 if data:
                     sr = data.get('pageProps', {}).get('searchResults', {})
                     results = sr.get('results', [])
-                    if sr.get('total') is not None:
+                    # total=0 是限流/异常响应的特征，不覆盖已记录的真实 total
+                    if sr.get('total') not in (None, 0):
                         grid_total = sr.get('total')
                 else:
                     results = []
@@ -949,6 +950,8 @@ def run_crawler():
                         continue
                     sr = data.get('pageProps', {}).get('searchResults', {})
                     results = sr.get('results', [])
+                    if sr.get('total') not in (None, 0):
+                        grid_total = sr.get('total')
 
                 if not results:
                     # 重试 3 次后仍为 0：数据不完整，失败退出以便邮件通知

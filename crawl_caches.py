@@ -630,7 +630,6 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
         logger.warning(f"  {gc_code} 两个 cookie 均连续 {MAX_RETRIES} 次返回 404")
         page_data = _fetch_archived_cache_page_data(gc_code)
         if page_data is not None:
-            page_data["cacheStatus"] = 2
             fields = [k for k in page_data if k != "code"]
             logger.info(f"  {gc_code} 预览接口返回 404 但网页可访问，从详情页提取 {len(fields)} 个字段")
             return page_data
@@ -639,11 +638,29 @@ def fetch_cache_preview(gc_code: str) -> Optional[dict]:
     return None
 
 
-def _fetch_archived_cache_page_data(gc_code: str) -> Optional[dict]:
-    """从 cache 详情页提取已归档 cache 的元数据（preview API 对已归档 cache 返回 404）。
+def _page_marks_cache_archived(text: str) -> bool:
+    """检测详情页 HTML 是否明确标记 cache 为已归档。
 
-    返回 API 格式的 dict（code, name, cacheStatus, owner->username 等），
-    以便下游 process_cache_item 能正常处理。
+    基于真实归档页面（GC1036Q / GC1039P / GC10435 / GC9ZYE5）验证的特征：
+    归档横幅元素 id="ctl00_ContentBody_archivedMessage" 及其内文案
+    "This cache has been archived"；有效 cache 页面（GCW5Y9）不含此元素。
+
+    preview API 对已归档 cache 返回 404，但 404 也可能由其它原因导致
+    （如部分仍有效的 cache），因此不能仅凭 API 404 判定归档，
+    必须以页面上的归档标记为准。
+    """
+    return bool(
+        re.search(r'id="ctl00_ContentBody_archivedMessage"', text, re.IGNORECASE)
+        or re.search(r"This cache has been archived", text, re.IGNORECASE)
+    )
+
+
+def _fetch_archived_cache_page_data(gc_code: str) -> Optional[dict]:
+    """从 cache 详情页提取 preview API 返回 404 的 cache 元数据。
+
+    返回 API 格式的 dict（code, name, owner->username 等）；
+    cacheStatus 仅在页面明确标记已归档时设置，否则不设置，
+    以免把仍有效的 cache 误标为 Archive。
     """
     detail_url = f"https://www.geocaching.com/geocache/{gc_code}"
 
@@ -777,6 +794,12 @@ def _fetch_archived_cache_page_data(gc_code: str) -> Optional[dict]:
                     if key in size_text:
                         result["containerType"] = type_id
                         break
+
+            # 仅当页面明确标记归档时才设置 cacheStatus=2；
+            # preview API 404 也可能由其它原因导致，此时不设置状态，
+            # 下游不会因此把有效 cache 误标为 Archive。
+            if _page_marks_cache_archived(text):
+                result["cacheStatus"] = 2
 
             return result
         except Exception:
@@ -1328,8 +1351,8 @@ def run_crawler():
             
             logger.info(f"  新增: {new_in_grid}, 更新: {updated_in_grid}")
 
-            # 随机延迟（经验上站点不限制爬虫，仅保留轻微节流）
-            time.sleep(0.2)
+            # 随机延迟（固定 4s；间隔过短会导致大量网格无响应）
+            time.sleep(4)
 
             grid_elapsed = time.perf_counter() - grid_start
             logger.info(

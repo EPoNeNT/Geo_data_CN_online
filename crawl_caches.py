@@ -1016,6 +1016,28 @@ def run_crawler():
 
                     if not is_new:
                         is_different = cache_metadata_changed(scanned_data[code], cache_data)
+                        if is_different:
+                            # 调试输出：更新字段的前后对比
+                            _diff_desc = []
+                            for _k in ('id', 'name', 'code', 'premium_only', 'favorite_points',
+                                       'geocache_type', 'container_type', 'difficulty', 'terrain',
+                                       'cache_status', 'details_url', 'placed_date', 'owner_username',
+                                       'last_found_date', 'trackable_count', 'region', 'country',
+                                       'attributes', 'owner_guid'):
+                                _lv = cache_data.get(_k)
+                                if _lv is None:
+                                    continue
+                                if cc.normalize_cache_field(_k, _lv) != cc.normalize_cache_field(_k, scanned_data[code].get(_k)):
+                                    _diff_desc.append(f"{_k}: {scanned_data[code].get(_k)!r} → {_lv!r}")
+                            if not cache_data.get('premium_only', False):
+                                for _k in ('latitude', 'longitude'):
+                                    _lv = cache_data.get(_k)
+                                    if _lv is None:
+                                        continue
+                                    if cc.normalize_cache_field(_k, _lv) != cc.normalize_cache_field(_k, scanned_data[code].get(_k)):
+                                        _diff_desc.append(f"{_k}: {scanned_data[code].get(_k)!r} → {_lv!r}")
+                            if _diff_desc:
+                                logger.info(f"  [更新] {code}: " + " | ".join(_diff_desc))
 
                     if is_new or is_different:
                         cache_record = dict(cache_data)

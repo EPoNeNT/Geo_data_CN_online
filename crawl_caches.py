@@ -495,11 +495,17 @@ def check_cache_status_via_detail_page(gc_code: str) -> Optional[int]:
       - HTTP 200 + 归档横幅元素 ctl00_ContentBody_archivedMessage → 已归档
       - HTTP 200 + 无横幅 → 有效
       - HTTP 404 → 已删除
+
+    Premium-only cache 在非 premium 登录态下返回受限页（title 为
+    "Premium Member Only Cache"，无横幅），不能据此判定为有效，
+    需继续尝试 premium cookie。
     """
     urls = [
         f"https://www.geocaching.com/geocache/{gc_code}",
         f"https://www.geocaching.com/seek/cache_details.aspx?wp={gc_code}",
     ]
+    # 收集各 cookie 的判定结果，全部尝试完后优先 premium cookie 的结果
+    candidates: dict[str, int] = {}
     for url in urls:
         for label, cookie in (("nonpremium", _RAW_NONPREMIUM_COOKIE), ("premium", _RAW_PREMIUM_COOKIE)):
             if not cookie:
@@ -512,14 +518,26 @@ def check_cache_status_via_detail_page(gc_code: str) -> Optional[int]:
                     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 }, timeout=15, allow_redirects=True)
                 if resp.status_code == 404:
-                    return CACHE_DELETED_STATUS
+                    candidates[label] = CACHE_DELETED_STATUS
+                    continue
                 if resp.status_code != 200 or "geocache" not in resp.url:
+                    continue
+                if looks_like_login_page(resp.url, resp.text):
+                    continue
+                # Premium-only 受限页：title 为 "…Premium Member Only Cache"，
+                # 无真实内容，不能作为"有效"依据（真实页面 title 为 "GCxxxx …"，不受影响）
+                if re.search(r"<title>[^<]*Premium Member Only Cache", resp.text, re.IGNORECASE):
                     continue
                 if _page_marks_cache_archived(resp.text):
                     return 2
-                return 0
+                candidates[label] = 0
             except Exception:
                 continue
+
+    # 优先采用 premium cookie 的判定（能访问受限 cache 的真实状态）
+    for label in ("premium", "nonpremium"):
+        if label in candidates:
+            return candidates[label]
     return None
 
 

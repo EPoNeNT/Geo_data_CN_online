@@ -1027,14 +1027,14 @@ def run_crawler():
                                 _lv = cache_data.get(_k)
                                 if _lv is None:
                                     continue
-                                if cc.normalize_cache_field(_k, _lv) != cc.normalize_cache_field(_k, scanned_data[code].get(_k)):
+                                if normalize_cache_field(_k, _lv) != normalize_cache_field(_k, scanned_data[code].get(_k)):
                                     _diff_desc.append(f"{_k}: {scanned_data[code].get(_k)!r} → {_lv!r}")
                             if not cache_data.get('premium_only', False):
                                 for _k in ('latitude', 'longitude'):
                                     _lv = cache_data.get(_k)
                                     if _lv is None:
                                         continue
-                                    if cc.normalize_cache_field(_k, _lv) != cc.normalize_cache_field(_k, scanned_data[code].get(_k)):
+                                    if normalize_cache_field(_k, _lv) != normalize_cache_field(_k, scanned_data[code].get(_k)):
                                         _diff_desc.append(f"{_k}: {scanned_data[code].get(_k)!r} → {_lv!r}")
                             if _diff_desc:
                                 logger.info(f"  [更新] {code}: " + " | ".join(_diff_desc))

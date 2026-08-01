@@ -484,6 +484,10 @@ def _page_marks_cache_archived(text: str) -> bool:
     return bool(
         re.search(r'id="ctl00_ContentBody_archivedMessage"', text, re.IGNORECASE)
         or re.search(r"This cache has been archived", text, re.IGNORECASE)
+        # 锁定（locked）状态与归档等价：横幅元素 ctl00_ContentBody_lockedMessage
+        # 及文案 "This cache has been locked, but it is available for viewing."
+        or re.search(r'id="ctl00_ContentBody_lockedMessage"', text, re.IGNORECASE)
+        or re.search(r"This cache has been locked", text, re.IGNORECASE)
     )
 
 

@@ -956,8 +956,8 @@ def run_crawler():
                 else:
                     results = []
 
-                # 网格总 cache 数达到 API 上限（10000）→ 无法取全，让 action 失败以便邮件通知
-                if grid_total is not None and grid_total >= PAGE_SIZE * PAGE_COUNT_LIMIT:
+                # 网格总 cache 数超过 API 上限（>10000）→ 无法取全，让 action 失败以便邮件通知
+                if grid_total is not None and grid_total > PAGE_SIZE * PAGE_COUNT_LIMIT:
                     raise RuntimeError(
                         f"网格 {grid_name} 的 cache 总数达到 {grid_total}（≥ {PAGE_SIZE * PAGE_COUNT_LIMIT}），"
                         f"已超过 API 单查询 10000 上限，无法完整爬取，请拆分网格后重试"
@@ -1090,11 +1090,14 @@ def run_crawler():
                 loop_stats['guid'] += guid_elapsed
                 loop_stats['guid_count'] += 1
 
-                if len(results) < PAGE_SIZE:
+                if (
+                    len(results) < PAGE_SIZE
+                    or (grid_total is not None and grid_crawled >= grid_total)
+                ):
                     break
                 skip += PAGE_SIZE
-                # skip 已达上限仍未爬完 → 与 API 10000 上限冲突，失败退出以便通知
-                if skip >= PAGE_SIZE * (PAGE_COUNT_LIMIT - 1):
+                # 已取满 10 页（skip=10000）仍未爬完 → 数据超过 API 上限，失败退出以便通知
+                if skip >= PAGE_SIZE * PAGE_COUNT_LIMIT:
                     raise RuntimeError(
                         f"网格 {grid_name} skip 已达 {skip} 但仍未爬完，超过 API 上限，请拆分网格后重试"
                     )

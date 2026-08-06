@@ -109,6 +109,8 @@ CACHE_RANKING_ENTRY_FILTER = (
     "AND c.owner_username IS NOT NULL AND c.owner_username <> '' "
     "AND COALESCE(c.cache_status, 0) != 404"
 )
+CITY_NAME_EXPR = "COALESCE(NULLIF(TRIM(c.city), ''), c.country)"
+CITY_NAME_WHERE = f"{CITY_NAME_EXPR} IS NOT NULL"
 COUNTRY_SUBTITLE_MAP = {
     "China": "中国",
     "Taiwan": "台湾",
@@ -234,6 +236,8 @@ class DataGenerator:
         self.database_url = database_url
         self.conn = None
         self.cursor = None
+        self._grouped_cache = {}
+        self._heatmap_cache = None
 
     def connect(self):
         """Connect to database."""
@@ -754,10 +758,27 @@ class DataGenerator:
 
     def generate_heatmap(self, country_filter: Optional[str] = None) -> Dict[str, List[Dict]]:
         """Generate overview heatmap data for recent and YTD find logs."""
+        grouped = self._load_heatmap()
         heatmap = {}
         for time_range in ["30d", "ytd"]:
-            rows = self.execute_query(
-                self.generate_heatmap_period_query(time_range, country_filter)
+            rows = grouped[time_range]
+            if country_filter:
+                rows = [r for r in rows if r["country"] == country_filter]
+            else:
+                # The original all-region query groups by rounded coordinates
+                # across all countries, so merge rows sharing a rounded
+                # latitude/longitude.
+                merged = {}
+                for row in rows:
+                    key = (row["latitude"], row["longitude"])
+                    merged[key] = merged.get(key, 0) + (row["count"] or 0)
+                rows = [
+                    {"latitude": lat, "longitude": lon, "count": count}
+                    for (lat, lon), count in merged.items()
+                ]
+            rows = sorted(
+                rows,
+                key=lambda r: (-(r["count"] or 0), r["latitude"], r["longitude"]),
             )
             heatmap[time_range] = [
                 {
@@ -768,6 +789,43 @@ class DataGenerator:
                 for row in rows
             ]
         return heatmap
+
+    def _heatmap_grouped_query(self, time_range: str) -> str:
+        """Return the grouped heatmap query covering all countries at once."""
+        if time_range == "30d":
+            date_filter = "l.visited::date >= CURRENT_DATE - INTERVAL '30 day'"
+        elif time_range == "ytd":
+            date_filter = (
+                "l.visited::date >= date_trunc('year', CURRENT_DATE)::date "
+                "AND l.visited::date <= CURRENT_DATE"
+            )
+        else:
+            raise ValueError(f"Unknown heatmap time range: {time_range}")
+
+        return f"""
+        SELECT
+          c.country AS country,
+          ROUND(c.latitude::numeric, 2)::float8 AS latitude,
+          ROUND(c.longitude::numeric, 2)::float8 AS longitude,
+          COUNT(*)::int AS count
+        FROM logs l
+        JOIN caches c ON c.code = l.gc_code
+        WHERE {EXCLUDE_CACHE_JOIN}
+          AND c.latitude IS NOT NULL
+          AND c.longitude IS NOT NULL
+          AND l.visited IS NOT NULL
+          AND {date_filter}
+        GROUP BY 1, 2, 3;
+        """
+
+    def _load_heatmap(self) -> Dict[str, List[Dict]]:
+        """Load grouped heatmap rows once per run."""
+        if self._heatmap_cache is None:
+            self._heatmap_cache = {
+                trange: self.execute_query(self._heatmap_grouped_query(trange))
+                for trange in ("30d", "ytd")
+            }
+        return self._heatmap_cache
 
     def generate_dt_top_caches_query(
         self,
@@ -977,6 +1035,348 @@ class DataGenerator:
             prev_score = score
 
         return ranks
+
+    # ------------------------------------------------------------------
+    # Grouped ranking queries (merged supersets of the per-region queries)
+    # ------------------------------------------------------------------
+
+    def _player_grouped_sql(
+        self,
+        ranking_type: str,
+        time_range: str,
+        previous: bool,
+        is_city_ranking: bool,
+    ) -> str:
+        """Return one query covering all countries for a player ranking."""
+        date_col = "c.placed_date" if ranking_type == "hides" else "l.visited"
+        date_condition = self.generate_ranking_stats_date_condition(
+            time_range,
+            date_col,
+            previous=previous,
+        )
+        cache_join_condition = self.generate_ranking_cache_condition(time_range, join_clause=True)
+        cache_where_condition = self.generate_ranking_cache_condition(time_range, join_clause=False)
+
+        if is_city_ranking:
+            city_where = f"WHERE {CITY_NAME_WHERE}"
+            city_group = f"GROUP BY {CITY_NAME_EXPR}, c.country"
+        else:
+            city_where = "WHERE"
+            city_group = ""
+
+        if ranking_type == "hides":
+            if is_city_ranking:
+                return f"""
+                SELECT {CITY_NAME_EXPR} AS name, c.country AS subtitle, COUNT(*)::int AS score
+                FROM caches c
+                {city_where}
+                  AND {date_condition}
+                  AND {cache_where_condition}
+                {city_group};
+                """
+            return f"""
+            SELECT c.owner_username AS name, c.country AS country, COUNT(*)::int AS score
+            FROM caches c
+            WHERE {OWNER_USERNAME_FILTER}
+              AND {date_condition}
+              AND {cache_where_condition}
+            GROUP BY c.owner_username, c.country;
+            """
+
+        if ranking_type == "finds":
+            if is_city_ranking:
+                return f"""
+                SELECT {CITY_NAME_EXPR} AS name, c.country AS subtitle, COUNT(*)::int AS score
+                FROM logs l
+                JOIN caches c ON c.code = l.gc_code
+                {city_where}
+                  AND {date_condition}
+                  AND {cache_join_condition}
+                  AND l.log_type != 'deleted'
+                {city_group};
+                """
+            return f"""
+            SELECT l.user_name AS name, c.country AS country,
+                   COUNT(DISTINCT l.gc_code)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND {date_condition}
+              AND {cache_join_condition}
+              AND l.log_type != 'deleted'
+            GROUP BY l.user_name, c.country;
+            """
+
+        if ranking_type == "ftf":
+            if is_city_ranking:
+                raise ValueError("FTF ranking is only supported for player rankings")
+            return f"""
+            SELECT l.user_name AS name, c.country AS country, COUNT(*)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND l.is_ftf IS TRUE
+              AND {date_condition}
+              AND {cache_join_condition}
+              AND l.log_type != 'deleted'
+            GROUP BY l.user_name, c.country;
+            """
+
+        if ranking_type not in ("favorites", "logs"):
+            raise ValueError(f"Unknown ranking type: {ranking_type}")
+
+        if is_city_ranking:
+            favorite_join = (
+                "AND l.favorite_point_used IS TRUE"
+                if ranking_type == "favorites"
+                else ""
+            )
+            return f"""
+            SELECT {CITY_NAME_EXPR} AS name, c.country AS subtitle, COUNT(*)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            {city_where}
+              {favorite_join}
+              AND {date_condition}
+              AND {cache_join_condition}
+              AND l.log_type != 'deleted'
+            {city_group};
+            """
+        if ranking_type == "favorites":
+            return f"""
+            SELECT c.owner_username AS name, c.country AS country, COUNT(l.*)::int AS score
+            FROM caches c
+            JOIN logs l ON l.gc_code = c.code
+            WHERE {OWNER_USERNAME_FILTER}
+              AND l.favorite_point_used IS TRUE
+              AND {date_condition}
+              AND {cache_join_condition}
+              AND l.log_type != 'deleted'
+            GROUP BY c.owner_username, c.country;
+            """
+        return f"""
+        SELECT c.owner_username AS name, c.country AS country, COUNT(l.*)::int AS score
+        FROM caches c
+        JOIN logs l ON l.gc_code = c.code
+        WHERE {OWNER_USERNAME_FILTER}
+          AND l.user_name IS NOT NULL
+          AND LOWER(l.user_name) <> LOWER(c.owner_username)
+          AND {date_condition}
+          AND {cache_join_condition}
+          AND l.log_type != 'deleted'
+        GROUP BY c.owner_username, c.country;
+        """
+
+    def _cache_grouped_sql(
+        self,
+        ranking_type: str,
+        time_range: str,
+        previous: bool,
+    ) -> str:
+        """Return one query covering all countries and cache types."""
+        date_condition = self.generate_ranking_stats_date_condition(
+            time_range,
+            "l.visited",
+            previous=previous,
+        )
+        cache_condition = self.generate_ranking_cache_condition(time_range, join_clause=True)
+        favorite_condition = (
+            "AND l.favorite_point_used IS TRUE"
+            if ranking_type == "favorites"
+            else ""
+        )
+        return f"""
+        SELECT
+          c.code,
+          c.name,
+          c.owner_username AS owner,
+          c.geocache_type AS geocache_type,
+          c.country AS country,
+          COUNT(l.*)::int AS score
+        FROM caches c
+        JOIN logs l ON l.gc_code = c.code
+        WHERE {CACHE_RANKING_ENTRY_FILTER}
+          {favorite_condition}
+          AND {date_condition}
+          AND {cache_condition}
+          AND l.log_type != 'deleted'
+        GROUP BY c.code, c.name, c.owner_username, c.geocache_type, c.country;
+        """
+
+    def _newbie_grouped_sql(self, ranking_type: str, previous: bool) -> str:
+        """Return one query covering all countries for a newbie ranking."""
+        registration_filter = (
+            PREVIOUS_NEWBIE_REGISTRATION_FILTER
+            if previous
+            else NEWBIE_REGISTRATION_FILTER
+        )
+        if ranking_type == "finds":
+            return f"""
+            SELECT l.user_name AS name, c.country AS country,
+                   COUNT(DISTINCT l.gc_code)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(l.user_name))
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND {registration_filter}
+              AND {EXCLUDE_CACHE_JOIN}
+              AND l.log_type != 'deleted'
+            GROUP BY l.user_name, c.country;
+            """
+        if ranking_type == "hides":
+            return f"""
+            SELECT c.owner_username AS name, c.country AS country, COUNT(*)::int AS score
+            FROM caches c
+            JOIN "user" u ON LOWER(u.user_name) = LOWER(TRIM(c.owner_username))
+            WHERE {OWNER_USERNAME_FILTER}
+              AND {registration_filter}
+              AND {EXCLUDE_CACHE_WHERE}
+            GROUP BY c.owner_username, c.country;
+            """
+        raise ValueError(f"Unknown newbie ranking type: {ranking_type}")
+
+    def _event_grouped_sql(self, ranking_type: str, previous_year: bool) -> str:
+        """Return one query covering all countries for an event ranking."""
+        if ranking_type == "hosts":
+            date_condition = (
+                "AND c.placed_date < date_trunc('year', CURRENT_DATE)::date"
+                if previous_year
+                else ""
+            )
+            return f"""
+            SELECT c.owner_username AS name, c.country AS country,
+                   COUNT(DISTINCT c.code)::int AS score
+            FROM caches c
+            WHERE {OWNER_USERNAME_FILTER}
+              AND {EVENT_CACHE_WHERE}
+              {date_condition}
+            GROUP BY c.owner_username, c.country;
+            """
+        if ranking_type == "participants":
+            date_condition = (
+                "AND l.visited < date_trunc('year', CURRENT_DATE)::date"
+                if previous_year
+                else ""
+            )
+            return f"""
+            SELECT l.user_name AS name, c.country AS country,
+                   COUNT(DISTINCT l.gc_code)::int AS score
+            FROM logs l
+            JOIN caches c ON c.code = l.gc_code
+            WHERE l.user_name IS NOT NULL AND l.user_name <> ''
+              AND l.log_type = 'Attended'
+              AND l.log_type != 'deleted'
+              AND {EVENT_CACHE_JOIN}
+              {date_condition}
+            GROUP BY l.user_name, c.country;
+            """
+        raise ValueError(f"Unknown event ranking type: {ranking_type}")
+
+    def _grouped_rows(self, family: str, *key_parts) -> List[Dict]:
+        """Load and cache grouped rows for a ranking family key."""
+        key = (family,) + tuple(key_parts)
+        if key not in self._grouped_cache:
+            family_name = key[0]
+            if family_name == "player":
+                _, ranking_type, time_range, previous, is_city = key
+                sql = self._player_grouped_sql(
+                    ranking_type, time_range, previous, is_city
+                )
+            elif family_name == "cache":
+                _, ranking_type, time_range, previous = key
+                sql = self._cache_grouped_sql(ranking_type, time_range, previous)
+            elif family_name == "newbie":
+                _, ranking_type, previous = key
+                sql = self._newbie_grouped_sql(ranking_type, previous)
+            elif family_name == "event":
+                _, ranking_type, previous_year = key
+                sql = self._event_grouped_sql(ranking_type, previous_year)
+            else:
+                raise ValueError(f"Unknown grouped family: {family_name}")
+            self._grouped_cache[key] = self.execute_query(sql)
+        return self._grouped_cache[key]
+
+    @staticmethod
+    def _partition_rows(rows: List[Dict], country_filter: Optional[str]) -> List[Dict]:
+        """Keep only rows matching the region, or all rows for the all region."""
+        if country_filter is None:
+            return rows
+        return [
+            r
+            for r in rows
+            if r.get("country") == country_filter or r.get("subtitle") == country_filter
+        ]
+
+    @staticmethod
+    def _merge_all_rows(rows: List[Dict], name_field: str = "name") -> List[Dict]:
+        """Merge per-country rows into global rows for the all region."""
+        merged = {}
+        for row in rows:
+            name = row[name_field]
+            if name is None:
+                continue
+            if name in merged:
+                merged[name]["score"] = (merged[name]["score"] or 0) + (row["score"] or 0)
+            else:
+                merged[name] = dict(row)
+        return list(merged.values())
+
+    @staticmethod
+    def _sort_rows(rows: List[Dict], name_field: str = "name") -> List[Dict]:
+        """Sort rows with the same key order the original SQL used."""
+        return sorted(rows, key=lambda r: (-(r["score"] or 0), r[name_field]))
+
+    @staticmethod
+    def _score_filtered(rows: List[Dict]) -> List[Dict]:
+        return [r for r in rows if (r["score"] or 0) > 0]
+
+    def _player_rows(
+        self,
+        ranking_type: str,
+        time_range: str,
+        previous: bool,
+        is_city_ranking: bool,
+        country_filter: Optional[str],
+    ) -> List[Dict]:
+        rows = self._grouped_rows(
+            "player", ranking_type, time_range, previous, is_city_ranking
+        )
+        rows = self._partition_rows(rows, country_filter)
+        if country_filter is None and not is_city_ranking:
+            rows = self._merge_all_rows(rows)
+        return rows
+
+    def _cache_rows(
+        self,
+        ranking_type: str,
+        time_range: str,
+        previous: bool,
+        country_filter: Optional[str],
+        cache_type_filter: Optional[int],
+    ) -> List[Dict]:
+        rows = self._grouped_rows("cache", ranking_type, time_range, previous)
+        rows = self._partition_rows(rows, country_filter)
+        if cache_type_filter is not None:
+            rows = [r for r in rows if r.get("geocache_type") == cache_type_filter]
+        return rows
+
+    def _newbie_rows(
+        self, ranking_type: str, previous: bool, country_filter: Optional[str]
+    ) -> List[Dict]:
+        rows = self._grouped_rows("newbie", ranking_type, previous)
+        rows = self._partition_rows(rows, country_filter)
+        if country_filter is None:
+            rows = self._merge_all_rows(rows)
+        return rows
+
+    def _event_rows(
+        self, ranking_type: str, previous_year: bool, country_filter: Optional[str]
+    ) -> List[Dict]:
+        rows = self._grouped_rows("event", ranking_type, previous_year)
+        rows = self._partition_rows(rows, country_filter)
+        if country_filter is None:
+            rows = self._merge_all_rows(rows)
+        return rows
 
     def generate_ranking_stats_date_condition(
         self,
@@ -1517,63 +1917,45 @@ class DataGenerator:
             rankings[rtype] = {}
             for trange in time_ranges:
                 logger.debug(f"Generating {rtype}/{trange} ranking...")
-                
-                # Get current period rankings (fetch more to handle ties at the boundary)
-                query = self.generate_ranking_query(
-                    rtype,
-                    trange,
-                    is_city_ranking,
-                    limit=limit * 2,
-                    country_filter=country_filter,
+
+                results = self._player_rows(
+                    rtype, trange, False, is_city_ranking, country_filter
                 )
-                results = self.execute_query(query)
+                results = self._sort_rows(results)
+                results = self._score_filtered(results)[: limit * 2]
 
-                # Filter out zero-score entries
-                results = [r for r in results if (r["score"] or 0) > 0]
-
-                # Get previous period rankings once (not per-entry!)
                 prev_ranks = {}
                 try:
-                    prev_query = self.generate_previous_period_query(
-                        rtype,
-                        trange,
-                        is_city_ranking,
-                        country_filter=country_filter,
+                    prev_results = self._player_rows(
+                        rtype, trange, True, is_city_ranking, country_filter
                     )
-                    prev_results = self.execute_query(prev_query)
-                    prev_results = [r for r in prev_results if (r["score"] or 0) > 0]
+                    prev_results = self._sort_rows(prev_results)
+                    prev_results = self._score_filtered(prev_results)
                     prev_ranks = self.build_rank_lookup(prev_results)
                     logger.debug(f"  Got {len(prev_results)} previous period entries for {rtype}/{trange}")
                 except Exception as e:
                     logger.warning(f"Failed to get previous period data for {rtype}/{trange}: {e}")
 
-                # Calculate tied ranks and apply display limit rules
                 ranked_results = []
-                display_rank = 0  # The actual displayed rank number
+                display_rank = 0
                 prev_score = None
-                
+
                 for i, row in enumerate(results):
                     score = row["score"] or 0
-                    
-                    # Calculate display rank with tie handling
+
                     if i == 0 or score != prev_score:
-                        # New score group: advance display rank
                         display_rank = i + 1
-                    # If same score as previous: keep same display_rank (ties)
-                    
-                    # Check if we should include this entry
-                    # Rule: Always include if within limit, OR if tied with last included entry
+
                     should_include = len(ranked_results) < limit
-                    
+
                     if not should_include and ranked_results:
-                        # Check if this entry is tied with the last included entry
                         last_included_score = ranked_results[-1]["score"]
                         if score == last_included_score:
                             should_include = True
-                    
+
                     if should_include:
                         entry = {
-                            "rank": display_rank,  # Tied rank number
+                            "rank": display_rank,
                             "name": row["name"],
                             "score": score,
                         }
@@ -1583,14 +1965,13 @@ class DataGenerator:
                                 entry["name"], row.get("subtitle", "")
                             )
 
-                        # Calculate trend based on rank difference
-                        previous_rank = prev_ranks.get(entry["name"], 0)  # 0 means not in previous rankings
+                        previous_rank = prev_ranks.get(entry["name"], 0)
                         trend, trend_delta = self.calculate_trend(display_rank, previous_rank)
                         entry["trend"] = trend
                         entry["trendDelta"] = trend_delta
 
                         ranked_results.append(entry)
-                    
+
                     prev_score = score
 
                 logger.debug(f"  Returning {len(ranked_results)} entries for {rtype}/{trange} (limit={limit})")
@@ -1610,23 +1991,14 @@ class DataGenerator:
         for rtype in ranking_types:
             stats[rtype] = {}
             for trange in time_ranges:
-                current_query = self.generate_ranking_count_query(
-                    rtype,
-                    trange,
-                    country_filter=country_filter,
+                current = self._player_rows(
+                    rtype, trange, False, False, country_filter
                 )
-                previous_query = self.generate_ranking_count_query(
-                    rtype,
-                    trange,
-                    previous=True,
-                    country_filter=country_filter,
+                previous = self._player_rows(
+                    rtype, trange, True, False, country_filter
                 )
-
-                current_result = self.execute_query(current_query)
-                previous_result = self.execute_query(previous_query)
-
-                player_count = current_result[0]["player_count"] if current_result else 0
-                previous_count = previous_result[0]["player_count"] if previous_result else 0
+                player_count = len(self._score_filtered(current))
+                previous_count = len(self._score_filtered(previous))
 
                 growth_pct = 0
                 if previous_count > 0:
@@ -1808,13 +2180,10 @@ class DataGenerator:
         """Generate newbie rankings without time-range dimensions."""
         rankings = {}
         for ranking_type in ["finds", "hides"]:
-            query = self.generate_newbie_ranking_query(
-                ranking_type,
-                limit=limit * 2,
-                country_filter=country_filter,
-            )
-            results = self.execute_query(query)
-            rankings[ranking_type] = self.format_ranked_rows_without_trend_period(results, limit)
+            rows = self._newbie_rows(ranking_type, False, country_filter)
+            rows = self._sort_rows(rows)
+            rows = self._score_filtered(rows)[: limit * 2]
+            rankings[ranking_type] = self.format_ranked_rows_without_trend_period(rows, limit)
         return rankings
 
     def generate_newbie_ranking_stats(
@@ -1824,19 +2193,10 @@ class DataGenerator:
         """Generate newbie player counts and growth versus the previous registration year."""
         stats = {}
         for ranking_type in ["finds", "hides"]:
-            current_query = self.generate_newbie_ranking_count_query(
-                ranking_type,
-                country_filter=country_filter,
-            )
-            previous_query = self.generate_newbie_ranking_count_query(
-                ranking_type,
-                country_filter=country_filter,
-                previous=True,
-            )
-            current_result = self.execute_query(current_query)
-            previous_result = self.execute_query(previous_query)
-            player_count = current_result[0]["player_count"] if current_result else 0
-            previous_count = previous_result[0]["player_count"] if previous_result else 0
+            current = self._newbie_rows(ranking_type, False, country_filter)
+            previous = self._newbie_rows(ranking_type, True, country_filter)
+            player_count = len(self._score_filtered(current))
+            previous_count = len(self._score_filtered(previous))
             growth_pct = None
             if previous_count > 0:
                 growth_pct = round((player_count - previous_count) / previous_count * 100, 1)
@@ -2008,21 +2368,12 @@ class DataGenerator:
         """Generate event rankings without time-range dimensions."""
         rankings = {}
         for ranking_type in ["hosts", "participants"]:
-            current_rows = self.execute_query(
-                self.generate_event_ranking_query(
-                    ranking_type,
-                    limit=limit * 2,
-                    country_filter=country_filter,
-                )
-            )
-            previous_rows = self.execute_query(
-                self.generate_event_ranking_query(
-                    ranking_type,
-                    limit=999999,
-                    country_filter=country_filter,
-                    previous_year=True,
-                )
-            )
+            current_rows = self._event_rows(ranking_type, False, country_filter)
+            current_rows = self._sort_rows(current_rows)
+            current_rows = self._score_filtered(current_rows)[: limit * 2]
+            previous_rows = self._event_rows(ranking_type, True, country_filter)
+            previous_rows = self._sort_rows(previous_rows)
+            previous_rows = self._score_filtered(previous_rows)
             rankings[ranking_type] = self.format_ranked_rows_with_previous_period(
                 current_rows,
                 previous_rows,
@@ -2037,21 +2388,10 @@ class DataGenerator:
         """Generate event player counts and growth versus cumulative counts before this year."""
         stats = {}
         for ranking_type in ["hosts", "participants"]:
-            current_result = self.execute_query(
-                self.generate_event_ranking_count_query(
-                    ranking_type,
-                    country_filter=country_filter,
-                )
-            )
-            previous_result = self.execute_query(
-                self.generate_event_ranking_count_query(
-                    ranking_type,
-                    country_filter=country_filter,
-                    previous_year=True,
-                )
-            )
-            player_count = current_result[0]["player_count"] if current_result else 0
-            previous_count = previous_result[0]["player_count"] if previous_result else 0
+            current = self._event_rows(ranking_type, False, country_filter)
+            previous = self._event_rows(ranking_type, True, country_filter)
+            player_count = len(self._score_filtered(current))
+            previous_count = len(self._score_filtered(previous))
             growth_pct = None
             if previous_count > 0:
                 growth_pct = round((player_count - previous_count) / previous_count * 100, 1)
@@ -2351,27 +2691,19 @@ class DataGenerator:
             for trange in time_ranges:
                 logger.debug(f"Generating cache {rtype}/{trange} ranking...")
 
-                query = self.generate_cache_ranking_query(
-                    rtype,
-                    trange,
-                    limit=limit * 2,
-                    country_filter=country_filter,
-                    cache_type_filter=cache_type_filter,
+                results = self._cache_rows(
+                    rtype, trange, False, country_filter, cache_type_filter
                 )
-                results = self.execute_query(query)
-                results = [r for r in results if (r["score"] or 0) > 0]
+                results = self._sort_rows(results, name_field="code")
+                results = self._score_filtered(results)[: limit * 2]
 
                 prev_ranks = {}
                 try:
-                    prev_query = self.generate_cache_ranking_query(
-                        rtype,
-                        trange,
-                        previous=True,
-                        country_filter=country_filter,
-                        cache_type_filter=cache_type_filter,
+                    prev_results = self._cache_rows(
+                        rtype, trange, True, country_filter, cache_type_filter
                     )
-                    prev_results = self.execute_query(prev_query)
-                    prev_results = [r for r in prev_results if (r["score"] or 0) > 0]
+                    prev_results = self._sort_rows(prev_results, name_field="code")
+                    prev_results = self._score_filtered(prev_results)
                     prev_ranks = self.build_rank_lookup(prev_results, key_field="code")
                     logger.debug(
                         f"  Got {len(prev_results)} previous period cache entries for {rtype}/{trange}"
@@ -2429,25 +2761,14 @@ class DataGenerator:
         for rtype in ranking_types:
             stats[rtype] = {}
             for trange in time_ranges:
-                current_query = self.generate_cache_ranking_count_query(
-                    rtype,
-                    trange,
-                    country_filter=country_filter,
-                    cache_type_filter=cache_type_filter,
+                current = self._cache_rows(
+                    rtype, trange, False, country_filter, cache_type_filter
                 )
-                previous_query = self.generate_cache_ranking_count_query(
-                    rtype,
-                    trange,
-                    previous=True,
-                    country_filter=country_filter,
-                    cache_type_filter=cache_type_filter,
+                previous = self._cache_rows(
+                    rtype, trange, True, country_filter, cache_type_filter
                 )
-
-                current_result = self.execute_query(current_query)
-                previous_result = self.execute_query(previous_query)
-
-                cache_count = current_result[0]["player_count"] if current_result else 0
-                previous_count = previous_result[0]["player_count"] if previous_result else 0
+                cache_count = len(self._score_filtered(current))
+                previous_count = len(self._score_filtered(previous))
 
                 growth_pct = None
                 if previous_count > 0:
@@ -2737,40 +3058,225 @@ class DataGenerator:
     def generate_city_details(self, rankings_data: Dict) -> Dict:
         """Generate city details data for cities in rankings."""
         logger.info("Generating city details...")
-        
+
         city_details = {}
-        
+
         # Collect all unique city names from rankings
         city_names = set()
         for rtype in rankings_data.values():
             for time_range_data in rtype.values():
                 for entry in time_range_data:
                     city_names.add(entry["name"])
-        
+
         logger.debug(f"Found {len(city_names)} unique cities to generate details for")
-        
-        # Generate details for each city
-        for city_name in city_names:
-            try:
-                cache_trend = self.generate_cache_trend(city_filter=city_name)
-                dt_matrix = self.generate_dt_matrix(
-                    country_filter=None,
-                    city_filter=city_name,
-                    include_top_caches=True,
-                )
-                
-                city_details[city_name] = {
-                    "cacheTrend": cache_trend,
-                    "dtMatrix": dt_matrix,
+
+        if not city_names:
+            return {}
+
+        monthly_sql, yearly_sql = self._batched_city_trend_queries()
+        monthly_rows = self.execute_query(monthly_sql)
+        yearly_rows = self.execute_query(yearly_sql)
+        dt_counts_sql, dt_top_sql = self._batched_city_dt_queries()
+        dt_counts = self.execute_query(dt_counts_sql)
+        dt_top = self.execute_query(dt_top_sql)
+
+        monthly_by_city = {}
+        for row in monthly_rows:
+            monthly_by_city.setdefault(row["city"], []).append(
+                {
+                    "label": row["label"],
+                    "count": row["count"] or 0,
+                    "archived": row["archived"] or 0,
                 }
-                
-                logger.debug(f"  Generated details for {city_name}")
-            
-            except Exception as e:
-                logger.warning(f"Failed to generate details for {city_name}: {e}")
-                continue
-        
+            )
+        yearly_by_city = {}
+        for row in yearly_rows:
+            yearly_by_city.setdefault(row["city"], []).append(
+                {
+                    "label": row["label"],
+                    "count": row["count"] or 0,
+                    "archived": row["archived"] or 0,
+                }
+            )
+
+        dt_counts_by_city = {}
+        for row in dt_counts:
+            dt_counts_by_city.setdefault(row["city"], {})[
+                (row["difficulty"], row["terrain"])
+            ] = row["count"] or 0
+        dt_top_by_city = {}
+        for row in dt_top:
+            dt_top_by_city.setdefault(row["city"], {}).setdefault(
+                (row["difficulty"], row["terrain"]), []
+            ).append(
+                {
+                    "code": row["code"],
+                    "name": row["name"],
+                    "owner": row["owner"] or "",
+                    "favoritePoints": row["favorite_points"] or 0,
+                }
+            )
+
+        for city_name in city_names:
+            monthly = monthly_by_city.get(city_name, [])
+            yearly = yearly_by_city.get(city_name, [])
+
+            avg_growth_pct = 0
+            if len(yearly) >= 2:
+                first_count = yearly[0]["count"] + yearly[0]["archived"]
+                last_count = yearly[-1]["count"] + yearly[-1]["archived"]
+                years_span = len(yearly) - 1
+                if first_count > 0:
+                    avg_growth = (
+                        (last_count / first_count) ** (1 / years_span) - 1
+                    ) * 100
+                    avg_growth_pct = round(avg_growth, 1)
+
+            cache_trend = {
+                "averageGrowthPct": avg_growth_pct,
+                "monthly": monthly,
+                "yearly": yearly,
+            }
+
+            counts = dt_counts_by_city.get(city_name, {})
+            top = dt_top_by_city.get(city_name, {})
+            matrix = []
+            for i, d in enumerate(DT_VALUES):
+                for j, t in enumerate(DT_VALUES):
+                    cell = {
+                        "row": i,
+                        "col": j,
+                        "difficulty": d,
+                        "terrain": t,
+                        "count": counts.get((d, t), 0),
+                    }
+                    cell_top_caches = top.get((d, t))
+                    if cell_top_caches:
+                        cell["topCaches"] = cell_top_caches
+                    matrix.append(cell)
+
+            city_details[city_name] = {
+                "cacheTrend": cache_trend,
+                "dtMatrix": matrix,
+            }
+
+            logger.debug(f"  Generated details for {city_name}")
+
         return city_details
+
+    def _batched_city_trend_queries(self) -> Tuple[str, str]:
+        """Return monthly and yearly cache-trend queries for all cities."""
+        monthly_sql = f"""
+        WITH months AS (
+          SELECT generate_series(
+            date_trunc('month', CURRENT_DATE - INTERVAL '9 month'),
+            date_trunc('month', CURRENT_DATE),
+            INTERVAL '1 month'
+          ) AS month_start
+        ),
+        counts AS (
+          SELECT {CITY_NAME_EXPR} AS city,
+                 date_trunc('month', c.placed_date)::date AS month,
+                 COUNT(*) FILTER (WHERE c.cache_status != 2)::int AS count,
+                 COUNT(*) FILTER (WHERE c.cache_status = 2)::int AS archived
+          FROM caches c
+          WHERE {EXCLUDE_CACHE_WHERE}
+            AND c.placed_date IS NOT NULL
+            AND c.placed_date >= date_trunc('month', CURRENT_DATE - INTERVAL '9 month')
+          GROUP BY 1, 2
+        )
+        SELECT
+          cities.city AS city,
+          TO_CHAR(months.month_start, 'YYYY-MM') AS label,
+          COALESCE(counts.count, 0)::int AS count,
+          COALESCE(counts.archived, 0)::int AS archived
+        FROM months
+        CROSS JOIN (
+          SELECT DISTINCT {CITY_NAME_EXPR} AS city
+          FROM caches c
+          WHERE {EXCLUDE_CACHE_WHERE}
+        ) cities
+        LEFT JOIN counts
+          ON counts.city = cities.city AND counts.month = months.month_start::date
+        ORDER BY cities.city, months.month_start;
+        """
+
+        yearly_sql = f"""
+        WITH years AS (
+          SELECT generate_series(
+            EXTRACT(YEAR FROM CURRENT_DATE)::int - 9,
+            EXTRACT(YEAR FROM CURRENT_DATE)::int
+          ) AS year
+        ),
+        counts AS (
+          SELECT {CITY_NAME_EXPR} AS city,
+                 EXTRACT(YEAR FROM placed_date)::int AS year,
+                 COUNT(*) FILTER (WHERE c.cache_status != 2)::int AS count,
+                 COUNT(*) FILTER (WHERE c.cache_status = 2)::int AS archived
+          FROM caches c
+          WHERE {EXCLUDE_CACHE_WHERE}
+            AND c.placed_date IS NOT NULL
+            AND EXTRACT(YEAR FROM placed_date)::int
+              >= EXTRACT(YEAR FROM CURRENT_DATE)::int - 9
+          GROUP BY 1, 2
+        )
+        SELECT
+          cities.city AS city,
+          years.year::text AS label,
+          COALESCE(counts.count, 0)::int AS count,
+          COALESCE(counts.archived, 0)::int AS archived
+        FROM years
+        CROSS JOIN (
+          SELECT DISTINCT {CITY_NAME_EXPR} AS city
+          FROM caches c
+          WHERE {EXCLUDE_CACHE_WHERE}
+        ) cities
+        LEFT JOIN counts
+          ON counts.city = cities.city AND counts.year = years.year
+        ORDER BY cities.city, years.year;
+        """
+        return monthly_sql, yearly_sql
+
+    def _batched_city_dt_queries(self) -> Tuple[str, str]:
+        """Return DT matrix count and top-cache queries for all cities."""
+        dt_values = ",".join(map(str, DT_VALUES))
+        counts_sql = f"""
+        SELECT
+          {CITY_NAME_EXPR} AS city,
+          c.difficulty::float8 AS difficulty,
+          c.terrain::float8 AS terrain,
+          COUNT(*)::int AS count
+        FROM caches c
+        WHERE {ACTIVE_CACHE_WHERE}
+          AND c.difficulty IN ({dt_values})
+          AND c.terrain IN ({dt_values})
+        GROUP BY 1, 2, 3;
+        """
+
+        top_sql = f"""
+        SELECT city, difficulty, terrain, code, name, owner, favorite_points
+        FROM (
+          SELECT
+            {CITY_NAME_EXPR} AS city,
+            c.difficulty::float8 AS difficulty,
+            c.terrain::float8 AS terrain,
+            c.code AS code,
+            c.name AS name,
+            c.owner_username AS owner,
+            COALESCE(c.favorite_points, 0)::int AS favorite_points,
+            ROW_NUMBER() OVER (
+              PARTITION BY {CITY_NAME_EXPR}, c.difficulty, c.terrain
+              ORDER BY COALESCE(c.favorite_points, 0) DESC, c.code ASC
+            ) AS rn
+          FROM caches c
+          WHERE {ACTIVE_CACHE_WHERE}
+            AND c.difficulty IN ({dt_values})
+            AND c.terrain IN ({dt_values})
+        ) ranked
+        WHERE rn <= 5
+        ORDER BY city, difficulty, terrain, favorite_points DESC, code ASC;
+        """
+        return counts_sql, top_sql
 
     def generate_city_rankings_json(self) -> Dict:
         """Generate complete city-rankings.json data."""

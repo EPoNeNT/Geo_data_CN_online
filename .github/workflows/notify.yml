@@ -3,7 +3,12 @@ name: Notify Series Requests
 on:
   schedule:
     - cron: "0 */4 * * *"  # 每4小时整点
-  workflow_dispatch:      # 也可手动触发
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: '审核完成后需发送邮件的申请 ID；留空则发送管理员待处理通知'
+        required: false
+        type: string
 
 jobs:
   notify:
@@ -24,4 +29,9 @@ jobs:
           NOTIFY_SENDER: ${{ secrets.NOTIFY_SENDER }}
           NOTIFY_PASSWORD: ${{ secrets.NOTIFY_PASSWORD }}
           NOTIFY_RECEIVER: ${{ secrets.NOTIFY_RECEIVER }}
-        run: python notify_series_requests.py
+        run: |
+          if [ -n "${{ inputs.request_id }}" ]; then
+            python notify_series_requests.py --decision-request-id "${{ inputs.request_id }}"
+          else
+            python notify_series_requests.py
+          fi

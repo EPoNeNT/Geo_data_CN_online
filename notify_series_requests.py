@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Check for unnotified series change requests and send email notification."""
+"""Send administrator and applicant notifications for series change requests."""
 
+import argparse
 import os
 import smtplib
 from email.message import EmailMessage
@@ -46,6 +47,52 @@ def mark_notified(conn, ids: list[int]) -> None:
     conn.commit()
 
 
+def ensure_decision_notification_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            ALTER TABLE series_change_requests
+            ADD COLUMN IF NOT EXISTS decision_notified_at TIMESTAMPTZ NULL
+            """
+        )
+    conn.commit()
+
+
+def get_pending_decision_notification(conn, request_id: int) -> dict | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, status, contact_email, target_series, target_city,
+                   proposed_series, proposed_city, review_note
+            FROM series_change_requests
+            WHERE id = %s
+              AND status IN ('applied', 'rejected')
+              AND NULLIF(TRIM(contact_email), '') IS NOT NULL
+              AND decision_notified_at IS NULL
+            """,
+            (request_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+
+def mark_decision_notified(conn, request_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE series_change_requests
+            SET decision_notified_at = NOW()
+            WHERE id = %s
+              AND decision_notified_at IS NULL
+            """,
+            (request_id,),
+        )
+    conn.commit()
+
+
 def build_email_body(requests: list[dict]) -> str:
     if not requests:
         return ""
@@ -64,8 +111,45 @@ def build_email_body(requests: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def build_decision_email_body(request: dict) -> str:
+    decision = "已通过" if request["status"] == "applied" else "未通过"
+    series_name = request["proposed_series"] or request["target_series"]
+    city = request["proposed_city"] or request["target_city"]
+    lines = [
+        "您好：",
+        "",
+        f"您提交的系列申请（编号 #{request['id']}）已审核{decision}。",
+        f"系列：{series_name}（{city}）",
+    ]
+    if request["status"] == "rejected" and request["review_note"]:
+        lines.append(f"审核说明：{request['review_note']}")
+    lines.extend(["", "此邮件由 Geodataing 系列审核后台自动发送，请勿直接回复。"])
+    return "\n".join(lines)
+
+
+def send_decision_email(request: dict) -> None:
+    decision = "已通过" if request["status"] == "applied" else "未通过"
+    message = EmailMessage()
+    message.set_content(build_decision_email_body(request))
+    message["Subject"] = f"[Geodataing] 系列申请{decision}"
+    message["From"] = SENDER
+    message["To"] = request["contact_email"]
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(SENDER, PASSWORD)
+        smtp.send_message(message)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--decision-request-id", type=int)
+    return parser.parse_args()
+
+
 def main():
     import time
+    args = parse_args()
+    if args.decision_request_id is not None and args.decision_request_id < 1:
+        raise ValueError("decision request id must be positive")
     last_error = None
     for attempt in range(3):
         try:
@@ -78,6 +162,17 @@ def main():
     else:
         raise last_error
     try:
+        if args.decision_request_id is not None:
+            ensure_decision_notification_schema(conn)
+            request = get_pending_decision_notification(conn, args.decision_request_id)
+            if request is None:
+                print(f"No decision notification to send for request {args.decision_request_id}")
+                return
+            send_decision_email(request)
+            mark_decision_notified(conn, request["id"])
+            print(f"Decision email sent for request {request['id']}")
+            return
+
         requests = get_unnotified_requests(conn)
         if not requests:
             print("No new requests to notify")

@@ -64,11 +64,16 @@ from crawl_logs import (  # noqa: E402
     PROFILES,
     AuthenticationError,
     DatabaseManager,
-    deduplicate_logs_by_cache_user,
+    SINGLETON_LOG_TYPES,
+    deduplicate_logs_by_log_id,
     fetch_logs_for_cache,
     get_logbook_token,
+    legacy_log_key,
+    legacy_log_matches,
+    log_date_sort_key,
     logger,
     normalize_log_date_for_compare,
+    select_storage_events,
 )
 
 
@@ -211,12 +216,31 @@ def summarize_changed_logs_by_cache(
     db: DatabaseManager,
     new_logs: List[dict],
 ) -> ChangedCacheSummary:
+    """Summarize the event-level writes that ``smart_upsert_logs`` will make."""
     if not new_logs:
         return {}
 
-    new_logs = deduplicate_logs_by_cache_user(new_logs)
+    new_logs = select_storage_events(deduplicate_logs_by_log_id(new_logs))
     gc_codes = list({log["GCCode"] for log in new_logs})
     existing_logs = db.get_existing_logs_for_caches(gc_codes)
+    existing_by_log_id = {
+        row["log_id"]: row
+        for row in existing_logs
+        if row.get("log_id") is not None
+    }
+    legacy_by_key: Dict[Tuple[str, str, str], List[dict]] = defaultdict(list)
+    singleton_by_key: Dict[Tuple[str, str, str], dict] = {}
+    for row in existing_logs:
+        key = legacy_log_key(row)
+        if not key:
+            continue
+        if row.get("log_id") is None:
+            legacy_by_key[key].append(row)
+        if key[2] in SINGLETON_LOG_TYPES:
+            current = singleton_by_key.get(key)
+            if current is None or log_date_sort_key(row["visited"]) > log_date_sort_key(current["visited"]):
+                singleton_by_key[key] = row
+
     summary: ChangedCacheSummary = defaultdict(
         lambda: {"raw": 0, "inserted": 0, "updated": 0, "details": []}
     )
@@ -224,16 +248,43 @@ def summarize_changed_logs_by_cache(
     for log in new_logs:
         gc_code = log["GCCode"]
         user_name = log["UserName"]
-        key = (gc_code, user_name)
+        key = legacy_log_key(log)
+        old_record = existing_by_log_id.get(log["LogID"])
+        action = None
+        reasons = []
 
-        if key not in existing_logs:
+        if old_record is not None:
+            if legacy_log_matches(old_record, log) and old_record.get("user_name") == user_name:
+                continue
+            action = "update"
+            reasons = ["event_fields_changed"]
+        else:
+            legacy_match = next(
+                (row for row in legacy_by_key.get(key, []) if legacy_log_matches(row, log)),
+                None,
+            )
+            if legacy_match is not None:
+                action = "update"
+                reasons = ["legacy_log_id_backfill"]
+            else:
+                singleton_row = singleton_by_key.get(key)
+                if singleton_row is not None:
+                    if log_date_sort_key(log["Visited"]) < log_date_sort_key(singleton_row["visited"]):
+                        continue
+                    action = "update"
+                    reasons = ["singleton_latest_event"]
+                else:
+                    action = "insert"
+                    reasons = ["missing"]
+
+        if action == "insert":
             summary[gc_code]["raw"] += 1
             summary[gc_code]["inserted"] += 1
             summary[gc_code]["details"].append(
                 {
                     "user": user_name,
-                    "action": "insert",
-                    "reasons": ["missing"],
+                    "action": action,
+                    "reasons": reasons,
                     "api": {
                         "visited": normalize_log_date_for_compare(log["Visited"]),
                         "favorite_point_used": bool(log.get("FavoritePointUsed", False)),
@@ -242,48 +293,14 @@ def summarize_changed_logs_by_cache(
                     },
                 }
             )
-            continue
-
-        old_record = existing_logs[key]
-        db_visited_str = normalize_log_date_for_compare(old_record["visited"])
-        api_visited_str = normalize_log_date_for_compare(log["Visited"])
-        api_record = {
-            "visited": api_visited_str,
-            "favorite_point_used": bool(log.get("FavoritePointUsed", False)),
-            "is_ftf": bool(log.get("IsFTF", False)),
-            "log_type": log.get("LogType", FOUND_LOG_TYPE),
-        }
-        db_record = {
-            "visited": db_visited_str,
-            "favorite_point_used": bool(old_record["favorite_point_used"]),
-            "is_ftf": bool(old_record["is_ftf"]),
-            "log_type": old_record.get("log_type") or FOUND_LOG_TYPE,
-            "duplicate_count": int(old_record.get("duplicate_count") or 1),
-        }
-        fields_match = (
-            db_record["visited"] == api_record["visited"]
-            and db_record["favorite_point_used"] == api_record["favorite_point_used"]
-            and db_record["is_ftf"] == api_record["is_ftf"]
-            and db_record["log_type"] == api_record["log_type"]
-        )
-
-        if not fields_match or db_record["duplicate_count"] > 1:
-            reasons = [
-                field
-                for field in ("visited", "favorite_point_used", "is_ftf", "log_type")
-                if db_record[field] != api_record[field]
-            ]
-            if db_record["duplicate_count"] > 1:
-                reasons.append("duplicate_count")
+        elif action == "update":
             summary[gc_code]["raw"] += 1
             summary[gc_code]["updated"] += 1
             summary[gc_code]["details"].append(
                 {
                     "user": user_name,
-                    "action": "update",
+                    "action": action,
                     "reasons": reasons,
-                    "db": db_record,
-                    "api": api_record,
                 }
             )
 

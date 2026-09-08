@@ -132,6 +132,10 @@ pip install -r requirements.txt
 python crawl_caches.py
 python assign_cities.py
 python crawl_logs.py
+# 一次性全量日志（含归档缓存）
+python crawl_logs.py --full
+# 每周补齐用：仅全部活跃缓存
+python crawl_logs.py --full-active
 python test/backfill_guids.py         # 回填 owner_guid 和 user_guid
 python crawl_user_regdates.py         # 爬取注册时间 + 首个找到的国家
 python generate_data.py
@@ -185,16 +189,18 @@ python test/fetch_first_find.py --limit 100
 
 支持：
 
-- 定时任务：每天 UTC 20:00 运行。
-- 手动运行：`mode=caches | logs | both | generate`。
+- 定时任务：每天 UTC 20:00 运行；每周日 UTC 22:00 对全部活跃缓存重爬日志。
+- 手动运行：`mode=caches | logs | logs-full | both | generate`。
 
 当前流程：
 
 - `caches`：运行 `crawl_caches.py`，然后运行 `assign_cities.py`。
 - `logs`：运行 `crawl_logs.py`。
+- `logs-full`：运行 `crawl_logs.py --full`，覆盖所有未删除缓存（含归档缓存）。
 - `both`：依次运行 cache 抓取、城市归属、日志抓取、用户注册时间补抓、静态数据生成。
 - `generate`：只生成静态数据。
-- 定时任务：运行完整链路，并包含 `crawl_user_regdates.py`。
+- 每日定时任务：运行完整链路，并包含 `crawl_user_regdates.py`。
+- 每周定时任务：同样运行完整链路；日志阶段改为 `--full-active`，补齐活跃缓存的所有日志类型。
 
 需要在 GitHub Secrets 中配置：
 

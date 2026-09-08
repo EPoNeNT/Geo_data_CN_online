@@ -3,11 +3,13 @@
 Geocache Logs 爬虫 - 适配 Neon 数据库
 基于 get_data.py 的逻辑重写
 """
+import argparse
 import logging
 import os
 import re
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -37,9 +39,10 @@ logger = setup_logging("crawl_logs.log")
 
 DATABASE_URL = require_env("DATABASE_URL")
 MAX_RETRIES = 3
-EVENT_CACHE_TYPES = {6, 13, 3653}
+MAX_LOGBOOK_PAGES = int(os.getenv("LOGBOOK_MAX_PAGES", "1000"))
 FOUND_LOG_TYPE = "Found it"
 ATTENDED_LOG_TYPE = "Attended"
+SINGLETON_LOG_TYPES = {FOUND_LOG_TYPE, ATTENDED_LOG_TYPE}
 FTF_MARKER_RE = re.compile(
     r"[\{\[\(\uFF08]\s*\*?\s*ftf\s*\*?\s*[\}\]\)\uFF09]",
     re.IGNORECASE,
@@ -94,39 +97,83 @@ def log_date_sort_key(value) -> str:
     return "0001-01-01"
 
 
-def deduplicate_logs_by_cache_user(logs: List[dict]) -> List[dict]:
-    """Keep only the latest visited date for each (GCCode, AccountGuid).
+def normalize_log_id(value) -> Optional[int]:
+    """Return a positive numeric LogID, or None when the API value is unusable."""
+    try:
+        log_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return log_id if log_id > 0 else None
 
-    When GUID is available it serves as the primary key (survives renames).
-    Falls back to (GCCode, UserName) for logs without a GUID.
-    """
-    deduped: Dict[Tuple[str, str], dict] = {}
 
+def deduplicate_logs_by_log_id(logs: List[dict]) -> List[dict]:
+    """Keep one copy of each API log event without collapsing distinct events."""
+    deduped: Dict[int, dict] = {}
     for log in logs:
-        gc_code = log.get("GCCode")
-        guid = log.get("AccountGuid")
-        user_name = log.get("UserName")
-        key = (gc_code, guid) if guid else (gc_code, user_name)
-        if not key[0] or not key[1]:
-            continue
-
-        existing = deduped.get(key)
-        if existing is None:
-            deduped[key] = log
-            continue
-
-        current_date = log_date_sort_key(log.get("Visited"))
-        existing_date = log_date_sort_key(existing.get("Visited"))
-        if current_date > existing_date:
-            deduped[key] = log
-        elif current_date == existing_date:
-            merged = dict(existing)
-            merged["FavoritePointUsed"] = bool(existing.get("FavoritePointUsed", False)) or bool(log.get("FavoritePointUsed", False))
-            merged["IsFTF"] = bool(existing.get("IsFTF", False)) or bool(log.get("IsFTF", False))
-            merged["LogType"] = existing.get("LogType") or log.get("LogType") or FOUND_LOG_TYPE
-            deduped[key] = merged
-
+        log_id = normalize_log_id(log.get("LogID"))
+        if log_id is None:
+            raise ValueError(f"Missing valid LogID for {log.get('GCCode')}")
+        normalized = dict(log)
+        normalized["LogID"] = log_id
+        deduped.setdefault(log_id, normalized)
     return list(deduped.values())
+
+
+def select_storage_events(logs: List[dict]) -> List[dict]:
+    """Keep all event logs except superseded Found it and Attended observations.
+
+    Those two types are singleton observations per cache/account/type in this
+    project. When an API response contains multiple such events, retain the
+    most recently visited one, breaking same-day ties by the larger LogID.
+    ``logs`` must already have valid, normalized LogID values.
+    """
+    latest_singletons = {}
+    non_singleton_logs = []
+    for log in logs:
+        key = legacy_log_key(log)
+        if not key or key[2] not in SINGLETON_LOG_TYPES:
+            non_singleton_logs.append(log)
+            continue
+        current = latest_singletons.get(key)
+        if (
+            current is None
+            or log_date_sort_key(log["Visited"]) > log_date_sort_key(current["Visited"])
+            or (
+                log_date_sort_key(log["Visited"]) == log_date_sort_key(current["Visited"])
+                and log["LogID"] > current["LogID"]
+            )
+        ):
+            latest_singletons[key] = log
+    return non_singleton_logs + list(latest_singletons.values())
+
+
+def legacy_log_key(log: dict) -> Optional[Tuple[str, str, str]]:
+    """Key used only to attach a LogID to records collected before event IDs existed."""
+    gc_code = log.get("GCCode") or log.get("gc_code")
+    user_guid = log.get("AccountGuid") or log.get("user_guid")
+    log_type = log.get("LogType") or log.get("log_type")
+    if not gc_code or not user_guid or not log_type:
+        return None
+    return str(gc_code), str(user_guid), str(log_type)
+
+
+def legacy_log_matches(existing: dict, incoming: dict) -> bool:
+    """Return whether an old ID-less row represents an incoming API event.
+
+    The legacy table has no event identifier, so a match requires its original
+    cache/user/type key plus all stored event fields. User name is deliberately
+    excluded because account names can change while AccountGuid remains stable.
+    """
+    if legacy_log_key(existing) != legacy_log_key(incoming):
+        return False
+    return (
+        normalize_log_date_for_compare(existing.get("visited"))
+        == normalize_log_date_for_compare(incoming.get("Visited"))
+        and bool(existing.get("favorite_point_used"))
+        == bool(incoming.get("FavoritePointUsed", False))
+        and bool(existing.get("is_ftf"))
+        == bool(incoming.get("IsFTF", False))
+    )
 
 
 def is_ftf_log_text(log_content: str) -> bool:
@@ -158,7 +205,7 @@ class DatabaseManager:
         logger.info("数据库连接成功")
 
     def ensure_logs_schema(self):
-        """Ensure columns required by current log crawling logic exist."""
+        """Migrate legacy cache/user rows to event-level LogID storage."""
         self.cursor.execute(
             """
             ALTER TABLE logs
@@ -173,8 +220,29 @@ class DatabaseManager:
         )
         self.cursor.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS logs_gc_user_guid_unique
-            ON logs(gc_code, user_guid) WHERE user_guid IS NOT NULL AND user_guid <> 'deleted'
+            ALTER TABLE logs
+            ADD COLUMN IF NOT EXISTS log_id BIGINT
+            """
+        )
+        # The two legacy constraints collapse multiple event logs from the same
+        # account. LogID is now the authoritative event identity.
+        self.cursor.execute("DROP INDEX IF EXISTS logs_gc_user_guid_unique")
+        self.cursor.execute(
+            "ALTER TABLE logs DROP CONSTRAINT IF EXISTS logs_gc_code_user_name_visited_key"
+        )
+        self.cursor.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS logs_log_id_unique
+            ON logs(log_id) WHERE log_id IS NOT NULL
+            """
+        )
+        self.cursor.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS logs_gc_user_guid_find_attend_unique
+            ON logs(gc_code, user_guid, log_type)
+            WHERE user_guid IS NOT NULL
+              AND user_guid <> 'deleted'
+              AND log_type IN ('Found it', 'Attended')
             """
         )
         self.conn.commit()
@@ -202,14 +270,21 @@ class DatabaseManager:
 
     def get_all_caches_to_crawl(
         self,
+        full: bool = False,
+        include_archived: bool = False,
     ) -> List[Tuple[str, Optional[float], Optional[float], bool, Optional[int]]]:
-        """获取需要爬取 logs 的全部 cache，并保留 premium 标记。"""
+        """Return incremental caches, active caches, or all non-deleted caches."""
+        status_filter = (
+            "COALESCE(c.cache_status, 0) <> 404"
+            if full and include_archived
+            else "COALESCE(c.cache_status, 0) NOT IN (2, 404)"
+        )
         self.cursor.execute(
-            """
+            f"""
             SELECT c.code, c.latitude, c.longitude, c.premium_only,
                    c.geocache_type, c.logs_crawled_at, c.last_found_date, c.placed_date
             FROM caches c
-            WHERE COALESCE(c.cache_status, 0) NOT IN (2, 404)
+            WHERE {status_filter}
             ORDER BY c.code
             """
         )
@@ -217,6 +292,10 @@ class DatabaseManager:
         results = []
         for row in self.cursor.fetchall():
             code, lat, lng, premium_only, geocache_type, logs_crawled_at, last_found_date, placed_date = row
+
+            if full:
+                results.append((code, lat, lng, bool(premium_only), geocache_type))
+                continue
 
             logs_crawled_date = (
                 logs_crawled_at.date() if hasattr(logs_crawled_at, 'date') else logs_crawled_at
@@ -266,244 +345,153 @@ class DatabaseManager:
                     logger.error(f"批量更新 logs_crawled_at 失败: {e}")
                     raise
 
-    def insert_logs(self, logs: List[dict]):
-        """批量插入日志。"""
-        if not logs:
-            return
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                execute_batch(
-                    self.cursor,
-                    """
-                    INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    [
-                        (
-                            log["GCCode"],
-                            log["UserName"],
-                            log["Visited"],
-                            log.get("FavoritePointUsed", False),
-                            log.get("IsFTF", False),
-                            log.get("LogType", FOUND_LOG_TYPE),
-                            log.get("AccountGuid"),
-                        )
-                        for log in logs
-                    ],
-                )
-                return
-            except psycopg2.OperationalError as e:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"插入 logs 失败，尝试重新连接 ({attempt + 1}/{max_retries})..."
-                    )
-                    self.reconnect()
-                else:
-                    logger.error(f"插入 logs 失败: {e}")
-                    raise
-
-    def get_existing_logs_for_caches(self, gc_codes: List[str]) -> Dict[Tuple[str, str], dict]:
-        """返回 {(gc_code, user_guid): record} 索引，仅包含已有 GUID 的记录。"""
+    def get_existing_logs_for_caches(self, gc_codes: List[str]) -> List[dict]:
+        """Load event rows and ID-less legacy rows for the incoming cache batch."""
         if not gc_codes:
-            return {}
-
+            return []
         self.cursor.execute(
             """
-            SELECT gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid
+            SELECT id, gc_code, user_name, visited, favorite_point_used, is_ftf,
+                   log_type, user_guid, log_id
             FROM logs
-            WHERE gc_code = ANY(%s) AND user_guid IS NOT NULL AND user_guid <> 'deleted'
+            WHERE gc_code = ANY(%s)
             """,
             (gc_codes,),
         )
-
-        existing = {}
-        for row in self.cursor.fetchall():
-            existing[(row[0], row[6])] = {
-                "user_name": row[1],
-                "visited": row[2],
-                "favorite_point_used": row[3],
-                "is_ftf": row[4],
-                "log_type": row[5],
-                "user_guid": row[6],
+        return [
+            {
+                "id": row[0], "gc_code": row[1], "user_name": row[2],
+                "visited": row[3], "favorite_point_used": row[4],
+                "is_ftf": row[5], "log_type": row[6], "user_guid": row[7],
+                "log_id": row[8],
             }
-        return existing
+            for row in self.cursor.fetchall()
+        ]
 
-    def smart_upsert_logs(self, new_logs: List[dict]) -> Tuple[int, int]:
-        """
-        智能日志更新：比较新旧记录，决定插入或替换。
-
-        返回: (inserted_count, updated_count)
-
-        逻辑：
-        - 用 (gc_code, user_guid) 匹配
-        - 匹配到但用户名变了 → UPDATE（覆盖旧用户名）
-        - 不存在 → INSERT
-        - 字段完全相同 → 跳过
-        """
-        if not new_logs:
-            return (0, 0)
-
-        deduped_logs = deduplicate_logs_by_cache_user(new_logs)
-        if len(deduped_logs) != len(new_logs):
-            logger.info(
-                "Deduplicated logs before upsert: raw %s, unique cache/user %s",
-                len(new_logs),
-                len(deduped_logs),
-            )
-        new_logs = deduped_logs
-
-        gc_codes = list(set(log["GCCode"] for log in new_logs))
-        existing_by_guid = self.get_existing_logs_for_caches(gc_codes)
-
-        to_insert = []
-        to_update = []
-
-        for log in new_logs:
-            gc_code = log["GCCode"]
-            user_name = log["UserName"]
-            guid = log.get("AccountGuid")
-
-            new_record = {
-                "visited": log["Visited"],
-                "favorite_point_used": log.get("FavoritePointUsed", False),
-                "is_ftf": log.get("IsFTF", False),
-                "log_type": log.get("LogType", FOUND_LOG_TYPE),
-                "user_guid": guid,
-            }
-
-            # 只用 GUID 匹配
-            old_record = existing_by_guid.get((gc_code, guid)) if guid else None
-
-            if old_record is None:
-                to_insert.append(log)
-                continue
-
-            # 已存在，比较字段
-            db_visited_str = normalize_log_date_for_compare(old_record["visited"])
-            api_visited_str = normalize_log_date_for_compare(new_record["visited"])
-
-            fields_match = (
-                db_visited_str == api_visited_str
-                and bool(old_record["favorite_point_used"]) == bool(new_record["favorite_point_used"])
-                and bool(old_record["is_ftf"]) == bool(new_record["is_ftf"])
-                and (old_record.get("log_type") or FOUND_LOG_TYPE) == new_record["log_type"]
-                and old_record.get("user_guid") == new_record.get("user_guid")
-            )
-
-            # 用户名变了（改名）→ 需要更新
-            name_changed = old_record.get("user_name") != user_name
-
-            if not fields_match or name_changed:
-                to_update.append(log)
-
-        # 执行批量操作
-        inserted_count = 0
-        updated_count = 0
-
-        if to_insert:
-            self._batch_insert_logs(to_insert)
-            inserted_count = len(to_insert)
-
-        if to_update:
-            updated_count = self._batch_update_logs(to_update)
-
-        return (inserted_count, updated_count)
-
-    def _batch_insert_logs(self, logs: List[dict]):
-        """执行批量 INSERT 操作。"""
-        execute_batch(
-            self.cursor,
-            """
-            INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            [
-                (
-                    log["GCCode"],
-                    log["UserName"],
-                    log["Visited"],
-                    log.get("FavoritePointUsed", False),
-                    log.get("IsFTF", False),
-                    log.get("LogType", FOUND_LOG_TYPE),
-                    log.get("AccountGuid"),
-                )
-                for log in logs
-            ],
+    @staticmethod
+    def _event_fields_match(existing: dict, incoming: dict) -> bool:
+        return (
+            legacy_log_matches(existing, incoming)
+            and existing.get("user_name") == (incoming.get("UserName") or "deleted")
         )
 
-    def _batch_update_logs(self, logs: List[dict]) -> int:
-        """执行批量 UPDATE 操作。优先用 (gc_code, user_guid) 匹配，回退用 user_name。"""
-        changed_count = 0
-        for log in logs:
-            gc_code = log["GCCode"]
-            user_name = log["UserName"]
-            guid = log.get("AccountGuid")
+    @staticmethod
+    def _log_values(log: dict) -> Tuple:
+        return (
+            log["GCCode"], log.get("UserName") or "deleted", log["Visited"],
+            bool(log.get("FavoritePointUsed", False)), bool(log.get("IsFTF", False)),
+            log.get("LogType") or "Unknown", log.get("AccountGuid"),
+            normalize_log_id(log.get("LogID")),
+        )
 
-            if guid:
-                where_clause = "gc_code = %s AND user_guid = %s"
-                where_params = (gc_code, guid)
-            else:
-                where_clause = "gc_code = %s AND user_name = %s"
-                where_params = (gc_code, user_name)
+    def smart_upsert_logs(self, new_logs: List[dict]) -> Tuple[int, int]:
+        """Upsert API events by LogID and backfill matching legacy rows.
 
-            self.cursor.execute(
-                f"""
-                DELETE FROM logs
-                WHERE {where_clause}
-                  AND ctid NOT IN (
-                      SELECT ctid
-                      FROM logs
-                      WHERE {where_clause}
-                      ORDER BY visited DESC
-                      LIMIT 1
-                  )
-                """,
-                where_params + where_params,
-            )
-            deleted_duplicates = max(0, self.cursor.rowcount or 0)
-            self.cursor.execute(
-                f"""
-                UPDATE logs
-                SET visited = %s,
-                    favorite_point_used = %s,
-                    is_ftf = %s,
-                    log_type = %s,
-                    user_name = %s,
-                    user_guid = %s
-                WHERE {where_clause}
-                  AND (
-                      visited IS DISTINCT FROM %s::date
-                      OR COALESCE(favorite_point_used, false) IS DISTINCT FROM %s::boolean
-                      OR COALESCE(is_ftf, false) IS DISTINCT FROM %s::boolean
-                      OR COALESCE(log_type, %s) IS DISTINCT FROM %s
-                      OR COALESCE(user_name, '') IS DISTINCT FROM %s
-                      OR user_guid IS DISTINCT FROM %s
-                  )
-                """,
+        ID-less rows are matched by ``(gc_code, user_guid, log_type)`` and all
+        stored event fields. For Found it and Attended, the project keeps one
+        row per cache/account/type and retains the most recent visited date.
+        """
+        if not new_logs:
+            return 0, 0
+        deduped_logs = deduplicate_logs_by_log_id(new_logs)
+        if len(deduped_logs) != len(new_logs):
+            logger.info("Deduplicated %s rows to %s LogID events", len(new_logs), len(deduped_logs))
+
+        deduped_logs = select_storage_events(deduped_logs)
+
+        existing = self.get_existing_logs_for_caches(list({log["GCCode"] for log in deduped_logs}))
+        existing_by_log_id = {row["log_id"]: row for row in existing if row["log_id"] is not None}
+        legacy_by_key = defaultdict(list)
+        singleton_by_key = {}
+        for row in existing:
+            if row["log_id"] is None:
+                key = legacy_log_key(row)
+                if key:
+                    legacy_by_key[key].append(row)
+            key = legacy_log_key(row)
+            if key and key[2] in SINGLETON_LOG_TYPES:
+                current = singleton_by_key.get(key)
+                if current is None or log_date_sort_key(row["visited"]) > log_date_sort_key(current["visited"]):
+                    singleton_by_key[key] = row
+
+        to_insert, to_update, legacy_backfills = [], [], []
+        consumed_legacy_ids = set()
+        for log in deduped_logs:
+            event_row = existing_by_log_id.get(log["LogID"])
+            if event_row is not None:
+                if not self._event_fields_match(event_row, log):
+                    to_update.append((event_row["id"], log))
+                continue
+
+            key = legacy_log_key(log)
+            matched_legacy = next(
                 (
-                    log["Visited"],
-                    log.get("FavoritePointUsed", False),
-                    log.get("IsFTF", False),
-                    log.get("LogType", FOUND_LOG_TYPE),
-                    user_name,
-                    guid,
-                ) + where_params + (
-                    log["Visited"],
-                    log.get("FavoritePointUsed", False),
-                    log.get("IsFTF", False),
-                    FOUND_LOG_TYPE,
-                    log.get("LogType", FOUND_LOG_TYPE),
-                    user_name,
-                    guid,
+                    row for row in legacy_by_key.get(key, [])
+                    if row["id"] not in consumed_legacy_ids and legacy_log_matches(row, log)
                 ),
+                None,
             )
-            if deleted_duplicates > 0 or (self.cursor.rowcount or 0) > 0:
-                changed_count += 1
-        return changed_count
+            if matched_legacy is not None:
+                consumed_legacy_ids.add(matched_legacy["id"])
+                legacy_backfills.append((matched_legacy["id"], log))
+                matched_legacy.update({
+                    "user_name": log.get("UserName") or "deleted",
+                    "visited": log["Visited"],
+                    "favorite_point_used": bool(log.get("FavoritePointUsed", False)),
+                    "is_ftf": bool(log.get("IsFTF", False)),
+                    "log_type": log.get("LogType") or "Unknown",
+                    "user_guid": log.get("AccountGuid"),
+                    "log_id": log["LogID"],
+                })
+                continue
+
+            singleton_row = singleton_by_key.get(key)
+            if singleton_row is not None:
+                if log_date_sort_key(log["Visited"]) >= log_date_sort_key(singleton_row["visited"]):
+                    to_update.append((singleton_row["id"], log))
+                    singleton_row.update({
+                        "user_name": log.get("UserName") or "deleted",
+                        "visited": log["Visited"],
+                        "favorite_point_used": bool(log.get("FavoritePointUsed", False)),
+                        "is_ftf": bool(log.get("IsFTF", False)),
+                        "log_type": log.get("LogType") or "Unknown",
+                        "user_guid": log.get("AccountGuid"),
+                        "log_id": log["LogID"],
+                    })
+                continue
+
+            to_insert.append(log)
+
+        if to_insert:
+            execute_batch(
+                self.cursor,
+                """
+                INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid, log_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (log_id) WHERE log_id IS NOT NULL DO UPDATE
+                SET user_name = EXCLUDED.user_name,
+                    visited = EXCLUDED.visited,
+                    favorite_point_used = EXCLUDED.favorite_point_used,
+                    is_ftf = EXCLUDED.is_ftf,
+                    log_type = EXCLUDED.log_type,
+                    user_guid = EXCLUDED.user_guid
+                """,
+                [self._log_values(log) for log in to_insert],
+            )
+
+        updates = to_update + legacy_backfills
+        if updates:
+            execute_batch(
+                self.cursor,
+                """
+                UPDATE logs
+                SET user_name = %s, visited = %s, favorite_point_used = %s,
+                    is_ftf = %s, log_type = %s, user_guid = %s, log_id = %s
+                WHERE id = %s
+                """,
+                [self._log_values(log)[1:] + (row_id,) for row_id, log in updates],
+            )
+        return len(to_insert), len(updates)
 
     def commit(self):
         """提交事务。"""
@@ -612,20 +600,17 @@ def fetch_logs_for_cache_result(
     cookie: str,
     accepted_log_types: Optional[set] = None,
 ) -> Tuple[List[dict], bool]:
-    """获取单个 cache 的所有 logs。"""
-    if accepted_log_types is None:
-        accepted_log_types = {FOUND_LOG_TYPE}
+    """Fetch every log event for one cache unless a caller explicitly filters."""
 
     logs = []
     current_idx = 1
     num_per_page = 100
-    max_pages = 100
     max_retries = 3
 
     headers = make_headers(cookie)
     headers["Referer"] = f"https://www.geocaching.com/seek/geocache_logs.aspx?code={gc_code}"
 
-    for _ in range(max_pages):
+    for _ in range(MAX_LOGBOOK_PAGES):
         url = (
             "https://www.geocaching.com/seek/geocache.logbook?"
             f"tkn={token}&idx={current_idx}&num={num_per_page}"
@@ -665,19 +650,27 @@ def fetch_logs_for_cache_result(
 
         for item in data:
             log_type = item.get("LogType")
-            if log_type not in accepted_log_types:
+            if accepted_log_types is not None and log_type not in accepted_log_types:
                 continue
 
+            log_id = normalize_log_id(item.get("LogID"))
+            if log_id is None:
+                logger.error("Logbook row has no usable LogID: cache=%s type=%s", gc_code, log_type)
+                return logs, False
+
+            # LogText is read only for the existing FTF marker heuristic and is
+            # intentionally omitted from the returned record and database.
             log_content = item.get("LogText", "")
             logs.append(
                 {
                     "GCCode": gc_code,
-                    "UserName": item.get("UserName"),
+                    "UserName": item.get("UserName") or "deleted",
                     "Visited": format_date(item.get("Visited", "")),
                     "FavoritePointUsed": item.get("FavoritePointUsed", False),
-                    "IsFTF": is_ftf_log_text(log_content),
-                    "LogType": log_type,
+                    "IsFTF": log_type == FOUND_LOG_TYPE and is_ftf_log_text(log_content),
+                    "LogType": log_type or "Unknown",
                     "AccountGuid": item.get("AccountGuid"),
+                    "LogID": log_id,
                 }
             )
 
@@ -687,7 +680,7 @@ def fetch_logs_for_cache_result(
         current_idx += 1
         time.sleep(page_sleep)
 
-    logger.error(f"Failed to fetch logs for {gc_code}: exceeded max pages {max_pages}; not marking as crawled")
+    logger.error(f"Failed to fetch logs for {gc_code}: exceeded max pages {MAX_LOGBOOK_PAGES}; not marking as crawled")
     return logs, False
 
 
@@ -735,13 +728,8 @@ def crawl_cache_group(
 
     logger.info(f"开始处理 {group_name} 组，共 {len(caches)} 个 cache")
 
-    for i, (code, geocache_type) in enumerate(caches):
+    for i, (code, _geocache_type) in enumerate(caches):
         logger.info(f"[{group_name} {i + 1}/{len(caches)}] 处理: {code}")
-        accepted_log_types = (
-            {ATTENDED_LOG_TYPE}
-            if geocache_type in EVENT_CACHE_TYPES
-            else {FOUND_LOG_TYPE}
-        )
 
         retry_count = 0
         max_retries = 1
@@ -812,7 +800,6 @@ def crawl_cache_group(
                     token,
                     page_sleep,
                     cookie,
-                    accepted_log_types=accepted_log_types,
                 )
 
                 if not crawl_complete:
@@ -890,14 +877,15 @@ def crawl_cache_group(
     }
 
 
-def run_logs_crawler():
-    """单次运行，先查全量 cache，再按 premium / nonpremium 分组处理。"""
+def run_logs_crawler(full: bool = False, include_archived: bool = False):
+    """Run incremental, active-full, or all-non-deleted event-log refreshes."""
     db = DatabaseManager(DATABASE_URL)
     db.connect()
 
     try:
-        logger.info("加载全部 cache 列表...")
-        caches = db.get_all_caches_to_crawl()
+        refresh_scope = "全量（含归档）" if include_archived else ("全量活跃" if full else "增量")
+        logger.info("加载%s cache 列表...", refresh_scope)
+        caches = db.get_all_caches_to_crawl(full=full, include_archived=include_archived)
         premium_caches = [
             (code, geocache_type)
             for code, _lat, _lng, premium_only, geocache_type in caches
@@ -951,8 +939,24 @@ def run_logs_crawler():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Crawl Geocaching logbook events.")
+    refresh_group = parser.add_mutually_exclusive_group()
+    refresh_group.add_argument(
+        "--full",
+        action="store_true",
+        help="Recrawl every non-deleted cache, including archived caches.",
+    )
+    refresh_group.add_argument(
+        "--full-active",
+        action="store_true",
+        help="Recrawl every active cache, excluding archived and unavailable caches.",
+    )
+    args = parser.parse_args()
     try:
-        run_logs_crawler()
+        run_logs_crawler(
+            full=args.full or args.full_active,
+            include_archived=args.full,
+        )
     except Exception:
         logger.exception("crawl_logs failed")
         raise

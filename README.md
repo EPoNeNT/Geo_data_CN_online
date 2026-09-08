@@ -106,7 +106,7 @@ pip install -r requirements.txt
 | 表 | 说明 |
 | --- | --- |
 | `caches` | cache 主表，包含 GC code、坐标、类型、状态、城市、发布时间、FP、owner_guid 等信息。 |
-| `logs` | cache 日志表，主要保存 Found it 日志、用户、访问日期、FTF 标记及 user_guid。 |
+| `logs` | cache 日志表，保存各类日志事件、LogID、用户、访问日期、FTF 标记及 user_guid，不保存 LogText。 |
 | `crawl_progress` | cache 网格抓取进度表。 |
 | `map_cities` | 城市边界表，使用 PostGIS geometry。 |
 | `user_avatars` | 玩家头像 URL 缓存表。 |
@@ -134,8 +134,10 @@ python assign_cities.py
 python crawl_logs.py
 # 一次性全量日志（含归档缓存）
 python crawl_logs.py --full
-# 每周补齐用：仅全部活跃缓存
+# 每月补齐用：无 last found 或一个月以上没有新 Found 的活跃缓存
 python crawl_logs.py --full-active
+# 定向重爬当前仍有日志缺少 LogID 的缓存
+python crawl_logs.py --missing-log-id
 python test/backfill_guids.py         # 回填 owner_guid 和 user_guid
 python crawl_user_regdates.py         # 爬取注册时间 + 首个找到的国家
 python generate_data.py
@@ -189,18 +191,20 @@ python test/fetch_first_find.py --limit 100
 
 支持：
 
-- 定时任务：每天 UTC 20:00 运行；每周日 UTC 22:00 对全部活跃缓存重爬日志。
-- 手动运行：`mode=caches | logs | logs-full | both | generate`。
+- 定时任务：每天 UTC 20:00 运行；每月 1 日 UTC 22:00 重爬无 `last_found_date` 或一个月以上没有新 Found 的活跃缓存日志。
+- 手动运行：`mode=caches | logs | logs-full | logs-missing-id | both | generate`。
 
 当前流程：
 
 - `caches`：运行 `crawl_caches.py`，然后运行 `assign_cities.py`。
 - `logs`：运行 `crawl_logs.py`。
 - `logs-full`：运行 `crawl_logs.py --full`，覆盖所有未删除缓存（含归档缓存）。
+- `logs-missing-id`：运行 `crawl_logs.py --missing-log-id`，仅处理当前存在 `log_id IS NULL` 日志的未删除缓存。
+- 日志同步以 `LogID` 识别事件并以 API 当前字段为准；完整 logbook 出现同缓存、同用户的新 `LogID` 时，会移除 API 已不存在的旧事件。
 - `both`：依次运行 cache 抓取、城市归属、日志抓取、用户注册时间补抓、静态数据生成。
 - `generate`：只生成静态数据。
 - 每日定时任务：运行完整链路，并包含 `crawl_user_regdates.py`。
-- 每周定时任务：同样运行完整链路；日志阶段改为 `--full-active`，补齐活跃缓存的所有日志类型。
+- 每月定时任务：同样运行完整链路；日志阶段改为 `--full-active`，补齐 `last_found_date` 为空或早于一个月前的活跃缓存。
 
 需要在 GitHub Secrets 中配置：
 

@@ -272,12 +272,27 @@ class DatabaseManager:
         self,
         full: bool = False,
         include_archived: bool = False,
+        missing_log_id_only: bool = False,
     ) -> List[Tuple[str, Optional[float], Optional[float], bool, Optional[int]]]:
-        """Return incremental caches, active caches, or all non-deleted caches."""
+        """Return incremental, monthly-stale, full, or ID-less-log caches."""
         status_filter = (
             "COALESCE(c.cache_status, 0) <> 404"
-            if full and include_archived
+            if (full and include_archived) or missing_log_id_only
             else "COALESCE(c.cache_status, 0) NOT IN (2, 404)"
+        )
+        stale_filter = (
+            "AND (c.last_found_date IS NULL OR "
+            "c.last_found_date < CURRENT_DATE - INTERVAL '1 month')"
+            if full and not include_archived and not missing_log_id_only
+            else ""
+        )
+        missing_log_id_filter = (
+            "AND EXISTS ("
+            "SELECT 1 FROM logs l "
+            "WHERE l.gc_code = c.code AND l.log_id IS NULL"
+            ")"
+            if missing_log_id_only
+            else ""
         )
         self.cursor.execute(
             f"""
@@ -285,6 +300,8 @@ class DatabaseManager:
                    c.geocache_type, c.logs_crawled_at, c.last_found_date, c.placed_date
             FROM caches c
             WHERE {status_filter}
+              {stale_filter}
+              {missing_log_id_filter}
             ORDER BY c.code
             """
         )
@@ -293,7 +310,7 @@ class DatabaseManager:
         for row in self.cursor.fetchall():
             code, lat, lng, premium_only, geocache_type, logs_crawled_at, last_found_date, placed_date = row
 
-            if full:
+            if full or missing_log_id_only:
                 results.append((code, lat, lng, bool(premium_only), geocache_type))
                 continue
 
@@ -384,12 +401,18 @@ class DatabaseManager:
             normalize_log_id(log.get("LogID")),
         )
 
-    def smart_upsert_logs(self, new_logs: List[dict]) -> Tuple[int, int]:
-        """Upsert API events by LogID and backfill matching legacy rows.
+    def smart_upsert_logs(
+        self,
+        new_logs: List[dict],
+        complete_cache_codes: Optional[set] = None,
+    ) -> Tuple[int, int]:
+        """Reconcile complete API events by LogID and backfill legacy rows.
 
         ID-less rows are matched by ``(gc_code, user_guid, log_type)`` and all
         stored event fields. For Found it and Attended, the project keeps one
-        row per cache/account/type and retains the most recent visited date.
+        row per cache/account/type using the current API result. When a complete
+        cache logbook contains a new LogID for an account, stored LogIDs for the
+        same cache/account that disappeared from the API are removed first.
         """
         if not new_logs:
             return 0, 0
@@ -397,9 +420,46 @@ class DatabaseManager:
         if len(deduped_logs) != len(new_logs):
             logger.info("Deduplicated %s rows to %s LogID events", len(new_logs), len(deduped_logs))
 
-        deduped_logs = select_storage_events(deduped_logs)
+        complete_codes = set(complete_cache_codes or [])
+        all_api_logs = deduped_logs
+        api_ids_by_cache = defaultdict(set)
+        for log in all_api_logs:
+            api_ids_by_cache[log["GCCode"]].add(log["LogID"])
 
-        existing = self.get_existing_logs_for_caches(list({log["GCCode"] for log in deduped_logs}))
+        deduped_logs = select_storage_events(all_api_logs)
+
+        cache_codes = {log["GCCode"] for log in all_api_logs} | complete_codes
+        existing = self.get_existing_logs_for_caches(list(cache_codes))
+        existing_ids = {
+            row["log_id"] for row in existing if row["log_id"] is not None
+        }
+        accounts_with_new_ids = {
+            (log["GCCode"], log.get("AccountGuid"))
+            for log in all_api_logs
+            if log["GCCode"] in complete_codes
+            and log.get("AccountGuid")
+            and log.get("AccountGuid") != "deleted"
+            and log["LogID"] not in existing_ids
+        }
+        stale_row_ids = [
+            row["id"]
+            for row in existing
+            if row["log_id"] is not None
+            and (row["gc_code"], row.get("user_guid")) in accounts_with_new_ids
+            and row["log_id"] not in api_ids_by_cache[row["gc_code"]]
+        ]
+        if stale_row_ids:
+            self.cursor.execute(
+                "DELETE FROM logs WHERE id = ANY(%s)",
+                (stale_row_ids,),
+            )
+            logger.info(
+                "Deleted %s stored log events absent from complete API results",
+                self.cursor.rowcount,
+            )
+            stale_row_id_set = set(stale_row_ids)
+            existing = [row for row in existing if row["id"] not in stale_row_id_set]
+
         existing_by_log_id = {row["log_id"]: row for row in existing if row["log_id"] is not None}
         legacy_by_key = defaultdict(list)
         singleton_by_key = {}
@@ -447,17 +507,19 @@ class DatabaseManager:
 
             singleton_row = singleton_by_key.get(key)
             if singleton_row is not None:
-                if log_date_sort_key(log["Visited"]) >= log_date_sort_key(singleton_row["visited"]):
-                    to_update.append((singleton_row["id"], log))
-                    singleton_row.update({
-                        "user_name": log.get("UserName") or "deleted",
-                        "visited": log["Visited"],
-                        "favorite_point_used": bool(log.get("FavoritePointUsed", False)),
-                        "is_ftf": bool(log.get("IsFTF", False)),
-                        "log_type": log.get("LogType") or "Unknown",
-                        "user_guid": log.get("AccountGuid"),
-                        "log_id": log["LogID"],
-                    })
+                # The API response is authoritative for a singleton log. Users
+                # can edit a Found it or Attended date in either direction, so
+                # an older API date must still replace the stored observation.
+                to_update.append((singleton_row["id"], log))
+                singleton_row.update({
+                    "user_name": log.get("UserName") or "deleted",
+                    "visited": log["Visited"],
+                    "favorite_point_used": bool(log.get("FavoritePointUsed", False)),
+                    "is_ftf": bool(log.get("IsFTF", False)),
+                    "log_type": log.get("LogType") or "Unknown",
+                    "user_guid": log.get("AccountGuid"),
+                    "log_id": log["LogID"],
+                })
                 continue
 
             to_insert.append(log)
@@ -469,7 +531,8 @@ class DatabaseManager:
                 INSERT INTO logs (gc_code, user_name, visited, favorite_point_used, is_ftf, log_type, user_guid, log_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (log_id) WHERE log_id IS NOT NULL DO UPDATE
-                SET user_name = EXCLUDED.user_name,
+                SET gc_code = EXCLUDED.gc_code,
+                    user_name = EXCLUDED.user_name,
                     visited = EXCLUDED.visited,
                     favorite_point_used = EXCLUDED.favorite_point_used,
                     is_ftf = EXCLUDED.is_ftf,
@@ -485,11 +548,11 @@ class DatabaseManager:
                 self.cursor,
                 """
                 UPDATE logs
-                SET user_name = %s, visited = %s, favorite_point_used = %s,
+                SET gc_code = %s, user_name = %s, visited = %s, favorite_point_used = %s,
                     is_ftf = %s, log_type = %s, user_guid = %s, log_id = %s
                 WHERE id = %s
                 """,
-                [self._log_values(log)[1:] + (row_id,) for row_id, log in updates],
+                [self._log_values(log) + (row_id,) for row_id, log in updates],
             )
         return len(to_insert), len(updates)
 
@@ -852,7 +915,10 @@ def crawl_cache_group(
 
         if len(all_logs) >= LOG_UPLOAD_THRESHOLD:
             if all_logs:
-                inserted, updated = db.smart_upsert_logs(all_logs)
+                inserted, updated = db.smart_upsert_logs(
+                    all_logs,
+                    complete_cache_codes=set(crawled_codes),
+                )
                 logs_count += (inserted + updated)
                 logger.info(f"{group_name} 组处理 {len(all_logs)} 条原始 logs: 新增 {inserted} 条, 更新 {updated} 条 (净增 {inserted+updated} 条)")
                 all_logs = []
@@ -861,7 +927,10 @@ def crawl_cache_group(
             db.commit()
 
     if all_logs:
-        inserted, updated = db.smart_upsert_logs(all_logs)
+        inserted, updated = db.smart_upsert_logs(
+            all_logs,
+            complete_cache_codes=set(crawled_codes),
+        )
         logs_count += (inserted + updated)
         logger.info(f"{group_name} 组处理 {len(all_logs)} 条原始 logs: 新增 {inserted} 条, 更新 {updated} 条 (净增 {inserted+updated} 条)")
     if crawled_codes:
@@ -877,15 +946,28 @@ def crawl_cache_group(
     }
 
 
-def run_logs_crawler(full: bool = False, include_archived: bool = False):
-    """Run incremental, active-full, or all-non-deleted event-log refreshes."""
+def run_logs_crawler(
+    full: bool = False,
+    include_archived: bool = False,
+    missing_log_id_only: bool = False,
+):
+    """Run incremental, monthly-stale, full, or ID-less-log refreshes."""
     db = DatabaseManager(DATABASE_URL)
     db.connect()
 
     try:
-        refresh_scope = "全量（含归档）" if include_archived else ("全量活跃" if full else "增量")
+        if missing_log_id_only:
+            refresh_scope = "缺失 LogID 定向"
+        elif include_archived:
+            refresh_scope = "全量（含归档）"
+        else:
+            refresh_scope = "月度久未发现" if full else "增量"
         logger.info("加载%s cache 列表...", refresh_scope)
-        caches = db.get_all_caches_to_crawl(full=full, include_archived=include_archived)
+        caches = db.get_all_caches_to_crawl(
+            full=full,
+            include_archived=include_archived,
+            missing_log_id_only=missing_log_id_only,
+        )
         premium_caches = [
             (code, geocache_type)
             for code, _lat, _lng, premium_only, geocache_type in caches
@@ -949,13 +1031,19 @@ if __name__ == "__main__":
     refresh_group.add_argument(
         "--full-active",
         action="store_true",
-        help="Recrawl every active cache, excluding archived and unavailable caches.",
+        help="Recrawl active caches with no last found date or one older than a month.",
+    )
+    refresh_group.add_argument(
+        "--missing-log-id",
+        action="store_true",
+        help="Recrawl only caches that currently contain logs without a LogID.",
     )
     args = parser.parse_args()
     try:
         run_logs_crawler(
             full=args.full or args.full_active,
             include_archived=args.full,
+            missing_log_id_only=args.missing_log_id,
         )
     except Exception:
         logger.exception("crawl_logs failed")

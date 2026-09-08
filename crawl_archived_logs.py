@@ -435,7 +435,10 @@ def flush_batch(
     changed_cache_summary: ChangedCacheSummary = {}
     if pending_logs:
         changed_cache_summary = summarize_changed_logs_by_cache(db, pending_logs)
-        inserted, updated = db.smart_upsert_logs(pending_logs)
+        inserted, updated = db.smart_upsert_logs(
+            pending_logs,
+            complete_cache_codes=set(pending_codes),
+        )
         changed_logs = inserted + updated
         logger.info(
             "Batch logs upserted: raw %s, inserted %s, updated %s, changed %s",

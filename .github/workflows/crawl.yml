@@ -2,10 +2,10 @@ name: Geocache Crawler
 
 on:
   # 定时触发：每天 UTC 20:00 运行（北京时间次日 04:00）；
-  # 每周日 UTC 22:00 对全部活跃缓存重爬日志。
+  # 每月 1 日 UTC 22:00 重爬无 last found 或一个月以上没有新 Found 的活跃缓存日志。
   schedule:
     - cron: '0 20 * * *'
-    - cron: '0 22 * * 0'
+    - cron: '0 22 1 * *'
   
   # 手动触发
   workflow_dispatch:
@@ -19,6 +19,7 @@ on:
           - caches
           - logs
           - logs-full
+          - logs-missing-id
           - both
           - generate
 
@@ -70,7 +71,7 @@ jobs:
   crawl-logs:
     runs-on: ubuntu-latest
     needs: crawl-caches
-    if: always() && (github.event.inputs.mode == 'logs' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'both' || github.event_name == 'schedule')
+    if: always() && (github.event.inputs.mode == 'logs' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'logs-missing-id' || github.event.inputs.mode == 'both' || github.event_name == 'schedule')
     
     steps:
       - name: Checkout code
@@ -91,7 +92,9 @@ jobs:
         run: |
           if [ "$RUN_MODE" = "logs-full" ]; then
             python crawl_logs.py --full
-          elif [ "$SCHEDULE" = "0 22 * * 0" ]; then
+          elif [ "$RUN_MODE" = "logs-missing-id" ]; then
+            python crawl_logs.py --missing-log-id
+          elif [ "$SCHEDULE" = "0 22 1 * *" ]; then
             python crawl_logs.py --full-active
           else
             python crawl_logs.py

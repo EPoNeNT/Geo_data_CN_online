@@ -109,6 +109,7 @@ CACHE_RANKING_ENTRY_FILTER = (
     "AND c.owner_username IS NOT NULL AND c.owner_username <> '' "
     "AND COALESCE(c.cache_status, 0) != 404"
 )
+RANKING_LOG_TYPE_CONDITION = "l.log_type IN ('Found it', 'Attended')"
 CITY_NAME_EXPR = "COALESCE(NULLIF(TRIM(c.city), ''), c.country)"
 CITY_NAME_WHERE = f"{CITY_NAME_EXPR} IS NOT NULL"
 COUNTRY_SUBTITLE_MAP = {
@@ -1092,7 +1093,7 @@ class DataGenerator:
                 {city_where}
                   AND {date_condition}
                   AND {cache_join_condition}
-                  AND l.log_type != 'deleted'
+                  AND {RANKING_LOG_TYPE_CONDITION}
                 {city_group};
                 """
             return f"""
@@ -1103,7 +1104,7 @@ class DataGenerator:
             WHERE l.user_name IS NOT NULL AND l.user_name <> ''
               AND {date_condition}
               AND {cache_join_condition}
-              AND l.log_type != 'deleted'
+              AND {RANKING_LOG_TYPE_CONDITION}
             GROUP BY l.user_name, c.country;
             """
 
@@ -1118,7 +1119,7 @@ class DataGenerator:
               AND l.is_ftf IS TRUE
               AND {date_condition}
               AND {cache_join_condition}
-              AND l.log_type != 'deleted'
+              AND {RANKING_LOG_TYPE_CONDITION}
             GROUP BY l.user_name, c.country;
             """
 
@@ -1139,7 +1140,7 @@ class DataGenerator:
               {favorite_join}
               AND {date_condition}
               AND {cache_join_condition}
-              AND l.log_type != 'deleted'
+              AND {RANKING_LOG_TYPE_CONDITION}
             {city_group};
             """
         if ranking_type == "favorites":
@@ -1151,7 +1152,7 @@ class DataGenerator:
               AND l.favorite_point_used IS TRUE
               AND {date_condition}
               AND {cache_join_condition}
-              AND l.log_type != 'deleted'
+              AND {RANKING_LOG_TYPE_CONDITION}
             GROUP BY c.owner_username, c.country;
             """
         return f"""
@@ -1163,7 +1164,7 @@ class DataGenerator:
           AND LOWER(l.user_name) <> LOWER(c.owner_username)
           AND {date_condition}
           AND {cache_join_condition}
-          AND l.log_type != 'deleted'
+          AND {RANKING_LOG_TYPE_CONDITION}
         GROUP BY c.owner_username, c.country;
         """
 
@@ -1199,7 +1200,7 @@ class DataGenerator:
           {favorite_condition}
           AND {date_condition}
           AND {cache_condition}
-          AND l.log_type != 'deleted'
+          AND {RANKING_LOG_TYPE_CONDITION}
         GROUP BY c.code, c.name, c.owner_username, c.geocache_type, c.country;
         """
 
@@ -1220,7 +1221,7 @@ class DataGenerator:
             WHERE l.user_name IS NOT NULL AND l.user_name <> ''
               AND {registration_filter}
               AND {EXCLUDE_CACHE_JOIN}
-              AND l.log_type != 'deleted'
+              AND {RANKING_LOG_TYPE_CONDITION}
             GROUP BY l.user_name, c.country;
             """
         if ranking_type == "hides":

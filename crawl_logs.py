@@ -5,6 +5,7 @@ Geocache Logs 爬虫 - 适配 Neon 数据库
 """
 import argparse
 import logging
+import math
 import os
 import re
 import sys
@@ -104,6 +105,28 @@ def normalize_log_id(value) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return log_id if log_id > 0 else None
+
+
+def filter_caches_by_radius(caches, center_lat, center_lng, radius_km):
+    """Keep cache tuples within the given haversine radius in kilometers."""
+    if radius_km <= 0:
+        raise ValueError("radius_km must be greater than zero")
+    earth_radius_km = 6371.0088
+    center_lat_rad = math.radians(center_lat)
+    center_lng_rad = math.radians(center_lng)
+    selected = []
+    for cache in caches:
+        lat, lng = cache[1], cache[2]
+        if lat is None or lng is None:
+            continue
+        lat_rad, lng_rad = math.radians(float(lat)), math.radians(float(lng))
+        haversine = (math.sin((lat_rad - center_lat_rad) / 2) ** 2
+                     + math.cos(center_lat_rad) * math.cos(lat_rad)
+                     * math.sin((lng_rad - center_lng_rad) / 2) ** 2)
+        distance_km = earth_radius_km * 2 * math.asin(math.sqrt(min(1.0, haversine)))
+        if distance_km <= radius_km:
+            selected.append(cache)
+    return selected
 
 
 def deduplicate_logs_by_log_id(logs: List[dict]) -> List[dict]:
@@ -950,13 +973,26 @@ def run_logs_crawler(
     full: bool = False,
     include_archived: bool = False,
     missing_log_id_only: bool = False,
+    center_lat: Optional[float] = None,
+    center_lng: Optional[float] = None,
+    radius_km: Optional[float] = None,
 ):
     """Run incremental, monthly-stale, full, or ID-less-log refreshes."""
+    radius_args = (center_lat, center_lng, radius_km)
+    if any(value is not None for value in radius_args) and not all(
+        value is not None for value in radius_args
+    ):
+        raise ValueError("radius arguments must be provided together")
+    if radius_km is not None and radius_km <= 0:
+        raise ValueError("radius_km must be greater than zero")
+
     db = DatabaseManager(DATABASE_URL)
     db.connect()
 
     try:
-        if missing_log_id_only:
+        if radius_km is not None:
+            refresh_scope = f"半径全量（含归档，{radius_km:g} km）"
+        elif missing_log_id_only:
             refresh_scope = "缺失 LogID 定向"
         elif include_archived:
             refresh_scope = "全量（含归档）"
@@ -964,10 +1000,12 @@ def run_logs_crawler(
             refresh_scope = "月度久未发现" if full else "增量"
         logger.info("加载%s cache 列表...", refresh_scope)
         caches = db.get_all_caches_to_crawl(
-            full=full,
-            include_archived=include_archived,
+            full=full or radius_km is not None,
+            include_archived=include_archived or radius_km is not None,
             missing_log_id_only=missing_log_id_only,
         )
+        if radius_km is not None:
+            caches = filter_caches_by_radius(caches, center_lat, center_lng, radius_km)
         premium_caches = [
             (code, geocache_type)
             for code, _lat, _lng, premium_only, geocache_type in caches
@@ -1038,12 +1076,25 @@ if __name__ == "__main__":
         action="store_true",
         help="Recrawl only caches that currently contain logs without a LogID.",
     )
+    parser.add_argument("--center-lat", type=float)
+    parser.add_argument("--center-lng", type=float)
+    parser.add_argument("--radius-km", type=float)
     args = parser.parse_args()
+    radius_args = (args.center_lat, args.center_lng, args.radius_km)
+    if any(v is not None for v in radius_args) and not all(v is not None for v in radius_args):
+        parser.error("radius arguments must be provided together")
+    if args.radius_km is not None and args.radius_km <= 0:
+        parser.error("--radius-km must be greater than zero")
+    if args.radius_km is not None and (args.full or args.full_active or args.missing_log_id):
+        parser.error("radius mode cannot be combined with another refresh mode")
     try:
         run_logs_crawler(
             full=args.full or args.full_active,
             include_archived=args.full,
             missing_log_id_only=args.missing_log_id,
+            center_lat=args.center_lat,
+            center_lng=args.center_lng,
+            radius_km=args.radius_km,
         )
     except Exception:
         logger.exception("crawl_logs failed")

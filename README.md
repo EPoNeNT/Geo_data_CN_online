@@ -32,7 +32,7 @@
 | 脚本 | 作用 |
 | --- | --- |
 | `test/backfill_guids.py` | 回填 `caches.owner_guid` 和 `logs.user_guid`。cache 全部填完后自动切换到 logs-only 模式。 |
-| `test/fetch_first_find.py` | 补全 `"user"` 表中所有缺失的 `reg_place`（第一个找到 cache 的国家）。 |
+| `test/fetch_first_find.py` | 补全 `"user"` 表中所有缺失的 `reg_place`（通常为第一个找到 cache 的国家；网站 Find 为 0 且数据库内 DNF 全部在大中华区同一地区时归入该地区）。 |
 | `test/fetch_user_regdates_once.py` | 一次性全量回填所有日志用户的注册时间。 |
 | `test/debug_airq_timeout.py` | 诊断用户 profile 页面请求超时问题。 |
 | `test/analyze_airq_html.py` | 分析用户 profile 页面体积异常原因。 |
@@ -119,7 +119,7 @@ pip install -r requirements.txt
 | `user_name` | TEXT | 用户名（主键）。 |
 | `guid` | TEXT | 用户 GUID。 |
 | `registration_date` | DATE | Geocaching 注册日期。 |
-| `reg_place` | TEXT | 第一个找到 cache 所在国家。 |
+| `reg_place` | TEXT | 分析用地域归属：通常为第一个找到 cache 所在国家；网站 Find 为 0 且数据库内 DNF 全部在 China、Hong Kong、Macao、Taiwan 中同一地区时也记为该地区。不是注册地、居住地或国籍。 |
 | `fetch_status` | TEXT | 抓取状态（`ok`、`not_found`、`request_failed` 等）。 |
 
 初始化城市边界前，需要确保 PostGIS 可用。可参考 `sql/neon_city_setup.sql` 和 `seed_map_cities_once.py`。
@@ -192,7 +192,7 @@ python test/fetch_first_find.py --limit 100
 支持：
 
 - 定时任务：每天 UTC 20:00 运行；每月 1 日 UTC 22:00 重爬无 `last_found_date` 或一个月以上没有新 Found 的活跃缓存日志。
-- 手动运行：`mode=caches | logs | logs-full | logs-missing-id | both | generate`。
+- 手动运行：`mode=caches | logs | logs-full | logs-missing-id | logs-radius | both | generate`。
 
 当前流程：
 
@@ -200,6 +200,7 @@ python test/fetch_first_find.py --limit 100
 - `logs`：运行 `crawl_logs.py`。
 - `logs-full`：运行 `crawl_logs.py --full`，覆盖所有未删除缓存（含归档缓存）。
 - `logs-missing-id`：运行 `crawl_logs.py --missing-log-id`，仅处理当前存在 `log_id IS NULL` 日志的未删除缓存。
+- `logs-radius`：运行固定北京中心点 2 公里半径模式，处理所有非 404 缓存（含归档缓存）。
 - 日志同步以 `LogID` 识别事件并以 API 当前字段为准；完整 logbook 出现同缓存、同用户的新 `LogID` 时，会移除 API 已不存在的旧事件。
 - `both`：依次运行 cache 抓取、城市归属、日志抓取、用户注册时间补抓、静态数据生成。
 - `generate`：只生成静态数据。

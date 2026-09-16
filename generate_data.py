@@ -853,8 +853,8 @@ class DataGenerator:
             c.difficulty::float8 AS difficulty,
             c.terrain::float8 AS terrain,
             c.code AS code,
-            c.name AS name,
-            c.owner_username AS owner,
+            COALESCE(NULLIF(TRIM(c.name), ''), c.code) AS name,
+            COALESCE(NULLIF(TRIM(c.owner_username), ''), '未知') AS owner,
             COALESCE(c.favorite_points, 0)::int AS favorite_points,
             ROW_NUMBER() OVER (
               PARTITION BY c.difficulty, c.terrain
@@ -913,8 +913,8 @@ class DataGenerator:
                 top_caches.setdefault(key, []).append(
                     {
                         "code": row["code"],
-                        "name": row["name"],
-                        "owner": row["owner"] or "",
+                        "name": row["name"] or row["code"],
+                        "owner": row["owner"] or "未知",
                         "favoritePoints": row["favorite_points"] or 0,
                     }
                 )
@@ -948,7 +948,7 @@ class DataGenerator:
             metrics = self.generate_summary_metrics(country)
             yearly_trend = self.generate_yearly_trend(country)
             heatmap = self.generate_heatmap(country)
-            dt_matrix = self.generate_dt_matrix(country)
+            dt_matrix = self.generate_dt_matrix(country, include_top_caches=True)
 
             total_caches = self.generate_active_cache_count(country)
 
@@ -982,7 +982,7 @@ class DataGenerator:
             "metrics": self.generate_summary_metrics(),
             "yearlyTrend": self.generate_yearly_trend(),
             "heatmap": self.generate_heatmap(),
-            "dtMatrix": self.generate_dt_matrix(),
+            "dtMatrix": self.generate_dt_matrix(include_top_caches=True),
         }
 
         regions_list, region_scopes = self.generate_regions_data()

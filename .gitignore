@@ -6,6 +6,18 @@ __pycache__/
 .env
 DATA_GENERATION_SPEC.md
 AI_AGENT_PROJECT_MAP.md
-analysis/
+/analysis/*
+# Preserve the chart snapshots moved from the project root.
+!/analysis/.chart-data-5bN56s/
+!/analysis/.chart-data-8w8AGR/
+!/analysis/.chart-data-9m4m01/
+!/analysis/.chart-data-Gxyi13/
+!/analysis/.chart-data-IhkB2H/
+!/analysis/.chart-data-NIbNPm/
+!/analysis/.chart-data-Q8DQ6h/
+!/analysis/.chart-data-Qot05k/
+!/analysis/.chart-data-Y78d7y/
+!/analysis/.chart-data-yGjOBz/
+!/analysis/.chart-data-ZJhgkO/
 .claude
 .runtime/

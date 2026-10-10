@@ -18,14 +18,16 @@ import pandas as pd
 import psycopg2
 import requests
 from psycopg2.extras import execute_batch
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from runtime_utils import (
     AuthenticationError,
+    AccessChallengeError,
     connect_postgres,
+    create_geocaching_session,
     is_login_url,
     looks_like_login_page,
+    looks_like_public_geocaching_page,
+    minimize_cookie_value,
     require_cookie,
     require_env,
     setup_logging,
@@ -53,9 +55,16 @@ NONPREMIUM_COOKIE = require_cookie("GEOCOOKIE_NONPREMIUM", "GEOCACHING_COOKIE")
 PREMIUM_COOKIE = require_cookie("GEOCOOKIE_PREMIUM")
 
 
-session = requests.Session()
-retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-session.mount("https://", HTTPAdapter(max_retries=retries))
+session = create_geocaching_session(NONPREMIUM_COOKIE)
+_cookie_sessions = {NONPREMIUM_COOKIE: session}
+
+
+def get_session_for_cookie(cookie: str) -> requests.Session:
+    """Reuse a cookie jar per account without mixing Premium and Basic state."""
+    cookie = minimize_cookie_value(cookie)
+    if cookie not in _cookie_sessions:
+        _cookie_sessions[cookie] = create_geocaching_session(cookie)
+    return _cookie_sessions[cookie]
 
 
 PROFILES = {
@@ -597,39 +606,20 @@ class DatabaseManager:
                     raise
 
 
-def make_headers(cookie: str) -> dict:
+def make_headers(cookie: str = "") -> dict:
     """构造请求头。"""
-    return {
+    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/144.0.0.0 Safari/537.36"
         ),
-        "Cookie": cookie,
         "X-Requested-With": "XMLHttpRequest",
     }
-
-
-def looks_like_public_geocaching_page(text: str) -> bool:
-    """Return True when Geocaching served a public page instead of an authenticated one."""
-    lowered = text or ""
-    compact = re.sub(r"\s+", "", lowered)
-    if '"isAuthenticated":false' in compact:
-        return True
-    if re.search(r"userInfo\s*=\s*\{\s*ID\s*:\s*0\s*\}", text or ""):
-        return True
-
-    match = re.search(
-        r'"pageInfo"\s*:\s*\{\s*"idx"\s*:\s*1,\s*"size"\s*:\s*(\d+),\s*"totalRows"\s*:\s*(\d+)',
-        text or "",
-    )
-    if match:
-        page_size = int(match.group(1))
-        total_rows = int(match.group(2))
-        if page_size <= 5 and total_rows > page_size:
-            return True
-
-    return False
+    # Preserve the old helper for external diagnostics; crawlers use the jar.
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
 
 
 def is_public_logbook_auth_error(error: Exception) -> bool:
@@ -640,11 +630,12 @@ def is_public_logbook_auth_error(error: Exception) -> bool:
 def get_logbook_token(gc_code: str, cookie: str) -> Optional[str]:
     """获取 logbook token。"""
     url = f"https://www.geocaching.com/seek/cache_details.aspx?wp={gc_code}"
-    headers = make_headers(cookie)
+    headers = make_headers()
+    active_session = get_session_for_cookie(cookie)
 
     for attempt in range(MAX_RETRIES):
         try:
-            resp = session.get(url, headers=headers, timeout=15)
+            resp = active_session.get(url, headers=headers, timeout=15)
 
             if resp.status_code == 200:
                 if looks_like_login_page(resp.url, resp.text):
@@ -660,7 +651,12 @@ def get_logbook_token(gc_code: str, cookie: str) -> Optional[str]:
                 if match:
                     return match.group(1)
 
-            elif resp.status_code in [401, 403]:
+            elif resp.status_code == 403:
+                raise AccessChallengeError(
+                    f"Access denied while getting token for {gc_code}: HTTP 403; "
+                    "check runner network or access challenge with diagnose_auth.py"
+                )
+            elif resp.status_code == 401:
                 if attempt == MAX_RETRIES - 1:
                     raise AuthenticationError(
                         f"Authentication failed while getting token for {gc_code}: HTTP {resp.status_code}"
@@ -670,10 +666,10 @@ def get_logbook_token(gc_code: str, cookie: str) -> Optional[str]:
             elif resp.status_code == 429:
                 time.sleep(10 * (attempt + 1))
 
-        except AuthenticationError:
+        except (AuthenticationError, AccessChallengeError):
             raise
         except Exception as e:
-            logger.error(f"获取 token 失败 {gc_code}: {e}")
+            logger.error("获取 token 失败 %s: %s", gc_code, type(e).__name__)
             time.sleep(5)
 
     return None
@@ -693,7 +689,8 @@ def fetch_logs_for_cache_result(
     num_per_page = 100
     max_retries = 3
 
-    headers = make_headers(cookie)
+    headers = make_headers()
+    active_session = get_session_for_cookie(cookie)
     headers["Referer"] = f"https://www.geocaching.com/seek/geocache_logs.aspx?code={gc_code}"
 
     for _ in range(MAX_LOGBOOK_PAGES):
@@ -707,9 +704,39 @@ def fetch_logs_for_cache_result(
         data = None
         for attempt in range(max_retries):
             try:
-                resp = session.get(url, headers=headers, timeout=20)
+                resp = active_session.get(url, headers=headers, timeout=20)
+                if resp.status_code == 401 or is_login_url(resp.url):
+                    raise AuthenticationError(f"Authentication failed while fetching logs for {gc_code}")
+                if resp.status_code == 403:
+                    raise AccessChallengeError(f"Access denied while fetching logs for {gc_code}: HTTP 403")
                 if resp.status_code == 200:
-                    data = resp.json().get("data", [])
+                    try:
+                        body = resp.json()
+                    except ValueError:
+                        if looks_like_login_page(resp.url, resp.text):
+                            raise AuthenticationError(f"Login HTML returned while fetching logs for {gc_code}")
+                        raise
+                    if (
+                        not isinstance(body, dict)
+                        or not isinstance(body.get("data"), list)
+                        or body.get("success") is False
+                        or str(body.get("status", "")).lower() in {"error", "fail", "failed", "false"}
+                    ):
+                        logger.warning("Invalid logbook response for %s; not marking as crawled", gc_code)
+                        continue
+                    data = body["data"]
+                    page_info = body.get("pageInfo") or {}
+                    if isinstance(page_info, dict):
+                        page_size = page_info.get("size")
+                        total_rows = page_info.get("totalRows")
+                        if (
+                            isinstance(page_size, int) and isinstance(total_rows, int)
+                            and page_size <= 5 and total_rows > page_size
+                            and len(data) <= page_size
+                        ):
+                            raise AuthenticationError(
+                                f"Public logbook response for {gc_code}; not marking as crawled"
+                            )
                     success = True
                     break
                 logger.warning(
@@ -719,10 +746,10 @@ def fetch_logs_for_cache_result(
                 requests.exceptions.SSLError,
                 requests.exceptions.ConnectionError,
             ) as e:
-                logger.warning(f"网络异常: {gc_code} {e}，正在进行第 {attempt + 1} 次重试...")
+                logger.warning(f"网络异常: {gc_code} {type(e).__name__}，正在进行第 {attempt + 1} 次重试...")
                 time.sleep(2)
             except (requests.RequestException, ValueError) as e:
-                logger.warning(f"Failed to fetch logs for {gc_code}: {e}; retrying ({attempt + 1})...")
+                logger.warning(f"Failed to fetch logs for {gc_code}: {type(e).__name__}; retrying ({attempt + 1})...")
                 time.sleep(2)
 
         if not success:
@@ -847,7 +874,8 @@ def crawl_cache_group(
                     if consecutive_public_page_failures >= MAX_CONSECUTIVE_PUBLIC_PAGE_FAILURES:
                         raise AuthenticationError(
                             f"Authentication failure detected: {consecutive_public_page_failures} consecutive "
-                            f"caches returned public logbook page in {group_name} group. Cookie may be expired."
+                            f"caches returned public logbook page in {group_name} group. "
+                            "Authentication was not retained; run diagnose_auth.py in the failing environment."
                         )
                     failed_caches.append(
                         {
@@ -915,7 +943,7 @@ def crawl_cache_group(
                 crawled_codes.append(code)
                 success = True
 
-            except AuthenticationError:
+            except (AuthenticationError, AccessChallengeError):
                 raise
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 retry_count += 1

@@ -23,6 +23,7 @@ on:
           - logs-radius
           - both
           - generate
+          - diagnose-auth
 
 env:
   DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -31,6 +32,26 @@ env:
   GEOCOOKIE_PREMIUM: ${{ secrets.GEOCOOKIE_PREMIUM }}
 
 jobs:
+  diagnose-auth:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'diagnose-auth'
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install diagnostic dependency
+        run: pip install 'requests>=2.31.0'
+
+      - name: Compare cookie jar and legacy header authentication
+        run: python diagnose_auth.py --compare-legacy --compare-full-cookie
+
   crawl-caches:
     runs-on: ubuntu-latest
     if: github.event.inputs.mode == 'caches' || github.event.inputs.mode == 'both' || github.event_name == 'schedule'

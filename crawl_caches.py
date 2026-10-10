@@ -16,8 +16,6 @@ from typing import List, Dict, Set, Optional
 import requests
 import psycopg2
 from psycopg2.extras import execute_batch
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from runtime_utils import (
     AuthenticationError,
@@ -25,6 +23,8 @@ from runtime_utils import (
     is_login_url,
     looks_like_login_page,
     optional_cookie,
+    create_geocaching_session,
+    minimize_cookie_value,
     require_cookie,
     require_env,
     setup_logging,
@@ -69,10 +69,19 @@ CRAWL_GRIDS = [
 ]
 _DETECTED_MAP_VERSION = None
 
-# 设置重试策略
-session = requests.Session()
-retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-session.mount('https://', HTTPAdapter(max_retries=retries))
+# Keep a separate cookie jar for each account.  The global alias is retained for
+# diagnostic compatibility with callers that inspect ``session``.
+_SESSIONS = {}
+
+
+def get_session_for_cookie(cookie: str):
+    normalized = minimize_cookie_value(cookie or "")
+    if normalized not in _SESSIONS:
+        _SESSIONS[normalized] = create_geocaching_session(normalized)
+    return _SESSIONS[normalized]
+
+
+session = get_session_for_cookie(COOKIE)
 
 
 def normalize_map_version(raw_version: Optional[str]) -> Optional[str]:
@@ -101,7 +110,6 @@ def detect_map_version(force_refresh: bool = False) -> str:
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
         "cache-control": "no-cache",
-        "cookie": COOKIE,
         "pragma": "no-cache",
         "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
         "sec-ch-ua-mobile": "?0",
@@ -115,7 +123,7 @@ def detect_map_version(force_refresh: bool = False) -> str:
     }
 
     try:
-        response = session.get(MAP_PAGE_URL, headers=headers, timeout=20)
+        response = get_session_for_cookie(COOKIE).get(MAP_PAGE_URL, headers=headers, timeout=20)
     except requests.RequestException as exc:
         raise RuntimeError(
             f"Failed to fetch map page while detecting map version: network error: {exc}"
@@ -416,7 +424,6 @@ def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float, s
 
     headers = {
         "accept": "*/*",
-        "cookie": COOKIE,
         "referer": "https://www.geocaching.com/play/map",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
         "x-nextjs-data": "1"
@@ -429,7 +436,7 @@ def safe_fetch(max_lat: float, max_lng: float, min_lat: float, min_lng: float, s
         try:
             base_url = f"https://www.geocaching.com/_next/data/release-{version}/en/play/map.json"
             full_url = f"{base_url}?box={box_str}&skip={skip}"
-            response = session.get(full_url, headers=headers, timeout=25)
+            response = get_session_for_cookie(COOKIE).get(full_url, headers=headers, timeout=25)
             
             if response.status_code == 200:
                 data = response.json()
@@ -515,9 +522,8 @@ def check_cache_status_via_detail_page(gc_code: str) -> Optional[int]:
             if not cookie:
                 continue
             try:
-                resp = session.get(url, headers={
+                resp = get_session_for_cookie(cookie).get(url, headers={
                     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "cookie": cookie,
                     "referer": "https://www.geocaching.com/play/map",
                     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 }, timeout=15, allow_redirects=True)
@@ -752,9 +758,8 @@ def _extract_owner_guid_from_detail_page(code: str, premium_only: bool = False) 
             if not cookie:
                 continue
             try:
-                resp = session.get(url, headers={
+                resp = get_session_for_cookie(cookie).get(url, headers={
                     "accept": "text/html,application/xhtml+xml",
-                    "cookie": cookie,
                     "referer": "https://www.geocaching.com/play/map",
                     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 }, timeout=10, allow_redirects=True)
@@ -786,7 +791,6 @@ def _fetch_detail_page_jsonld(code: str) -> Optional[dict]:
             headers = {
                 "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "cookie": cookie,
                 "referer": "https://www.geocaching.com/play/map",
                 "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
                 "sec-ch-ua-mobile": "?0",
@@ -800,7 +804,7 @@ def _fetch_detail_page_jsonld(code: str) -> Optional[dict]:
             }
 
             try:
-                resp = session.get(url, headers=headers, timeout=15, allow_redirects=True)
+                resp = get_session_for_cookie(cookie).get(url, headers=headers, timeout=15, allow_redirects=True)
                 if resp.status_code == 404:
                     return None
                 if resp.status_code != 200:

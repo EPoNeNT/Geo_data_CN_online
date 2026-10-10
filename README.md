@@ -78,7 +78,7 @@ pip install -r requirements.txt
 | 变量 | 说明 |
 | --- | --- |
 | `DATABASE_URL` | Neon/PostgreSQL 连接串。 |
-| `REG_COOKIE` 或 `GEOCOOKIE_NONPREMIUM` | 非 Premium 账号 Cookie，用于抓取普通数据。 |
+| `GEOCOOKIE_NONPREMIUM`（兼容 `GEOCACHING_COOKIE`） | 普通 cache 和日志爬虫使用的 Cookie。`REG_COOKIE` 只用于用户注册信息补抓，不能替代此变量。 |
 | `GEOCOOKIE_PREMIUM` | Premium 账号 Cookie，用于抓取 Premium cache 相关数据及查看其他用户 finds。 |
 
 可选：
@@ -222,12 +222,28 @@ python test/fetch_first_find.py --limit 100
 - `public/`、`test/`、`.env`、`.claude/` 已被 git 忽略。
 - 不要将数据库连接串、Cookie 或账号信息写入代码、README、日志或 Issue。
 - Cookie 环境变量预处理时会自动最小化（仅保留 `gspkauth` 字段），避免 header 过大。
+- 兼容仅复制 Cookie 值或带 `Cookie:` 前缀的完整请求头；外层引号会被移除，字段值内的编码不变。
+- cache 和日志爬虫使用按账号隔离的 Cookie jar；跳转时继续携带认证 Cookie，并接收服务器返回的 Cookie 更新。不要再给这些请求手动添加固定的 `Cookie` 请求头，否则会覆盖 jar 中的新值。
 
 ## 常见问题
 
 ### Geocaching 返回登录页或 403
 
-通常是 Cookie 失效。更新本地 `.env` 或 GitHub Secrets 中的 Cookie。
+先运行只读诊断，不要仅根据“游客页”或 HTTP 403 就认定 Cookie 过期。详情页的 301/302 跳转可能导致固定 Cookie 请求头丢失；403 也可能来自访问限制。地图接口成功不代表日志详情页认证成功。
+
+本地诊断（不连接数据库，不打印 Cookie、token 或页面正文）：
+
+```bash
+python diagnose_auth.py --env-file .env --compare-legacy --compare-full-cookie
+# 必要时对照本地代理差异；正式爬虫仍沿用环境中的代理设置
+python diagnose_auth.py --env-file .env --compare-legacy --compare-full-cookie --ignore-proxy
+```
+
+在 Actions 中手动运行 `Geocache Crawler`，选择 `diagnose-auth` 模式，可在 Ubuntu runner 上用同一份 Secrets 对比旧请求头、精简 Cookie jar 和完整 Cookie jar 三种方式，判断跳转丢失或 Cookie 精简是否影响认证。完整 Cookie 仅用于诊断对照，正式爬虫仍沿用精简策略。该模式不会抓取并写入数据库，也不会生成或推送前端数据。
+
+诊断输出包含实际使用的变量名、运行环境、认证字段长度和分段结构、每次跳转是否带 `gspkauth`、登录/游客状态、服务器 Cookie 的有效期和是否更新，以及日志接口的返回条数。不会打印 Cookie 值、token 或页面正文。只有正式使用的精简 Cookie jar 方式检查通过才返回退出码 0。请同步本地和 Actions 的 Cookie 后再比较，避免把两份不同的 Cookie 当作环境差异。普通日志爬虫优先使用 `GEOCOOKIE_NONPREMIUM`，不存在时才读取 `GEOCACHING_COOKIE`；不读取 `REG_COOKIE`。`diagnose_auth.py` 只在明确指定 `--env-file` 时读取本地文件，并保留已有进程环境变量的优先级。
+
+Cookie jar 能在单次进程内接受网站提供的续期，但网站是否续期由服务器决定。Actions 每个 job 都从 Secrets 的原始 Cookie 开始，运行中更新的值不会自动写回 Secrets。因此，只修复 Cookie 传递无法保证永久免手动更换。当前不保存账号密码、不自动登录，也不上传 Cookie 状态。若认证凭据确实过期，仍需更新本地和 GitHub Secrets。后续若要自动重新登录，需要单独配置账号凭据并处理网站可能出现的验证码。
 
 ### 某个用户请求超时或耗时很长
 

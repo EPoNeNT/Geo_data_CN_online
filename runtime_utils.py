@@ -3,6 +3,7 @@
 
 import logging
 import os
+import re
 import sys
 import time
 from collections import OrderedDict
@@ -12,6 +13,40 @@ from typing import Iterable
 
 class AuthenticationError(RuntimeError):
     """Raised when a request clearly indicates the session is not authenticated."""
+
+
+class AccessChallengeError(RuntimeError):
+    """Raised when access is denied without evidence that credentials expired."""
+
+
+def create_geocaching_session(cookie: str):
+    """Keep account cookies through redirects and accept server-side rotation."""
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    session = requests.Session()
+    for name, value in parse_cookie_fields(minimize_cookie_value(cookie)).items():
+        session.cookies.set(name, value, domain=".geocaching.com", path="/", secure=True)
+    retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    return session
+
+
+def looks_like_public_geocaching_page(text: str) -> bool:
+    """Recognize guest state without treating a signed-in short page as public."""
+    compact = re.sub(r"\s+", "", text or "")
+    if '"isAuthenticated":false' in compact:
+        return True
+    if re.search(r"userInfo\s*=\s*\{\s*ID\s*:\s*0\s*\}", text or ""):
+        return True
+    if '"isAuthenticated":true' in compact:
+        return False
+    match = re.search(
+        r'"pageInfo"\s*:\s*\{\s*"idx"\s*:\s*1,\s*"size"\s*:\s*(\d+),\s*"totalRows"\s*:\s*(\d+)',
+        text or "",
+    )
+    return bool(match and int(match.group(1)) <= 5 and int(match.group(2)) > int(match.group(1)))
 
 
 def require_env(name: str) -> str:
@@ -25,6 +60,10 @@ def require_env(name: str) -> str:
 def normalize_cookie_value(value: str | None) -> str:
     """Normalize cookie values from .env files and GitHub Secrets."""
     cookie = (value or "").strip()
+    if len(cookie) >= 2 and cookie[0] == cookie[-1] and cookie[0] in {"'", '"'}:
+        cookie = cookie[1:-1].strip()
+    if cookie[:7].lower() == "cookie:":
+        cookie = cookie[7:].strip()
     if len(cookie) >= 2 and cookie[0] == cookie[-1] and cookie[0] in {"'", '"'}:
         cookie = cookie[1:-1].strip()
     return cookie
@@ -184,7 +223,8 @@ def looks_like_login_page(url: str, text: str) -> bool:
         "<title>sign in",
         "create your free account",
         "sign in to continue",
-        "next-auth",
-        "account/signin",
     )
-    return any(marker in lowered for marker in markers)
+    if any(marker in lowered for marker in markers):
+        return True
+    # Sign-in links and NextAuth assets also appear on ordinary content pages.
+    return bool(re.search(r'<form\b[^>]*action=[\'"][^\'"]*/account/signin', lowered))

@@ -8,20 +8,35 @@ on:
 
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Run crawler or read-only authentication diagnostic'
+        required: true
+        default: 'crawl'
+        type: choice
+        options:
+          - crawl
+          - diagnose-auth
       limit:
         description: 'Optional --limit value for a manual run'
         required: false
         type: string
 
+concurrency:
+  group: geocache-crawler-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   DATABASE_URL: ${{ secrets.DATABASE_URL }}
   GEOCOOKIE_NONPREMIUM: ${{ secrets.GEOCOOKIE_NONPREMIUM }}
   GEOCOOKIE_PREMIUM: ${{ secrets.GEOCOOKIE_PREMIUM }}
+  GEOCACHING_COOKIE_STATE_FILE: .runtime/geocaching-auth/nonpremium.enc
 
 jobs:
   crawl-archived-logs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      GEOCACHING_COOKIE_STATE_KEY: ${{ secrets.GEOCACHING_COOKIE_STATE_KEY }}
 
     steps:
       - name: Check biweekly schedule
@@ -68,8 +83,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Restore encrypted nonpremium cookie state
+        if: (github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true') && env.GEOCACHING_COOKIE_STATE_KEY != ''
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: geocaching-basic-state-v1-
+
+      - name: Diagnose archived cache authentication
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'diagnose-auth'
+        timeout-minutes: 10
+        run: python diagnose_auth.py --cache GC1036Q --use-cookie-state --compare-legacy --compare-full-cookie
+
       - name: Run archived logs crawler
-        if: github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true'
+        if: (github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true') && github.event.inputs.mode != 'diagnose-auth'
         shell: bash
         run: |
           if [ -n "$CRAWL_LIMIT" ]; then
@@ -80,6 +109,14 @@ jobs:
         env:
           LOG_TO_FILE: '1'
           CRAWL_LIMIT: ${{ github.event.inputs.limit }}
+
+      - name: Save encrypted nonpremium cookie state
+        if: always() && (github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true') && env.GEOCACHING_COOKIE_STATE_KEY != '' && hashFiles('.runtime/geocaching-auth/nonpremium.enc') != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
 
       - name: Upload run artifacts
         if: always() && (github.event_name == 'workflow_dispatch' || steps.biweekly.outputs.should_run == 'true')

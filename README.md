@@ -99,7 +99,7 @@ pip install -r requirements.txt
 | `FIRST_FIND_TIMEOUT_SECONDS` | 首个找到 cache 查询超时（默认 45s）。 |
 | `FIRST_FIND_DELAY_SECONDS` | 首个找到 cache 查询用户间延迟（默认 1.0s）。 |
 
-本地跨进程保存普通账号 Cookie 续期时，可设置 `GEOCACHING_COOKIE_STATE_KEY` 为 Fernet 生成的 URL-safe Base64 密钥（44 个字符）。可用 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` 生成，然后将密钥只放入本地 `.env` 或 GitHub Actions Secret `GEOCACHING_COOKIE_STATE_KEY`。末尾的 `=` 是密钥的一部分；`.env` 中可用双引号包裹整个值，复制到 Secret 时不包含外层引号。可选的 `GEOCACHING_COOKIE_STATE_FILE` 指定状态文件路径，默认 `.runtime/geocaching-auth/nonpremium.enc`。Actions 在 `crawl-caches`、`crawl-logs` 和 `diagnose-auth` job 间恢复并保存该加密文件；需要为这些 job 配置同一 Secret。文件只以加密形式进入 Actions cache，`.runtime/` 已在 gitignore 中排除。更换 `GEOCOOKIE_NONPREMIUM` 会使旧状态失效并从新配置的 Cookie 开始。服务器是否续期由服务器决定；退出登录可能撤销会话，缓存过期或被驱逐后可能需要手动更新 Cookie。此机制不使用账号密码，也不在 workflow 中执行密码登录。
+本地跨进程保存普通账号 Cookie 续期时，可设置 `GEOCACHING_COOKIE_STATE_KEY` 为 Fernet 生成的 URL-safe Base64 密钥（44 个字符）。可用 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` 生成，然后将密钥只放入本地 `.env` 或 GitHub Actions Secret `GEOCACHING_COOKIE_STATE_KEY`。末尾的 `=` 是密钥的一部分；`.env` 中可用双引号包裹整个值，复制到 Secret 时不包含外层引号。可选的 `GEOCACHING_COOKIE_STATE_FILE` 指定状态文件路径，默认 `.runtime/geocaching-auth/nonpremium.enc`。Actions 在 `crawl-caches`、`crawl-logs`、`diagnose-auth` 和独立的 `Archived Logs Crawler` job 间恢复并保存该加密文件；需要为这些 job 配置同一 Secret。两个工作流共享缓存前缀和并发组，避免同时更新同一账号的续期状态。文件只以加密形式进入 Actions cache，`.runtime/` 已在 gitignore 中排除。更换 `GEOCOOKIE_NONPREMIUM` 会使旧状态失效并从新配置的 Cookie 开始。服务器是否续期由服务器决定；退出登录可能撤销会话，缓存过期或被驱逐后可能需要手动更新 Cookie。此机制不使用账号密码，也不在 workflow 中执行密码登录。
 
 ## 数据库表
 
@@ -209,6 +209,8 @@ python test/fetch_first_find.py --limit 100
 - 每日定时任务：运行完整链路，并包含 `crawl_user_regdates.py`。
 - 每月定时任务：同样运行完整链路；日志阶段改为 `--full-active`，补齐 `last_found_date` 为空或早于一个月前的活跃缓存。
 
+独立归档工作流 `.github/workflows/crawl-archived-logs.yml` 每两周运行一次。手动运行 `Archived Logs Crawler` 时，`mode=crawl` 执行归档日志抓取，可选 `limit`；`mode=diagnose-auth` 仅对归档缓存 `GC1036Q` 检查两个账号的详情页和日志接口，不连接或写入数据库。两种模式都恢复、续期并保存普通账号的共享加密 Cookie 状态，使用已有的 `GEOCACHING_COOKIE_STATE_KEY` Secret。
+
 需要在 GitHub Secrets 中配置：
 
 - `DATABASE_URL`
@@ -245,7 +247,7 @@ python diagnose_auth.py --env-file .env --compare-legacy --compare-full-cookie -
 
 诊断输出包含实际使用的变量名、运行环境、认证字段长度和分段结构、每次跳转是否带 `gspkauth`、登录/游客状态、服务器 Cookie 的有效期和是否更新，以及日志接口的返回条数。不会打印 Cookie 值、token 或页面正文。只有正式使用的精简 Cookie jar 方式检查通过才返回退出码 0。请同步本地和 Actions 的 Cookie 后再比较，避免把两份不同的 Cookie 当作环境差异。普通日志爬虫优先使用 `GEOCOOKIE_NONPREMIUM`，不存在时才读取 `GEOCACHING_COOKIE`；不读取 `REG_COOKIE`。`diagnose_auth.py` 只在明确指定 `--env-file` 时读取本地文件，并保留已有进程环境变量的优先级。Actions 诊断的普通账号主请求可使用加密缓存中服务器续期后的 Cookie；旧请求头和完整 Cookie 对照仍使用配置的原始 Cookie，因此输出会注明两者可能来源不同。
 
-Cookie jar 能在单次进程内接受网站提供的续期。Actions 的三个爬取和诊断 job 会通过加密缓存传递普通账号的续期状态，但网站是否续期由服务器决定，退出登录会撤销会话，缓存也可能过期或被驱逐。届时仍需手动更新 Cookie。工作流不保存账号密码、不自动登录；真实登录可能要求 CAPTCHA。
+Cookie jar 能在单次进程内接受网站提供的续期。Actions 的常规爬取、诊断和独立归档日志 job 会通过加密缓存传递普通账号的续期状态，但网站是否续期由服务器决定，退出登录会撤销会话，缓存也可能过期或被驱逐。届时仍需手动更新 Cookie。工作流不保存账号密码、不自动登录；真实登录可能要求 CAPTCHA。
 
 Cookie 的有效期不保证会话在这段时间内一直有效；浏览器退出登录等操作可能使服务器提前拒绝复制给 Actions 的凭据。若同一账号在本地和 Actions 的三种请求方式下都失败，服务器清除了 `gspkauth`，而另一账号正常，应先重新获取失败账号的 Cookie，而不是反复重跑或修改字段。建议普通账号和 Premium 账号分别使用独立浏览器配置文件，减少通过退出登录切换账号；复制 Cookie 后保留对应会话。更新同名 Actions Secret 和本地 `.env` 后先运行 `diagnose-auth`，确认通过再恢复正常爬取。跨运行保存续期 Cookie 也不能保证恢复已被服务器拒绝的会话。
 

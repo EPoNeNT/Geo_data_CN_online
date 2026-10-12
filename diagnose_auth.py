@@ -28,7 +28,10 @@ def load_env_file(path: str) -> None:
         line = raw.strip()
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            os.environ.setdefault(key.strip(), value)
 
 
 def cookie_format_metadata(cookie: str) -> dict:
@@ -77,8 +80,10 @@ def response_metadata(response: requests.Response) -> dict:
     }
 
 
-def check_cookie(cookie: str, cache: str, legacy: bool = False, ignore_proxy: bool = False, full_cookie: bool = False) -> dict:
-    session = requests.Session() if legacy or full_cookie else create_geocaching_session(cookie)
+def check_cookie(cookie: str, cache: str, legacy: bool = False, ignore_proxy: bool = False, full_cookie: bool = False, use_cookie_state: bool = False) -> dict:
+    session = requests.Session() if legacy or full_cookie else (
+        create_geocaching_session(cookie, profile="nonpremium") if use_cookie_state else create_geocaching_session(cookie)
+    )
     if full_cookie:
         for name, value in parse_cookie_fields(cookie).items():
             session.cookies.set(name, value, domain=".geocaching.com", path="/", secure=True)
@@ -97,6 +102,8 @@ def check_cookie(cookie: str, cache: str, legacy: bool = False, ignore_proxy: bo
             params={"wp": cache}, headers=headers, timeout=20,
         )
         result["detail"] = response_metadata(response)
+        if use_cookie_state:
+            result["auth_state_source"] = getattr(session, "auth_state_source", "configured_cookie")
         result["auth_cookie_in_jar_after"] = any(c.name == "gspkauth" for c in session.cookies)
         original_auth = parse_cookie_fields(cookie).get("gspkauth")
         result["auth_cookie_value_updated"] = any(
@@ -148,6 +155,7 @@ def main() -> int:
     parser.add_argument("--compare-legacy", action="store_true", help="Also test the previous fixed-header behavior")
     parser.add_argument("--compare-full-cookie", action="store_true", help="Also check whether discarded cookie fields affect authentication")
     parser.add_argument("--ignore-proxy", action="store_true", help="Diagnostic only: bypass environment proxy settings")
+    parser.add_argument("--use-cookie-state", action="store_true", help="Use encrypted renewed state for the nonpremium profile only")
     args = parser.parse_args()
     if not re.fullmatch(r"GC[0-9A-Z]+", args.cache.upper()):
         parser.error("--cache must be a GC code")
@@ -174,7 +182,8 @@ def main() -> int:
         if not fields.get("gspkauth"):
             all_ok = False
             continue
-        result = check_cookie(cookie, args.cache.upper(), ignore_proxy=args.ignore_proxy)
+        result = check_cookie(cookie, args.cache.upper(), ignore_proxy=args.ignore_proxy,
+                              use_cookie_state=args.use_cookie_state and profile == "nonpremium")
         print(json.dumps({"profile": profile, **result}), flush=True)
         all_ok = all_ok and result["ok"]
         if args.compare_legacy:

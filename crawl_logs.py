@@ -55,7 +55,7 @@ NONPREMIUM_COOKIE = require_cookie("GEOCOOKIE_NONPREMIUM", "GEOCACHING_COOKIE")
 PREMIUM_COOKIE = require_cookie("GEOCOOKIE_PREMIUM")
 
 
-session = create_geocaching_session(NONPREMIUM_COOKIE)
+session = create_geocaching_session(NONPREMIUM_COOKIE, profile="nonpremium")
 _cookie_sessions = {NONPREMIUM_COOKIE: session}
 
 
@@ -63,7 +63,8 @@ def get_session_for_cookie(cookie: str) -> requests.Session:
     """Reuse a cookie jar per account without mixing Premium and Basic state."""
     cookie = minimize_cookie_value(cookie)
     if cookie not in _cookie_sessions:
-        _cookie_sessions[cookie] = create_geocaching_session(cookie)
+        profile = "nonpremium" if cookie == NONPREMIUM_COOKIE else None
+        _cookie_sessions[cookie] = create_geocaching_session(cookie, profile=profile)
     return _cookie_sessions[cookie]
 
 

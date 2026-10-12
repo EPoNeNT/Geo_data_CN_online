@@ -77,7 +77,8 @@ _SESSIONS = {}
 def get_session_for_cookie(cookie: str):
     normalized = minimize_cookie_value(cookie or "")
     if normalized not in _SESSIONS:
-        _SESSIONS[normalized] = create_geocaching_session(normalized)
+        profile = "nonpremium" if normalized == COOKIE else None
+        _SESSIONS[normalized] = create_geocaching_session(normalized, profile=profile)
     return _SESSIONS[normalized]
 
 

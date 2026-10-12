@@ -25,17 +25,24 @@ on:
           - generate
           - diagnose-auth
 
+concurrency:
+  group: geocache-crawler-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   DATABASE_URL: ${{ secrets.DATABASE_URL }}
   REG_COOKIE: ${{ secrets.REG_COOKIE }}
   GEOCOOKIE_NONPREMIUM: ${{ secrets.GEOCOOKIE_NONPREMIUM }}
   GEOCOOKIE_PREMIUM: ${{ secrets.GEOCOOKIE_PREMIUM }}
+  GEOCACHING_COOKIE_STATE_FILE: .runtime/geocaching-auth/nonpremium.enc
 
 jobs:
   diagnose-auth:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'diagnose-auth'
     timeout-minutes: 10
+    env:
+      GEOCACHING_COOKIE_STATE_KEY: ${{ secrets.GEOCACHING_COOKIE_STATE_KEY }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -46,15 +53,34 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install diagnostic dependency
-        run: pip install 'requests>=2.31.0'
+      - name: Restore encrypted nonpremium cookie state
+        if: env.GEOCACHING_COOKIE_STATE_KEY != ''
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: geocaching-basic-state-v1-
+
+      - name: Install diagnostic dependencies
+        run: pip install 'requests>=2.31.0' 'cryptography>=44.0.0'
 
       - name: Compare cookie jar and legacy header authentication
-        run: python diagnose_auth.py --compare-legacy --compare-full-cookie
+        run: python diagnose_auth.py --use-cookie-state --compare-legacy --compare-full-cookie
+
+      - name: Save encrypted nonpremium cookie state
+        if: always() && env.GEOCACHING_COOKIE_STATE_KEY != '' && hashFiles('.runtime/geocaching-auth/nonpremium.enc') != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
 
   crawl-caches:
     runs-on: ubuntu-latest
     if: github.event.inputs.mode == 'caches' || github.event.inputs.mode == 'both' || github.event_name == 'schedule'
+    env:
+      GEOCACHING_COOKIE_STATE_KEY: ${{ secrets.GEOCACHING_COOKIE_STATE_KEY }}
     
     steps:
       - name: Checkout code
@@ -70,6 +96,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Restore encrypted nonpremium cookie state
+        if: env.GEOCACHING_COOKIE_STATE_KEY != ''
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: geocaching-basic-state-v1-
 
       - name: Run cache crawler
         run: python crawl_caches.py
@@ -82,6 +117,14 @@ jobs:
         timeout-minutes: 60
         env:
           LOG_TO_FILE: '1'
+
+      - name: Save encrypted nonpremium cookie state
+        if: always() && env.GEOCACHING_COOKIE_STATE_KEY != '' && hashFiles('.runtime/geocaching-auth/nonpremium.enc') != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
       
       - name: Upload logs on failure
         if: failure()
@@ -94,6 +137,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: crawl-caches
     if: always() && (github.event.inputs.mode == 'logs' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'logs-missing-id' || github.event.inputs.mode == 'logs-radius' || github.event.inputs.mode == 'both' || github.event_name == 'schedule')
+    env:
+      GEOCACHING_COOKIE_STATE_KEY: ${{ secrets.GEOCACHING_COOKIE_STATE_KEY }}
     
     steps:
       - name: Checkout code
@@ -109,6 +154,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Restore encrypted nonpremium cookie state
+        if: env.GEOCACHING_COOKIE_STATE_KEY != ''
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: geocaching-basic-state-v1-
       
       - name: Run logs crawler
         run: |
@@ -128,6 +182,14 @@ jobs:
           LOG_TO_FILE: '1'
           RUN_MODE: ${{ github.event.inputs.mode }}
           SCHEDULE: ${{ github.event.schedule }}
+
+      - name: Save encrypted nonpremium cookie state
+        if: always() && env.GEOCACHING_COOKIE_STATE_KEY != '' && hashFiles('.runtime/geocaching-auth/nonpremium.enc') != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
       
       - name: Upload logs on failure
         if: failure()

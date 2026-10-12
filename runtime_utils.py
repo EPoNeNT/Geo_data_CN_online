@@ -19,15 +19,20 @@ class AccessChallengeError(RuntimeError):
     """Raised when access is denied without evidence that credentials expired."""
 
 
-def create_geocaching_session(cookie: str):
+def create_geocaching_session(cookie: str, *, profile: str | None = None):
     """Keep account cookies through redirects and accept server-side rotation."""
     import requests
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
 
-    session = requests.Session()
-    for name, value in parse_cookie_fields(minimize_cookie_value(cookie)).items():
-        session.cookies.set(name, value, domain=".geocaching.com", path="/", secure=True)
+    session = None
+    if profile == "nonpremium":
+        from geocaching_auth_state import build_state_session
+        session = build_state_session(cookie)
+    if session is None:
+        session = requests.Session()
+        for name, value in parse_cookie_fields(minimize_cookie_value(cookie)).items():
+            session.cookies.set(name, value, domain=".geocaching.com", path="/", secure=True)
     retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount("https://", HTTPAdapter(max_retries=retries))
     return session

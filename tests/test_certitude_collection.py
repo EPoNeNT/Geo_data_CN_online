@@ -130,6 +130,39 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
         self.assertIn("GC00002", conn.state["descriptions"])
         self.assertEqual(conn.state["descriptions"]["GC00001"]["descriptionScanStatus"], "ok")
 
+    def test_detail_progress_counts_processed_urls_and_both_alias_paths(self):
+        conn = FakeConnection()
+        row = cache()
+        crawl_certitude.load_candidates = lambda _conn: [row]
+        primary = "https://www.certitudes.org/a-primary"
+        known_alias = "https://www.certitudes.org/b-known-alias"
+        learned_alias = "https://www.certitudes.org/c-learned-alias"
+        conn.state["checkers"]["GC12345"] = {
+            "checkerId": "GC12345", "sourceUrl": primary, "crawl": {"status": "error"},
+        }
+        conn.state["descriptions"]["GC12345"] = {
+            "descriptionScannedAt": crawl_certitude.utc_now(), "descriptionScanStatus": "ok",
+            "descriptionScanCoverage": "complete",
+            "sourceFingerprint": crawl_certitude.description_fingerprint(row),
+            "descriptionLinks": [
+                {"checkerId": "GC12345", "sourceUrl": known_alias},
+                {"sourceUrl": learned_alias},
+            ],
+        }
+        fresh = {"checkerId": "GC12345", "cacheCode": "GC12345", "successCount": 1,
+                 "failureCount": 0, "counterObservedAt": "2026-11-01T00:00:00Z",
+                 "solverListCoverage": "complete", "solverListObservedAt": "2026-11-01T00:00:00Z",
+                 "publicSolvers": [], "crawl": {"status": "ok"}}
+        messages = []
+        class Logger:
+            def info(self, message, *args): messages.append(message % args)
+            def warning(self, message, *args): messages.append(message % args)
+        with patch.object(crawl_certitude, "parse_checker_html", return_value=fresh):
+            self.collect(conn, FakeFetcher({primary: "page", learned_alias: "page"}), logger=Logger())
+        progress = [line for line in messages if "detail progress" in line]
+        self.assertTrue(progress, messages)
+        self.assertEqual(progress[-1], "Certitude detail progress: processed=3 successful=1 failed=0 skipped_aliases=2")
+
     def test_unchanged_verified_checker_is_not_refreshed_without_activity_index_hit(self):
         conn = FakeConnection()
         row = cache(archived=False)

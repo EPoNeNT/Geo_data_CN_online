@@ -186,6 +186,9 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
     sessions = {}
     due = select_due_candidates(candidates, descriptions, datetime.now(timezone.utc), refresh_days, description_limit)
     attempted = scanned = 0
+    if logger:
+        logger.info("Certitude description stage started: candidates=%s descriptions_due=%s limit=%s",
+                    len(candidates), len(due), description_limit)
     for cache in due:
         code, now = cache["code"], utc_now()
         attempted += 1
@@ -211,10 +214,19 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
             store.save_description(code, record)
             descriptions[code] = record
             if isinstance(exc, AuthenticationError):
+                if logger:
+                    logger.info("Certitude description progress: attempted=%s successful=%s failed=%s",
+                                attempted, scanned, attempted - scanned)
                 break
+            if logger and (attempted % 25 == 0 or attempted == len(due)):
+                logger.info("Certitude description progress: attempted=%s successful=%s failed=%s",
+                            attempted, scanned, attempted - scanned)
             continue
         store.save_description(code, record)
         descriptions[code] = record
+        if logger and (attempted % 25 == 0 or attempted == len(due)):
+            logger.info("Certitude description progress: attempted=%s successful=%s failed=%s",
+                        attempted, scanned, attempted - scanned)
 
     # Retain discovered links independently of the daily activity index.
     for code, description in descriptions.items():
@@ -239,6 +251,8 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
             if cid and not link.get("checkerId"):
                 link["checkerId"] = cid
         store.save_description(code, description)
+    if logger:
+        logger.info("Certitude index stage started: candidates=%s page_limit=%s", len(candidates), activity_page_limit)
     activity_result = index_activity(store, fetcher, candidates, checkers, page_limit=activity_page_limit,
                                      logger=logger, session_factory=requests.Session)
     sources = {}
@@ -258,8 +272,17 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
     source_session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; public-read research)"})
     fetched_ids = set()
     valid_reads = 0
+    if logger:
+        logger.info("Certitude detail stage started: pending_unique_urls=%s retained_checkers=%s",
+                    len(sources), len(checkers))
+    detail_processed = detail_failed = detail_skipped = 0
     for source_url, known_ids in sorted(sources.items()):
+        detail_processed += 1
         if known_ids and known_ids.issubset(fetched_ids):
+            detail_skipped += 1
+            if logger and (detail_processed % 25 == 0 or detail_processed == len(sources)):
+                logger.info("Certitude detail progress: processed=%s successful=%s failed=%s skipped_aliases=%s",
+                            detail_processed, valid_reads, detail_failed, detail_skipped)
             continue
         now = utc_now()
         fresh = None
@@ -272,6 +295,10 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
             if known_ids and cid not in known_ids:
                 raise FetchError("checker_identity_changed")
             if cid in fetched_ids:
+                detail_skipped += 1
+                if logger and (detail_processed % 25 == 0 or detail_processed == len(sources)):
+                    logger.info("Certitude detail progress: processed=%s successful=%s failed=%s skipped_aliases=%s",
+                                detail_processed, valid_reads, detail_failed, detail_skipped)
                 continue
             previous = checkers.get(cid)
             merged = merge_checker(previous, fresh, last_attempt_at=now,
@@ -307,6 +334,7 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
                 if changed:
                     store.save_description(code, description)
         except (FetchError, ValueError) as exc:
+            detail_failed += 1
             error = str(exc) if isinstance(exc, FetchError) else "checker_parse_failed"
             if logger:
                 parsed_source = urlparse(source_url)
@@ -331,6 +359,9 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
                         changed = True
                 if changed:
                     store.save_description(code, description)
+        if logger and (detail_processed % 25 == 0 or detail_processed == len(sources)):
+            logger.info("Certitude detail progress: processed=%s successful=%s failed=%s skipped_aliases=%s",
+                        detail_processed, valid_reads, detail_failed, detail_skipped)
     for session in sessions.values():
         session.close()
     source_session.close()

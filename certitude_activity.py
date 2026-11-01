@@ -159,6 +159,10 @@ def index_activity(store, fetcher, candidates, checkers, *, page_limit=100, logg
             scan_start = _time(old.get("scanStartedAt")) if old.get("inProgress") else None
             cutoff = _time(old.get("indexCoveredThroughAt"))
             cursor = old.get("resumeUrl") if old.get("inProgress") else None
+            region_pages_start = result["pages"]
+            if logger:
+                logger.info("Certitude dashboard region started: region=%s resumed=%s page_limit=%s",
+                            region, bool(cursor), page_limit)
             state = deepcopy(old)
             clock_verified = bool(old.get("clockVerified", True)) if old.get("inProgress") else True
             all_known = bool(old.get("allTimesKnown", True)) if old.get("inProgress") else True
@@ -245,6 +249,10 @@ def index_activity(store, fetcher, candidates, checkers, *, page_limit=100, logg
                     previous_end, reached = process_page(bundle, previous_end)
                     count += 1
                     next_url = bundle[0].get("nextUrl")
+                    if logger:
+                        logger.info("Certitude dashboard page processed: region=%s page=%s rows=%s queued=%s skipped=%s has_next=%s",
+                                    region, count, len(bundle[0]["rows"]), result["queued"],
+                                    result["skipped"], bool(next_url))
                     if next_url is None or reached:
                         complete = clock_verified and all_known
                         if not complete:
@@ -267,6 +275,9 @@ def index_activity(store, fetcher, candidates, checkers, *, page_limit=100, logg
                 if logger:
                     logger.warning("Certitude dashboard scan failed: %s (%s)", region, type(exc).__name__)
             finally:
+                if logger:
+                    logger.info("Certitude dashboard region finished: region=%s status=%s pages=%s",
+                                region, state.get("status", "error"), result["pages"] - region_pages_start)
                 session.close()
                 session = None
     except (ValueError, RuntimeError, requests.RequestException) as exc:

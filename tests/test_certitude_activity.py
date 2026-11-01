@@ -147,7 +147,7 @@ class ActivityIndexTests(unittest.TestCase):
         return {"checkerId": cid, "sourceUrl": "https://www.certitudes.org/certify/" + cid,
                 "cacheCode": parent, "ageSeconds": age, "successCount": success, "failureCount": 0}
 
-    def run_index(self, pages, candidates=None, scans=None, limit=100, times=None):
+    def run_index(self, pages, candidates=None, scans=None, limit=100, times=None, logger=None):
         store, fetcher = FakeStore(scans), FakeFetcher(pages)
         parser = lambda marker, url, expected_country_id=None: (
             self.controls if marker == "controls" else
@@ -156,7 +156,7 @@ class ActivityIndexTests(unittest.TestCase):
         with patch.object(activity, "parse_dashboard_html", side_effect=parser), \
                 patch.object(activity, "_now", side_effect=lambda: next(ticks)):
             out = activity.index_activity(store, fetcher, candidates or [{"code": "GC1", "country": "China"}], {},
-                                          page_limit=limit, session_factory=FakeSession)
+                                          page_limit=limit, logger=logger, session_factory=FakeSession)
         return out, store, fetcher
 
     def test_initial_scan_enumerates_both_pages_and_saves_rows_before_checkpoint(self):
@@ -170,6 +170,22 @@ class ActivityIndexTests(unittest.TestCase):
         self.assertEqual([e[0] for e in store.events], ["checker", "scan", "checker", "scan"])
         self.assertFalse(store.events[-1][2]["inProgress"])
         self.assertIn(("GET", next_url), fetcher.calls)
+
+    def test_progress_logs_region_and_processed_page_without_cursor_url(self):
+        cursor = "https://www.certitudes.org/?sort=act&dir=desc&idx=privatecursor"
+        pages = {"https://www.certitudes.org/": "controls", "POST:1": "region",
+                 "region": self.page(rows=[self.row("A")], next_url=cursor),
+                 cursor: self.page(rows=[self.row("B")])}
+        messages = []
+        class Logger:
+            def info(self, message, *args): messages.append(message % args)
+            def warning(self, message, *args): messages.append(message % args)
+        self.run_index(pages, logger=Logger())
+        output = "\n".join(messages)
+        self.assertIn("region started: region=china resumed=False", output)
+        self.assertIn("page processed: region=china page=1 rows=1", output)
+        self.assertIn("region finished: region=china status=ok pages=2", output)
+        self.assertNotIn("privatecursor", output)
 
     def test_equal_old_cutoff_boundary_includes_next_page(self):
         next_url = "https://www.certitudes.org/?sort=act&dir=desc&idx=two"

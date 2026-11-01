@@ -17,3 +17,9 @@ CREATE TABLE IF NOT EXISTS certitude_snapshots (
     record JSONB NOT NULL,
     PRIMARY KEY (checker_id, observed_at)
 );
+
+CREATE TABLE IF NOT EXISTS certitude_activity_scans (
+    scope TEXT PRIMARY KEY,
+    record JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);

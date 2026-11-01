@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -8,6 +9,13 @@ except ImportError:
 
 WORKFLOW = Path('.github/workflows/crawl.yml')
 TEXT = WORKFLOW.read_text(encoding='utf-8')
+
+
+def job_block(name):
+    match = re.search(rf'^  {re.escape(name)}:\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)', TEXT, re.M | re.S)
+    if not match:
+        raise AssertionError(f'missing job: {name}')
+    return match.group(1)
 
 class CertitudeWorkflowTests(unittest.TestCase):
     def test_yaml_parses_when_pyyaml_available(self):
@@ -25,15 +33,47 @@ class CertitudeWorkflowTests(unittest.TestCase):
     def test_job_runs_certitude_and_preserves_static_deploy_paths(self):
         self.assertIn("run: python -m unittest discover -s tests -p 'test_certitude*.py'", TEXT)
         self.assertIn('python crawl_certitude.py --description-limit "$CERTITUDE_DESCRIPTION_LIMIT"', TEXT)
+        self.assertIn('crawl-certitude:', TEXT)
         self.assertIn('python generate_certitude.py', TEXT)
         self.assertIn('cp public/data/*.json /tmp/Geodataing/public/data/', TEXT)
         self.assertIn('cp -R public/data/certitude/. /tmp/Geodataing/public/data/certitude/', TEXT)
         self.assertIn('if [ -d public/data/certitude ]; then', TEXT)
         self.assertNotIn('rm -rf /tmp/Geodataing/public/data/certitude', TEXT)
 
+
+    def test_collection_is_separate_and_generation_waits_for_it(self):
+        collector, generator = job_block('crawl-certitude'), job_block('generate-data')
+        self.assertIn('needs: crawl-logs', collector)
+        self.assertIn("github.event.inputs.mode == 'certitude'", collector)
+        self.assertIn("github.event.inputs.mode == 'both'", collector)
+        self.assertIn("github.event_name == 'schedule'", collector)
+        collector_if = next(line for line in collector.splitlines() if line.strip().startswith('if:'))
+        self.assertNotIn("github.event.inputs.mode == 'generate'", collector_if)
+        self.assertNotIn('python generate_certitude.py', collector)
+        self.assertIn('needs: [crawl-logs, crawl-certitude]', generator)
+        self.assertNotIn("github.event.inputs.mode == 'certitude'", generator.split('steps:', 1)[0])
+        gen_step = generator[generator.index('- name: Generate Certitude static data'):]
+        gen_if = gen_step.split('run: python generate_certitude.py', 1)[0]
+        self.assertIn('if: success() &&', gen_if)
+        self.assertIn("needs.crawl-certitude.result != 'failure'", gen_if)
+        self.assertIn("needs.crawl-certitude.result != 'cancelled'", gen_if)
+        self.assertNotIn('python crawl_certitude.py', generator)
+
+    def test_cookie_state_settings_and_collection_command_are_only_in_crawler(self):
+        collector, generator = job_block('crawl-certitude'), job_block('generate-data')
+        self.assertIn('GEOCACHING_COOKIE_STATE_KEY', collector)
+        self.assertIn('CERTITUDE_DESCRIPTION_LIMIT', collector)
+        self.assertIn('Restore encrypted nonpremium cookie state', collector)
+        self.assertIn('Save encrypted nonpremium cookie state', collector)
+        self.assertNotIn('Restore encrypted nonpremium cookie state', generator)
+        self.assertNotIn('Save encrypted nonpremium cookie state', generator)
+        self.assertNotIn('CERTITUDE_DESCRIPTION_LIMIT', generator)
+        self.assertNotIn('python crawl_certitude.py', generator)
+
     def test_offline_tests_run_before_collection(self):
-        test_step = TEXT.index("run: python -m unittest discover -s tests -p 'test_certitude*.py'")
-        collect_step = TEXT.index('run: python crawl_certitude.py')
+        job = TEXT.split('  crawl-certitude:', 1)[1].split('  generate-data:', 1)[0]
+        test_step = job.index("run: python -m unittest discover -s tests -p 'test_certitude*.py'")
+        collect_step = job.index('run: python crawl_certitude.py')
         self.assertLess(test_step, collect_step)
 
 if __name__ == '__main__':

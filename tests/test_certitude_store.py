@@ -136,7 +136,35 @@ class CertitudeStoreTests(unittest.TestCase):
         self.assertIn("create table if not exists certitude_descriptions", sql)
         self.assertIn("create table if not exists certitude_checkers", sql)
         self.assertIn("create table if not exists certitude_snapshots", sql)
+        self.assertIn("create table if not exists certitude_activity_scans", sql)
         self.assertNotIn("drop table", sql)
+
+    def test_activity_scans_round_trip_and_use_parameterized_upsert(self):
+        conn = FakeConnection()
+        record = {"lastAttemptAt": "2026-11-01T00:00:00Z", "status": "ok", "cursor": "page/2"}
+        conn.cur.rows = [("region:North", json.dumps(record))]
+        store = CertitudeStore(conn)
+        self.assertEqual(store.load_activity_scans(), {"region:North": record})
+        store.save_activity_scan("region:North", record)
+        query, params = conn.cur.calls[-1]
+        self.assertNotIn("region:North", query)
+        self.assertEqual(params[0], "region:North")
+        self.assertEqual(json.loads(params[1]), record)
+        self.assertEqual(params[2], record["lastAttemptAt"])
+        self.assertIn("ON CONFLICT (scope)", query)
+        self.assertEqual(conn.commits, 2)
+
+    def test_activity_scan_without_attempt_time_gets_updated_timestamp(self):
+        conn = FakeConnection()
+        CertitudeStore(conn).save_activity_scan("region:South", {"status": "error"})
+        _, params = conn.cur.calls[0]
+        self.assertTrue(params[2])
+
+    def test_activity_scan_record_must_be_json_object(self):
+        conn = FakeConnection()
+        with self.assertRaises(ValueError):
+            CertitudeStore(conn).save_activity_scan("region:North", [])
+        self.assertEqual(conn.cur.calls, [])
 
     def test_description_uses_contract_scanned_timestamp_and_preserves_link_evidence(self):
         conn = FakeConnection()

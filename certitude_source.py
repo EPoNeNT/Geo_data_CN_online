@@ -74,6 +74,170 @@ def _parse_tree(html: str) -> _Node:
     return parser.root
 
 
+def _class_nodes(node: _Node, class_name: str):
+    return [item for item in node.descendants()
+            if class_name in (item.attrs.get("class") or "").split()]
+
+
+def _nonnegative_int(value: str) -> int | None:
+    value = value.strip()
+    return int(value) if re.fullmatch(r"\d+", value) else None
+
+
+def _dashboard_age(node: _Node) -> int | None:
+    # Attribute t is already an elapsed whole-second age, never a timestamp.
+    return _nonnegative_int(node.attrs.get("t", ""))
+
+
+def parse_dashboard_html(html: str, source_url: str, expected_country_id: str | None = None) -> dict:
+    """Parse a complete Certitude dashboard page without inferring missing data."""
+    if not isinstance(html, str) or not isinstance(source_url, str) or not _host_allowed(source_url):
+        raise ValueError("dashboard HTML and allowed source URL are required")
+    root = _parse_tree(html)
+    html_nodes = [node for node in root.descendants() if node.tag == "html"]
+    if not html_nodes or any(not node.closed for node in html_nodes):
+        raise ValueError("dashboard document is incomplete")
+
+    forms = [node for node in root.descendants() if node.tag == "form"]
+    country_selects = [select for form in forms for select in form.descendants()
+                       if select.tag == "select" and select.attrs.get("name") == "filter_country"]
+    tables = [node for node in root.descendants() if node.tag == "table"]
+    if len(country_selects) != 1 or not tables:
+        raise ValueError("dashboard controls or table are unavailable")
+    form = next(form for form in forms if country_selects[0] in list(form.descendants()))
+    if not form.closed:
+        raise ValueError("dashboard filter form is truncated")
+    expected_headers = {"solution", "owner", "puzzle", "location", "date published", "woohoo!", "d'oh!", "latest activity"}
+    table = next((candidate for candidate in tables
+                  if expected_headers.issubset({" ".join(node.text().split()).casefold()
+                                               for node in candidate.descendants() if node.tag == "th"})), None)
+    if table is None:
+        raise ValueError("dashboard activity table is unavailable")
+    if not table.closed:
+        raise ValueError("dashboard table is truncated")
+
+    filter_names = {"filter_owner", "filter_country", "filter_region", "filter_quadrangle", "filter_user"}
+    filters = {}
+    for node in form.descendants():
+        name = node.attrs.get("name")
+        if name not in filter_names:
+            continue
+        if node.tag == "select":
+            options = [item for item in node.descendants() if item.tag == "option"]
+            selected = next((item for item in options if "selected" in item.attrs), options[0] if options else None)
+            filters[name] = ((selected.attrs.get("value") if selected.attrs.get("value") is not None else selected.text()).strip()
+                             if selected else "")
+        elif node.tag == "input":
+            filters[name] = node.attrs.get("value") or ""
+    if not filter_names.issubset(filters):
+        raise ValueError("dashboard filter controls are incomplete")
+
+    countries = {}
+    country_select = country_selects[0]
+    for option in (item for item in country_select.descendants() if item.tag == "option"):
+        label = " ".join(option.text().split()).casefold()
+        key = next((key for phrase, key in (("china", "china"), ("taiwan", "taiwan"),
+                      ("hong kong", "hong-kong"), ("macao", "macao"), ("macau", "macao"))
+                    if label.endswith(phrase)), None)
+        if key:
+            value = option.attrs.get("value")
+            if value is None:
+                raise ValueError("dashboard country option has no value")
+            countries[key] = value
+    if set(countries) != {"china", "taiwan", "hong-kong", "macao"}:
+        raise ValueError("dashboard country options are incomplete")
+    selected_country = filters["filter_country"] or next(
+        (item.attrs.get("value", "") for item in country_select.descendants()
+         if item.tag == "option"), "")
+    if expected_country_id is not None and selected_country != str(expected_country_id):
+        raise ValueError("dashboard selected country conflicts with expected country")
+    if expected_country_id is not None and (
+            filters["filter_region"] != "All" or filters["filter_quadrangle"] != "All"
+            or filters["filter_owner"] != "" or filters["filter_user"] != ""):
+        raise ValueError("dashboard contains unexpected restrictive subfilters")
+
+    headers = [" ".join(node.text().split()).casefold() for node in table.descendants() if node.tag == "th"]
+    if not expected_headers.issubset(set(headers)):
+        raise ValueError("dashboard table headers are incomplete")
+    rows = []
+    for tr in (item for item in table.descendants() if item.tag == "tr"):
+        cells = [item for item in tr.descendants() if item.tag == "td"]
+        if not cells:
+            continue
+        if not tr.closed or any(not cell.closed for cell in cells):
+            raise ValueError("dashboard data row is truncated")
+        def cell(class_name):
+            return next((item for item in cells if class_name in (item.attrs.get("class") or "").split()), None)
+        wp_cell, cache_cell, activity_cell = cell("c-wp"), cell("c-nam"), cell("c-act")
+        success_cell, failure_cell = cell("c-woo"), cell("c-doh")
+        if not all((wp_cell, cache_cell, activity_cell, success_cell, failure_cell)):
+            raise ValueError("dashboard data row is malformed")
+        checker_anchor = next((item for item in wp_cell.descendants() if item.tag == "a" and item.attrs.get("href")), None)
+        if checker_anchor is None:
+            raise ValueError("dashboard checker link is missing")
+        checker_url = urljoin(source_url, checker_anchor.attrs["href"].strip())
+        if not _host_allowed(checker_url):
+            raise ValueError("dashboard checker link host is not allowed")
+        checker_id = _waypoint(checker_url)
+        if checker_id is None:
+            raise ValueError("dashboard checker ID is unavailable")
+        parent_link = next((urljoin(source_url, item.attrs["href"].strip()) for item in cache_cell.descendants()
+                            if item.tag == "a" and item.attrs.get("href") and
+                            _id_from_gc_url(urljoin(source_url, item.attrs["href"].strip()))), None)
+        cache_code = _id_from_gc_url(parent_link) if parent_link else None
+        rows.append({"checkerId": checker_id, "sourceUrl": checker_url, "cacheCode": cache_code,
+                     "ageSeconds": _dashboard_age(activity_cell),
+                     "successCount": _nonnegative_int(success_cell.text()),
+                     "failureCount": _nonnegative_int(failure_cell.text())})
+
+    action = urljoin(source_url, form.attrs.get("action", ""))
+    action_query = parse_qs(urlsplit(action).query)
+    sort_url = None
+    for anchor in (node for node in root.descendants() if node.tag == "a" and node.attrs.get("href")):
+        candidate = urljoin(source_url, anchor.attrs["href"].strip())
+        query = parse_qs(urlsplit(candidate).query)
+        if query.get("sort") == ["act"] and query.get("dir") == ["desc"]:
+            sort_url = candidate
+            break
+    if sort_url is None and action_query.get("sort") == ["act"] and action_query.get("dir") == ["desc"]:
+        sort_url = action
+
+    next_url = None
+    pagination = []
+    for anchor in (node for node in root.descendants() if node.tag == "a" and node.attrs.get("href")):
+        candidate = urljoin(source_url, anchor.attrs["href"].strip())
+        query = parse_qs(urlsplit(candidate).query, keep_blank_values=True)
+        parsed = urlsplit(candidate)
+        if (parsed.hostname in {"certitudes.org", "www.certitudes.org"} and parsed.path == "/"
+                and query.get("sort") == action_query.get("sort")
+                and query.get("dir") == action_query.get("dir")
+                and query.get("idx", [""])[0]):
+            pagination.append({"url": candidate, "text": " ".join(anchor.text().split()),
+                               "rel": anchor.attrs.get("rel", ""), "class": anchor.attrs.get("class", "")})
+    for container in (node for node in root.descendants() if node.tag == "div" and
+                       {"next", "logo"}.issubset(set((node.attrs.get("class") or "").split()))):
+        links = [node for node in container.descendants() if node.tag == "a" and node.attrs.get("href")]
+        if not links:
+            continue
+        candidates = []
+        for link in links:
+            resolved = urljoin(source_url, link.attrs["href"].strip())
+            query = parse_qs(urlsplit(resolved).query, keep_blank_values=True)
+            if (urlsplit(resolved).hostname in {"certitudes.org", "www.certitudes.org"} and
+                    urlsplit(resolved).path == "/" and query.get("sort") == action_query.get("sort") and
+                    query.get("dir") == action_query.get("dir") and query.get("idx", [""])[0]):
+                candidates.append(resolved)
+        if len(candidates) != 1:
+            raise ValueError("dashboard pagination link is malformed or ambiguous")
+        if next_url is not None and next_url != candidates[0]:
+            raise ValueError("dashboard pagination links conflict")
+        next_url = candidates[0]
+    return {"filterAction": action, "activitySortUrl": sort_url,
+            "sort": action_query.get("sort", [None])[0], "direction": action_query.get("dir", [None])[0], "countries": countries,
+            "selectedCountry": selected_country, "filters": filters, "rows": rows,
+            "pagination": pagination, "nextUrl": next_url}
+
+
 def _host_allowed(url: str) -> bool:
     try:
         return (urlsplit(url).scheme.lower() in {"http", "https"}

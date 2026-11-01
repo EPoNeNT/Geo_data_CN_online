@@ -234,6 +234,20 @@ class CertitudeStore:
         rows = self._run("SELECT checker_id, record FROM certitude_checkers", fetch=True)
         return {checker_id: self._decode(record) for checker_id, record in rows}
 
+    def load_activity_scans(self):
+        rows = self._run("SELECT scope, record FROM certitude_activity_scans", fetch=True)
+        return {scope: self._decode(record) for scope, record in rows}
+
+    def save_activity_scan(self, scope, record):
+        if not isinstance(record, dict):
+            raise ValueError("activity scan record must be a JSON object")
+        updated_at = record.get("lastAttemptAt") or datetime.now(timezone.utc).isoformat()
+        self._run(
+            "INSERT INTO certitude_activity_scans (scope, record, updated_at) VALUES (%s, %s::jsonb, %s) "
+            "ON CONFLICT (scope) DO UPDATE SET record = EXCLUDED.record, updated_at = EXCLUDED.updated_at",
+            (scope, json.dumps(record, ensure_ascii=False), updated_at),
+        )
+
     def save_description(self, code, record):
         existing = self._run("SELECT record FROM certitude_descriptions WHERE cache_code = %s", (code,), fetch=True)
         previous = self._decode(existing[0][0]) if existing else {}

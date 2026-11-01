@@ -95,6 +95,24 @@ class PublicationDiscoveryTests(unittest.TestCase):
         self.assertEqual([e[0] for e in china_events[:2]], ["checker", "scan"])
         self.assertEqual(store.scans["published:china"]["scanNewestPublishedAt"], "2026-11-02T00:00:00Z")
 
+    def test_zero_page_limit_reads_to_terminal_page(self):
+        cursor = "https://www.certitudes.org/?sort=dat&dir=desc&idx=older"
+        pages = {"https://www.certitudes.org/": "controls"}
+        for country in "1234":
+            pages["POST:" + country] = page(country)
+        pages["POST:1"] = page("1", [row("HEAD")], cursor)
+        pages[cursor] = page("1", [row("OLDER", published="2020-01-01T00:00:00Z")])
+        result, store, fetcher = self.run_index(pages, limit=0)
+        self.assertEqual(result["pages"], 5)
+        self.assertEqual(result["failedRegions"], [])
+        self.assertEqual(result["partialRegions"], [])
+        self.assertIn(("GET", cursor), fetcher.calls)
+        self.assertFalse(store.scans["published:china"]["inProgress"])
+
+    def test_negative_page_limit_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            self.run_index({}, limit=-1)
+
     def test_equal_publication_cutoff_continues_but_strictly_older_page_stops(self):
         cursor = "https://www.certitudes.org/?sort=dat&dir=desc&idx=older"
         pages = {"https://www.certitudes.org/": "controls"}

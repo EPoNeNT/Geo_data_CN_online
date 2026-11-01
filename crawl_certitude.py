@@ -234,11 +234,15 @@ def collect(connection, *, activity_page_limit=100, publication_page_limit=100, 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--activity-page-limit", type=int, default=int(os.getenv("CERTITUDE_ACTIVITY_PAGE_LIMIT", "100")))
-    parser.add_argument("--publication-page-limit", type=int, default=int(os.getenv("CERTITUDE_PUBLICATION_PAGE_LIMIT", "100")))
+    parser.add_argument("--activity-page-limit", type=int, default=os.getenv("CERTITUDE_ACTIVITY_PAGE_LIMIT", "100"),
+                        help="Maximum activity pages per region (at least 1; default 100)")
+    parser.add_argument("--publication-page-limit", type=int, default=os.getenv("CERTITUDE_PUBLICATION_PAGE_LIMIT", "100"),
+                        help="Maximum publication pages per region (0 means unlimited; default 100)")
     args = parser.parse_args()
-    if args.activity_page_limit < 1 or args.publication_page_limit < 1:
-        parser.error("page limits must be positive")
+    if args.activity_page_limit < 1:
+        parser.error("--activity-page-limit must be at least 1")
+    if args.publication_page_limit < 0:
+        parser.error("--publication-page-limit must be nonnegative (0 means unlimited)")
     logger = setup_logging("crawl_certitude.log")
     connection = connect_postgres(require_env("DATABASE_URL"), logger=logger)
     try:

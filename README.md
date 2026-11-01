@@ -98,7 +98,7 @@ pip install -r requirements.txt
 | `AVATAR_REQUEST_TIMEOUT_SECONDS` | 头像请求超时时间。 |
 | `FIRST_FIND_TIMEOUT_SECONDS` | 首个找到 cache 查询超时（默认 45s）。 |
 | `FIRST_FIND_DELAY_SECONDS` | 首个找到 cache 查询用户间延迟（默认 1.0s）。 |
-| `CERTITUDE_PUBLICATION_PAGE_LIMIT` | 每个地区每次最多读取的发布时间列表页数（默认 100；至少为 1）；命令行可用 `--publication-page-limit` 覆盖。 |
+| `CERTITUDE_PUBLICATION_PAGE_LIMIT` | 每个地区每次最多读取的发布时间列表页数（默认 100；0 表示不限页数）；命令行可用 `--publication-page-limit` 覆盖。 |
 | `CERTITUDE_ACTIVITY_PAGE_LIMIT` | 每次地区活动扫描最多读取的 dashboard 页面数（默认 100；至少为 1）；命令行可用 `--activity-page-limit` 覆盖。 |
 | `CERTITUDE_REQUEST_DELAY_SECONDS` | Certitude 来源请求间隔（默认 1.5 秒）。 |
 | `CERTITUDE_MAX_RETRIES` | Certitude 来源请求最大重试次数（默认 3）。 |
@@ -122,7 +122,7 @@ python crawl_certitude.py --publication-page-limit 100 --activity-page-limit 100
 python generate_certitude.py
 ```
 
-每个地区的发布时间列表每次最多读取 100 页，可通过 `CERTITUDE_PUBLICATION_PAGE_LIMIT` 或 `--publication-page-limit` 调整；活动扫描同样默认最多读取 100 页，可通过 `CERTITUDE_ACTIVITY_PAGE_LIMIT` 或 `--activity-page-limit` 调整。手动 Actions 的 `certitude` 模式提供 `publication_page_limit` 输入，默认 100。扫描使用 dashboard 实际筛选和下一页链接；达到上限会保存游标供后续续扫。恢复时先重新读取地区筛选列表，再读取保存的游标。活动索引发现近期变化，失败或未完成的 checker 会保留待处理状态并在后续重试。来源时间与缓存响应信息只用于保守识别近期活动窗口；窗口边界可能重复检查少量记录，以避免漏掉边界活动。公开活动年龄是经过的秒数，不是活动发生的绝对时间；精确 `latestActivityAt` 仍来自 checker 详情页。手动 Actions 的 `certitude` 模式只采集并写入 Neon，不生成或发布文件；完成采集后，可选择 `generate` 模式生成和发布数据，该模式不会启动 Certitude 爬虫，并保留原有的用户注册时间补抓流程。`both` 模式及定时运行会执行完整链路。已核验的链接不会因单次扫描缺失而重置；未映射题目和未知角色会保留为未知状态。Certitude 静态数据不包含 Found it 状态。
+每个地区的发布时间列表默认每次最多读取 100 页，设为 `0` 可取消页数上限；首次扫描读取到末页，后续仍遵循增量时间边界。可通过 `CERTITUDE_PUBLICATION_PAGE_LIMIT` 或 `--publication-page-limit` 调整；活动扫描同样默认最多读取 100 页，可通过 `CERTITUDE_ACTIVITY_PAGE_LIMIT` 或 `--activity-page-limit` 调整。手动 Actions 的 `certitude` 模式提供 `publication_page_limit` 输入，默认 100。扫描使用 dashboard 实际筛选和下一页链接；达到上限会保存游标供后续续扫。恢复时先重新读取地区筛选列表，再读取保存的游标。活动索引发现近期变化，失败或未完成的 checker 会保留待处理状态并在后续重试。来源时间与缓存响应信息只用于保守识别近期活动窗口；窗口边界可能重复检查少量记录，以避免漏掉边界活动。公开活动年龄是经过的秒数，不是活动发生的绝对时间；精确 `latestActivityAt` 仍来自 checker 详情页。手动 Actions 的 `certitude` 模式只采集并写入 Neon，不生成或发布文件；完成采集后，可选择 `generate` 模式生成和发布数据，该模式不会启动 Certitude 爬虫，并保留原有的用户注册时间补抓流程。`both` 模式及定时运行会执行完整链路。已核验的链接不会因单次扫描缺失而重置；未映射题目和未知角色会保留为未知状态。Certitude 静态数据不包含 Found it 状态。
 
 采集器使用 `certitude_descriptions`、`certitude_checkers`、`certitude_snapshots` 和 `certitude_activity_scans` 四张表；也可手动执行 `sql/certitude_setup.sql` 初始化。未完成各地区首次发布时间列表遍历和静态数据生成时，生成结果不代表发现范围已完成。后续前端应先读取 `/data/certitude/manifest.json`，并在同一 `datasetVersion` 下读取其余文件。
 
@@ -229,7 +229,7 @@ python test/fetch_first_find.py --limit 100
 - `logs-missing-id`：运行 `crawl_logs.py --missing-log-id`，仅处理当前存在 `log_id IS NULL` 日志的未删除缓存。
 - `logs-radius`：运行固定北京中心点 2 公里半径模式，处理所有非 404 缓存（含归档缓存）。
 - 日志同步以 `LogID` 识别事件并以 API 当前字段为准；完整 logbook 出现同缓存、同用户的新 `LogID` 时，会移除 API 已不存在的旧事件。
-- `certitude`：独立运行 `crawl-certitude` job，读取发布时间列表和地区活动增量，刷新匹配的验证页统计与公开名单并保存到 Neon。可用 `publication_page_limit` 输入设置每地区发布时间列表页数上限（默认 100）；该 job 不使用 Geocaching Cookie 状态。
+- `certitude`：独立运行 `crawl-certitude` job，读取发布时间列表和地区活动增量，刷新匹配的验证页统计与公开名单并保存到 Neon。可用 `publication_page_limit` 输入设置每地区发布时间列表页数上限（默认 100，0 表示不限页数）；该 job 不使用 Geocaching Cookie 状态。
 - `both`：依次运行 cache 抓取、城市归属、日志抓取、Certitude 采集、用户注册时间补抓、静态数据生成。
 - `generate`：从现有数据库生成并发布普通报表及 Certitude 静态数据，不运行 Certitude 爬虫；保留原有用户注册时间补抓。
 - 每日定时任务：运行完整链路，包含 Certitude 采集和 `crawl_user_regdates.py`。

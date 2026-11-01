@@ -43,9 +43,9 @@ def _pending_checker(row):
 
 def index_publications(store, fetcher, candidates, checkers, *, page_limit=100, logger=None,
                        session_factory=requests.Session):
-    """Save candidates before advancing a resumable publication scan."""
-    if page_limit < 1:
-        raise ValueError("publication page limit must be positive")
+    """Save candidates before advancing a resumable scan; zero removes the page cap."""
+    if page_limit < 0:
+        raise ValueError("publication page limit must be nonnegative (0 means unlimited)")
     result = {"pages": 0, "queued": 0, "skipped": 0, "failedRegions": [], "partialRegions": []}
     project_codes = {str(row.get("code", "")).strip().upper() for row in candidates}
     candidate_fingerprint = _candidate_fingerprint(project_codes)
@@ -188,7 +188,7 @@ def index_publications(store, fetcher, candidates, checkers, *, page_limit=100, 
                 visited.add(next_url)
                 cursor = next_url
                 save(cursor, "partial")
-                if count >= page_limit:
+                if page_limit and count >= page_limit:
                     result["partialRegions"].append(region)
                     break
                 page = read(cursor, country)

@@ -37,7 +37,7 @@
 3. 对匹配项目的 checker 详情使用匿名 HTTP 读取，以来源 waypoint 和页面明确父级链接核验映射。新发现、近期活动、失败或未完成项进入待处理队列；已完成且无变化的记录不重复入队。
 4. `certitude_store.py` 将当前 checker 记录、真实观测快照及地区活动和发布时间扫描进度写入现有专用表。不保存答案、提示、失败提交正文或认证凭据。既有描述记录和 checker/snapshot 数据保留；不删除表或迁移数据。
 5. 地区活动列表仍按实际表单筛选和 `sort=act&dir=desc` 每日刷新，发现近期活动变化并重试失败或未完成的 checker。每区每次最多读取 `CERTITUDE_ACTIVITY_PAGE_LIMIT` 页（默认 100；CLI `--activity-page-limit` 可覆盖）。
-6. 发布时间扫描每区最多读取 `CERTITUDE_PUBLICATION_PAGE_LIMIT` 页（默认 100；CLI `--publication-page-limit` 可覆盖）。`crawl-certitude` Action 输入 `publication_page_limit` 默认 100。到达上限保存真实游标；续跑时重新 POST 地区首页，再读取保存的游标。checker 待处理记录先持久化再推进游标。
+6. 发布时间扫描每区最多读取 `CERTITUDE_PUBLICATION_PAGE_LIMIT` 页（默认 100，0 表示不限页数；CLI `--publication-page-limit` 可覆盖）。`crawl-certitude` Action 输入 `publication_page_limit` 默认 100。到达上限保存真实游标；续跑时重新 POST 地区首页，再读取保存的游标。checker 待处理记录先持久化再推进游标。
 7. 活动窗口仍根据请求起止时间、来源 `Date` 和缓存时间信息保守估计，边界采用包含式检查。dashboard 的 `c-act.act[t]` 是经过秒数，不是绝对时间；准确的 `latestActivityAt` 只从 checker 详情页读取。
 8. 采集失败保留上次有效计数、名单及观测时间。只有本次实际取得有效数据时才写入对应观测或快照，不用旧值伪造历史。
 9. `generate_certitude.py` 在只读一致性事务中读取主数据与已核验 checker；计算榜单、关系和 15 组范围。Found it 日志不再为 Certitude 静态数据联结。
@@ -56,7 +56,7 @@
 
 ## Action 接入与交付
 
-`crawl-certitude` 作为独立 job 负责匿名采集并写入 Neon，不依赖或恢复/保存 Geocaching 加密 Cookie 状态；`crawl-caches` 和 `crawl-logs` 仍使用原有账号会话。`generate-data` 中的 Certitude 生成步骤只读取已保存数据。手动 `certitude` 模式可用 `publication_page_limit` 限制每地区发布时间列表页数，默认 100；`generate` 模式不会启动 Certitude 爬虫，继续保留原有的用户注册时间补抓和生成发布流程。`both` 与定时运行按 `crawl-caches → crawl-logs → crawl-certitude → generate-data` 执行。采集失败或取消时跳过本轮 Certitude 生成，保留已发布版本。递归复制 Certitude 子目录，保留发布仓库已有历史版本。工作流改动本身不执行 Git 提交或 push。
+`crawl-certitude` 作为独立 job 负责匿名采集并写入 Neon，不依赖或恢复/保存 Geocaching 加密 Cookie 状态；`crawl-caches` 和 `crawl-logs` 仍使用原有账号会话。`generate-data` 中的 Certitude 生成步骤只读取已保存数据。手动 `certitude` 模式可用 `publication_page_limit` 限制每地区发布时间列表页数，默认 100，0 表示不限页数；`generate` 模式不会启动 Certitude 爬虫，继续保留原有的用户注册时间补抓和生成发布流程。`both` 与定时运行按 `crawl-caches → crawl-logs → crawl-certitude → generate-data` 执行。采集失败或取消时跳过本轮 Certitude 生成，保留已发布版本。递归复制 Certitude 子目录，保留发布仓库已有历史版本。工作流改动本身不执行 Git 提交或 push。
 
 前端后续从 manifest 读取固定批次路径；每批为 manifest 加 15 个范围文件，不生成逐题或合并详情文件。范围内保留题目摘要，玩家查看关联藏点时使用 `scope.caches` 和榜单中的 `cacheCodes`。发布环境宜将 manifest 设置为可重新验证、版本目录设置为长缓存。当前仓库只负责生成数据，不修改另一个仓库的页面或缓存配置。
 

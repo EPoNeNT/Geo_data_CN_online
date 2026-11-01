@@ -26,7 +26,7 @@ on:
           - certitude
           - diagnose-auth
       publication_page_limit:
-        description: '每个地区单次最多扫描的发布时间列表页数（未完成会保存进度）'
+        description: '每个地区的发布时间列表页数上限（0 表示不限页数；未完成会保存进度）'
         required: false
         default: '100'
         type: string

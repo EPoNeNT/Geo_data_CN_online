@@ -1,0 +1,82 @@
+"""Offline checks for candidate discovery and atomic Certitude publication."""
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timezone
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from crawl_certitude import _description_record, description_fingerprint, select_due_candidates
+from generate_certitude import build_dataset, publish_dataset
+
+
+class PipelineTests(unittest.TestCase):
+    def test_description_duplicate_source_occurrences_are_preserved(self):
+        links = [{"sourceUrl": "https://www.certitudes.org/certitude?wp=GC1", "evidence": "LongDescription",
+                  "sourceOccurrence": "LongDescription:1"},
+                 {"sourceUrl": "https://www.certitudes.org/certitude?wp=GC1", "evidence": "LongDescription",
+                  "sourceOccurrence": "LongDescription:2"}]
+        result = _description_record({}, {"code": "GC1"}, "2026-11-01T00:00:00Z", links=links)
+        self.assertEqual(len(result["descriptionLinks"]), 2)
+
+    def test_pending_first_archived_included_and_unchanged_recent_skipped(self):
+        now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+        rows = [{"code": "GC1", "cache_status": 2}, {"code": "GC2"}, {"code": "GC3"}]
+        saved = {"GC2": {"descriptionScanStatus": "ok", "descriptionScanCoverage": "complete",
+                          "descriptionScannedAt": "2026-10-31T00:00:00Z",
+                          "sourceFingerprint": description_fingerprint(rows[1])}}
+        self.assertEqual([r["code"] for r in select_due_candidates(rows, saved, now, 30, 1)], ["GC1"])
+        self.assertEqual([r["code"] for r in select_due_candidates(rows, saved, now, 30, 0)], ["GC1", "GC3"])
+
+    def test_failed_scan_retried_and_metadata_change_triggers_scan(self):
+        rows = [{"code": "GC1", "name": "new"}]
+        saved = {"GC1": {"descriptionScanStatus": "ok", "descriptionScanCoverage": "complete",
+                          "descriptionScannedAt": "2026-10-31T00:00:00Z", "sourceFingerprint": "old"}}
+        self.assertEqual(select_due_candidates(rows, saved, datetime.now(timezone.utc), 30, 10), rows)
+
+    def test_empty_dataset_has_fifteen_scopes_and_unique_version(self):
+        first = build_dataset([], {}, {})
+        second = build_dataset([], {}, {})
+        self.assertEqual(len(first[1]), 15)
+        self.assertNotEqual(first[0]["datasetVersion"], second[0]["datasetVersion"])
+
+    def test_prior_verified_mapping_conflict_retains_cache_with_unknown_stats(self):
+        candidates = [{"code": "GC1", "country": "China"}]
+        checkers = {"GC1": {"checkerId": "GC1", "cacheCode": "GC1", "mappingStatus": "conflict",
+                            "mappingEvidence": "previous parent GC1; new parent GC2", "role": "unknown"}}
+        manifest, scopes, details = build_dataset(candidates, {}, checkers)
+        self.assertEqual(manifest["cacheCount"], 1)
+        self.assertFalse(details["GC1"]["stats"]["knownRule"])
+        self.assertIsNone(details["GC1"]["stats"]["publicCorrectCount"])
+
+    def test_generation_recalculates_freshness_from_retained_observation_times(self):
+        candidates = [{"code": "GC1", "country": "China"}]
+        old = "2000-01-01T00:00:00Z"
+        checkers = {"GC1": {"checkerId": "GC1", "sourceUrl": "https://www.certitudes.org/certitude?wp=GC1",
+                            "cacheCode": "GC1", "mappingStatus": "verified", "role": "final",
+                            "successCount": 0, "failureCount": 0, "counterObservedAt": old,
+                            "publicSolvers": [], "solverListCoverage": "complete", "solverListObservedAt": old,
+                            "crawl": {"status": "ok", "stale": False}}}
+        _, _, details = build_dataset(candidates, {}, checkers)
+        self.assertTrue(details["GC1"]["cache"]["checkers"][0]["crawl"]["stale"])
+
+    def test_failed_validation_keeps_old_manifest_and_old_version(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+            root = Path(temp) / "certitude"
+            first = build_dataset([], {}, {})
+            publish_dataset(*first, output_dir=root)
+            original = (root / "manifest.json").read_bytes()
+            broken = build_dataset([], {}, {})
+            broken[0]["cacheCount"] = 9
+            with self.assertRaises(ValueError):
+                publish_dataset(*broken, output_dir=root)
+            self.assertEqual((root / "manifest.json").read_bytes(), original)
+            second = build_dataset([], {}, {})
+            publish_dataset(*second, output_dir=root)
+            self.assertTrue((root / "versions" / first[0]["datasetVersion"]).is_dir())
+            self.assertEqual(json.loads((root / "manifest.json").read_text())["datasetVersion"], second[0]["datasetVersion"])
+
+
+if __name__ == "__main__":
+    unittest.main()

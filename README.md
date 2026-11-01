@@ -98,8 +98,29 @@ pip install -r requirements.txt
 | `AVATAR_REQUEST_TIMEOUT_SECONDS` | 头像请求超时时间。 |
 | `FIRST_FIND_TIMEOUT_SECONDS` | 首个找到 cache 查询超时（默认 45s）。 |
 | `FIRST_FIND_DELAY_SECONDS` | 首个找到 cache 查询用户间延迟（默认 1.0s）。 |
+| `CERTITUDE_DESCRIPTION_LIMIT` | 每次最多扫描的描述数量；默认 200，设为 `0` 扫描全部到期项。Actions 手动运行也可用 `description_limit` 输入覆盖。 |
+| `CERTITUDE_DESCRIPTION_REFRESH_DAYS` | 已扫描描述的刷新间隔（默认 30 天）。 |
+| `CERTITUDE_REQUEST_DELAY_SECONDS` | Certitude 来源请求间隔（默认 1.5 秒）。 |
+| `CERTITUDE_MAX_RETRIES` | Certitude 来源请求最大重试次数（默认 3）。 |
+| `CERTITUDE_REQUEST_TIMEOUT_SECONDS` | Certitude 来源请求超时（默认 30 秒）。 |
+| `CERTITUDE_FRESHNESS_HOURS` | 生成数据时公开名单的 freshness 阈值（默认 48 小时）。 |
 
 本地跨进程保存普通账号 Cookie 续期时，可设置 `GEOCACHING_COOKIE_STATE_KEY` 为 Fernet 生成的 URL-safe Base64 密钥（44 个字符）。可用 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` 生成，然后将密钥只放入本地 `.env` 或 GitHub Actions Secret `GEOCACHING_COOKIE_STATE_KEY`。末尾的 `=` 是密钥的一部分；`.env` 中可用双引号包裹整个值，复制到 Secret 时不包含外层引号。可选的 `GEOCACHING_COOKIE_STATE_FILE` 指定状态文件路径，默认 `.runtime/geocaching-auth/nonpremium.enc`。Actions 在 `crawl-caches`、`crawl-logs`、`diagnose-auth` 和独立的 `Archived Logs Crawler` job 间恢复并保存该加密文件；需要为这些 job 配置同一 Secret。两个工作流共享缓存前缀和并发组，避免同时更新同一账号的续期状态。文件只以加密形式进入 Actions cache，`.runtime/` 已在 gitignore 中排除。更换 `GEOCOOKIE_NONPREMIUM` 会使旧状态失效并从新配置的 Cookie 开始。服务器是否续期由服务器决定；退出登录可能撤销会话，缓存过期或被驱逐后可能需要手动更新 Cookie。此机制不使用账号密码，也不在 workflow 中执行密码登录。
+
+## Certitude 每日静态数据
+
+每日 Actions 工作流会对项目内所有 Mystery 缓存（包括已归档缓存）增量扫描描述，并更新已核验的 Certitude 页面及公开名单。描述扫描有界、可续跑；普通账号和 Premium 缓存请求沿用现有 `GEOCOOKIE_NONPREMIUM`、`GEOCOOKIE_PREMIUM` 与加密续期状态。无需 Certitude 账号 Cookie，也不采集或保存答案。
+
+本地可分别运行采集与生成：
+
+```bash
+python crawl_certitude.py --description-limit 200
+python generate_certitude.py
+```
+
+将上限设为 `0` 可扫描所有到期描述。手动 Actions 可选择 `certitude` 模式并调整描述扫描上限。已核验的链接不会因单次扫描缺失而重置；未映射题目、未知角色和不完整日志覆盖会保留为未知状态。Found it 没有匹配记录时，只有存在完整覆盖证据才会判定为未找到。
+
+采集器会创建 `certitude_descriptions`、`certitude_checkers` 和 `certitude_snapshots` 表；也可手动执行 `sql/certitude_setup.sql`。尚未执行数据库迁移或完成首次全量扫描时，生成结果不代表数据已完整。后续前端应先读取 `/data/certitude/manifest.json`，并在同一 `datasetVersion` 下读取其余文件。
 
 ## 数据库表
 

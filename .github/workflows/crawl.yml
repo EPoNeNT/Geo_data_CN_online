@@ -23,7 +23,13 @@ on:
           - logs-radius
           - both
           - generate
+          - certitude
           - diagnose-auth
+      description_limit:
+        description: '单次扫描缓存描述数量上限（0 表示扫描全部到期项）'
+        required: false
+        default: '200'
+        type: string
 
 concurrency:
   group: geocache-crawler-${{ github.ref }}
@@ -201,7 +207,11 @@ jobs:
   generate-data:
     runs-on: ubuntu-latest
     needs: crawl-logs
-    if: always() && (github.event.inputs.mode == 'both' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'generate' || github.event_name == 'schedule')
+    if: always() && (github.event.inputs.mode == 'both' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'generate' || github.event.inputs.mode == 'certitude' || github.event_name == 'schedule')
+    env:
+      GEOCACHING_COOKIE_STATE_KEY: ${{ secrets.GEOCACHING_COOKIE_STATE_KEY }}
+      CERTITUDE_DESCRIPTION_LIMIT: ${{ github.event.inputs.description_limit || '200' }}
+
 
     steps:
       - name: Checkout code
@@ -218,6 +228,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run offline Certitude tests
+        run: python -m unittest discover -s tests -p 'test_certitude*.py'
+
+      - name: Restore encrypted nonpremium cookie state
+        if: env.GEOCACHING_COOKIE_STATE_KEY != ''
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: geocaching-basic-state-v1-
+
       - name: Crawl missing user registration dates
         if: github.event.inputs.mode == 'both' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'generate' || github.event_name == 'schedule'
         run: python crawl_user_regdates.py
@@ -226,10 +248,33 @@ jobs:
           LOG_TO_FILE: '1'
 
       - name: Generate static data files
+        if: github.event.inputs.mode != 'certitude'
         run: python generate_data.py
         timeout-minutes: 30
         env:
           LOG_TO_FILE: '1'
+
+      - name: Crawl Certitude cache descriptions and checkers
+        if: github.event.inputs.mode == 'certitude' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'generate' || github.event_name == 'schedule'
+        run: python crawl_certitude.py --description-limit "$CERTITUDE_DESCRIPTION_LIMIT"
+        timeout-minutes: 300
+        env:
+          LOG_TO_FILE: '1'
+
+      - name: Generate Certitude static data
+        if: github.event.inputs.mode == 'certitude' || github.event.inputs.mode == 'both' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'generate' || github.event_name == 'schedule'
+        run: python generate_certitude.py
+        timeout-minutes: 30
+        env:
+          LOG_TO_FILE: '1'
+
+      - name: Save encrypted nonpremium cookie state
+        if: always() && env.GEOCACHING_COOKIE_STATE_KEY != '' && hashFiles('.runtime/geocaching-auth/nonpremium.enc') != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
 
       - name: Setup SSH deploy key
         run: |
@@ -246,7 +291,13 @@ jobs:
         run: |
           git clone git@github.com:EPoNeNT/Geodataing.git /tmp/Geodataing
           mkdir -p /tmp/Geodataing/public/data
-          cp public/data/*.json /tmp/Geodataing/public/data/
+          if ls public/data/*.json >/dev/null 2>&1; then
+            cp public/data/*.json /tmp/Geodataing/public/data/
+          fi
+          if [ -d public/data/certitude ]; then
+            mkdir -p /tmp/Geodataing/public/data/certitude
+            cp -R public/data/certitude/. /tmp/Geodataing/public/data/certitude/
+          fi
           cd /tmp/Geodataing
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -273,3 +324,5 @@ jobs:
           path: |
             crawl_user_regdates.log
             generate_data.log
+            crawl_certitude.log
+            generate_certitude.log

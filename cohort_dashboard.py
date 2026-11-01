@@ -59,6 +59,64 @@ CACHE_TYPE_LABELS = {
     1858: "Wherigo",
     3653: "Community Celebration Event",
 }
+DATA_ACQUISITION_PRIORITIES = (
+    {
+        "availability": "现有数据库可直接聚合",
+        "priority": "P0",
+        "topic": "日志节奏与多日参与",
+        "data": "日志日期、Found/DNF/Attended、注册日期",
+        "use": "区分单日集中找寻和跨多日形成习惯，定位第二次活动日的转化价值。",
+    },
+    {
+        "availability": "现有数据库可直接聚合",
+        "priority": "P0",
+        "topic": "缓存供给与空间可达性",
+        "data": "缓存经纬度、城市、placed_date、状态、日志覆盖",
+        "use": "估算首次活动城市的可见供给、新增供给和移动半径，并与激活及留存对照。",
+    },
+    {
+        "availability": "现有数据库可直接聚合",
+        "priority": "P1",
+        "topic": "缓存新鲜度与维护状态",
+        "data": "placed_date、last_found_date、cache_status、DNF 日志",
+        "use": "识别新手失败是否集中于长期无人找到或状态异常的缓存。",
+    },
+    {
+        "availability": "现有数据库可直接聚合",
+        "priority": "P1",
+        "topic": "缓存属性和类型结构",
+        "data": "attributes、类型、容器、难度、地形",
+        "use": "形成推荐实验的次级分层，并检查城市或时期的供给结构差异。",
+    },
+    {
+        "availability": "需要新增采集或实验埋点",
+        "priority": "P0",
+        "topic": "内容渠道归因",
+        "data": "来源链接、活动码、落地页曝光与点击、注册来源",
+        "use": "区分视频、自然搜索、社群转发和其他渠道，计算真实转化与长期价值。",
+    },
+    {
+        "availability": "需要新增采集或实验埋点",
+        "priority": "P0",
+        "topic": "产品引导与推荐实验",
+        "data": "推荐曝光、点击、推送触达、实验分组、后续日志",
+        "use": "验证第二活动日引导、DNF 后替代缓存推荐和 3/5/10 找阶梯任务的因果效果。",
+    },
+    {
+        "availability": "需要新增采集或实验埋点",
+        "priority": "P1",
+        "topic": "历史供给快照",
+        "data": "活动时点的缓存可用状态、收藏点和维护状态",
+        "use": "避免用当前快照解释历史行为，提升供给与缓存质量分析的可信度。",
+    },
+    {
+        "availability": "需要新增采集或实验埋点",
+        "priority": "P1",
+        "topic": "用户位置与出行背景",
+        "data": "经同意的常驻城市或粗粒度位置、旅行状态",
+        "use": "区分本地长期参与与旅行期间的一次性大中华区日志。",
+    },
+)
 
 VIDEO_PUBLICATIONS = (
     {
@@ -241,6 +299,29 @@ def build_cohort_query() -> str:
        AND e.visited = d.first_engagement_date
        AND e.log_type IN ({engagement_types})
       GROUP BY d.guid, d.first_engagement_date
+    ),
+    first_engagement_cache_history AS (
+      SELECT
+        fel.guid,
+        c.placed_date::date AS first_engagement_cache_placed_date,
+        MAX(h.visited::date) FILTER (
+          WHERE h.log_type = 'Found it'
+            AND COALESCE(h.log_type, '') <> 'deleted'
+            AND h.visited IS NOT NULL
+            AND h.visited::date < fel.first_engagement_date
+        ) AS first_engagement_cache_prior_found,
+        COUNT(*) FILTER (
+          WHERE h.log_type = 'Didn''t find it'
+            AND COALESCE(h.log_type, '') <> 'deleted'
+            AND h.visited IS NOT NULL
+            AND h.visited::date >= fel.first_engagement_date - INTERVAL '90 days'
+            AND h.visited::date < fel.first_engagement_date
+        )::int AS first_engagement_cache_prior_dnf_90
+      FROM first_engagement_locations fel
+      JOIN caches c ON c.code = fel.first_engagement_cache
+      LEFT JOIN logs h ON h.gc_code = fel.first_engagement_cache
+      WHERE fel.first_engagement_cache_count = 1
+      GROUP BY fel.guid, c.placed_date, fel.first_engagement_date
     )
     SELECT
       b.cohort_month,
@@ -254,6 +335,9 @@ def build_cohort_query() -> str:
       fel.first_engagement_terrain,
       fel.first_engagement_geocache_type,
       fel.first_engagement_container_type,
+      feh.first_engagement_cache_placed_date,
+      feh.first_engagement_cache_prior_found,
+      feh.first_engagement_cache_prior_dnf_90,
       BOOL_OR(
         e.log_type = 'Found it'
         AND e.visited = fel.first_engagement_date
@@ -317,6 +401,16 @@ def build_cohort_query() -> str:
           AND e.visited >= b.registration_date
           AND e.visited < b.registration_date + INTERVAL '30 days'
       )::int AS attended_d30,
+      COUNT(DISTINCT e.visited) FILTER (
+        WHERE e.log_type = 'Found it'
+          AND e.visited >= b.registration_date
+          AND e.visited < b.registration_date + INTERVAL '30 days'
+      )::int AS find_days_d30,
+      COUNT(DISTINCT e.visited) FILTER (
+        WHERE e.log_type IN ({engagement_types})
+          AND e.visited >= b.registration_date
+          AND e.visited < b.registration_date + INTERVAL '30 days'
+      )::int AS engagement_days_d30,
       COUNT(*) FILTER (
         WHERE e.log_type = 'Found it'
           AND e.visited >= fel.first_engagement_date
@@ -411,6 +505,7 @@ def build_cohort_query() -> str:
     LEFT JOIN scoped_events e ON e.guid = b.guid
     LEFT JOIN first_dnf fd ON fd.guid = b.guid
     LEFT JOIN first_engagement_locations fel ON fel.guid = b.guid
+    LEFT JOIN first_engagement_cache_history feh ON feh.guid = b.guid
     GROUP BY b.guid, b.reg_place, b.cohort_month, b.registration_date,
              fd.first_valid_dnf, fd.first_valid_dnf_cache,
              fd.first_valid_dnf_cache_count, fd.first_valid_dnf_difficulty,
@@ -419,7 +514,10 @@ def build_cohort_query() -> str:
              fel.first_engagement_date, fel.first_engagement_city,
              fel.first_engagement_cache_count, fel.first_engagement_cache,
              fel.first_engagement_difficulty, fel.first_engagement_terrain,
-             fel.first_engagement_geocache_type, fel.first_engagement_container_type
+             fel.first_engagement_geocache_type, fel.first_engagement_container_type,
+             feh.first_engagement_cache_placed_date,
+             feh.first_engagement_cache_prior_found,
+             feh.first_engagement_cache_prior_dnf_90
     ORDER BY b.cohort_month, b.guid;
     """
 
@@ -607,7 +705,11 @@ def _weighted_insight_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "lifecycleEligible": _sum_field(rows, "lifecycleEligible"),
     }
     for output, (numerator, denominator) in INSIGHT_RATE_FIELDS.items():
-        result[output] = rate(_sum_field(rows, numerator), _sum_field(rows, denominator))
+        numerator_value = _sum_field(rows, numerator)
+        denominator_value = _sum_field(rows, denominator)
+        result[numerator] = numerator_value
+        result[denominator] = denominator_value
+        result[output] = rate(numerator_value, denominator_value)
 
     lifecycle = {
         "zeroInactive": _sum_field(rows, "lifecycleNoFindNoD90"),
@@ -727,6 +829,232 @@ def analyze_growth_and_onboarding(
             "overall": behavior(valid_rows),
             "china": behavior([row for row in valid_rows if row.get("reg_place") == "China"]),
         },
+    }
+
+
+def _cadence_activity_summary(
+    rows: list[dict[str, Any]], as_of: date
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"users": len(rows)}
+    for label, field, end_day in (
+        ("M3", "active_m3", 120),
+        ("M6", "active_m6", 210),
+        ("M12", "active_m12", 390),
+    ):
+        eligible = [
+            row for row in rows
+            if row.get("registration_date")
+            and row["registration_date"] <= as_of - timedelta(days=end_day)
+        ]
+        active = sum(bool(row.get(field)) for row in eligible)
+        result[f"eligible{label}"] = len(eligible)
+        result[f"active{label}"] = active
+        result[f"active{label}Rate"] = rate(active, len(eligible))
+    return result
+
+
+def analyze_engagement_cadence(
+    rows: Iterable[dict[str, Any]], as_of: date
+) -> dict[str, Any]:
+    """Compare single-day and multi-day finding while controlling D30 depth."""
+    eligible = [
+        dict(row) for row in rows
+        if row.get("reg_place") == "China"
+        and not row.get("pre_registration_find")
+        and row.get("registration_date")
+        and row["registration_date"] <= as_of - timedelta(days=30)
+    ]
+
+    def period_label(row: dict[str, Any]) -> str:
+        year = row["registration_date"].year
+        if year <= 2020:
+            return "2017–2020"
+        if year <= 2023:
+            return "2021–2023"
+        if year <= 2025:
+            return "2024–2025"
+        return f"{as_of.year} YTD"
+
+    period_trends = []
+    labels = ("2017–2020", "2021–2023", "2024–2025", f"{as_of.year} YTD")
+    for label in labels:
+        selected = [row for row in eligible if period_label(row) == label]
+        finders = [row for row in selected if int(row.get("finds_d30") or 0) > 0]
+        multi_day = [row for row in finders if int(row.get("find_days_d30") or 0) >= 2]
+        four_plus_days = [row for row in finders if int(row.get("find_days_d30") or 0) >= 4]
+        period_trends.append({
+            "period": label,
+            "eligibleD30": len(selected),
+            "findersD30": len(finders),
+            "finderRate": rate(len(finders), len(selected)),
+            "multiDayFinders": len(multi_day),
+            "multiDayShareAmongFinders": rate(len(multi_day), len(finders)),
+            "fourPlusDayFinders": len(four_plus_days),
+            "fourPlusDayShareAmongFinders": rate(len(four_plus_days), len(finders)),
+            "finds3PlusUsers": sum(int(row.get("finds_d30") or 0) >= 3 for row in selected),
+            "finds3PlusRate": rate(
+                sum(int(row.get("finds_d30") or 0) >= 3 for row in selected), len(selected)
+            ),
+            "finds10PlusUsers": sum(int(row.get("finds_d30") or 0) >= 10 for row in selected),
+            "finds10PlusRate": rate(
+                sum(int(row.get("finds_d30") or 0) >= 10 for row in selected), len(selected)
+            ),
+        })
+
+    recent = [row for row in eligible if row["registration_date"].year >= 2024]
+    depth_definitions = (
+        ("finds_1_2", "1–2 找", lambda row: 1 <= int(row.get("finds_d30") or 0) <= 2),
+        ("finds_3_9", "3–9 找", lambda row: 3 <= int(row.get("finds_d30") or 0) <= 9),
+        ("finds_10_plus", "10+ 找", lambda row: int(row.get("finds_d30") or 0) >= 10),
+    )
+    cadence_definitions = (
+        ("single_day", "1 个找寻日", lambda row: int(row.get("find_days_d30") or 0) == 1),
+        ("multi_day", "2+ 个找寻日", lambda row: int(row.get("find_days_d30") or 0) >= 2),
+    )
+    depth_cadence = []
+    for depth_key, depth_label, depth_predicate in depth_definitions:
+        depth_rows = [row for row in recent if depth_predicate(row)]
+        for cadence_key, cadence_label, cadence_predicate in cadence_definitions:
+            selected = [row for row in depth_rows if cadence_predicate(row)]
+            summary = _cadence_activity_summary(selected, as_of)
+            summary.update({
+                "depthKey": depth_key,
+                "depthLabel": depth_label,
+                "cadenceKey": cadence_key,
+                "cadenceLabel": cadence_label,
+                "depthUsers": len(depth_rows),
+                "shareWithinDepth": rate(len(selected), len(depth_rows)),
+            })
+            depth_cadence.append(summary)
+
+    return {
+        "scope": "reg_place = China",
+        "eligibleD30Users": len(eligible),
+        "recentStartYear": 2024,
+        "recentEligibleD30Users": len(recent),
+        "periodTrends": period_trends,
+        "recentDepthCadence": depth_cadence,
+    }
+
+
+def analyze_cache_historical_freshness(
+    rows: Iterable[dict[str, Any]], as_of: date
+) -> dict[str, Any]:
+    """Compare first-activity outcomes by history known before that activity."""
+    selected = [
+        dict(row) for row in rows
+        if row.get("reg_place") == "China"
+        and not row.get("pre_registration_find")
+        and row.get("registration_date")
+        and row["registration_date"].year >= 2024
+        and row.get("first_engagement_date")
+        and int(row.get("first_engagement_cache_count") or 0) == 1
+    ]
+
+    def summarize(key: str, label: str, group: list[dict[str, Any]]) -> dict[str, Any]:
+        eligible_d30 = [
+            row for row in group
+            if row["registration_date"] <= as_of - timedelta(days=30)
+        ]
+        eligible_m3 = [
+            row for row in group
+            if row["registration_date"] <= as_of - timedelta(days=120)
+        ]
+        first_day_found = sum(bool(row.get("first_engagement_found")) for row in group)
+        first_day_dnf_only = sum(
+            bool(row.get("first_engagement_dnf"))
+            and not bool(row.get("first_engagement_found"))
+            for row in group
+        )
+        d30_found = sum(int(row.get("finds_d30") or 0) > 0 for row in eligible_d30)
+        active_m3 = sum(bool(row.get("active_m3")) for row in eligible_m3)
+        return {
+            "key": key,
+            "label": label,
+            "users": len(group),
+            "firstDayFound": first_day_found,
+            "firstDayFoundRate": rate(first_day_found, len(group)),
+            "firstDayDnfOnly": first_day_dnf_only,
+            "firstDayDnfOnlyRate": rate(first_day_dnf_only, len(group)),
+            "eligibleD30": len(eligible_d30),
+            "d30Found": d30_found,
+            "d30FoundRate": rate(d30_found, len(eligible_d30)),
+            "eligibleM3": len(eligible_m3),
+            "activeM3": active_m3,
+            "activeM3Rate": rate(active_m3, len(eligible_m3)),
+        }
+
+    freshness_definitions = (
+        ("within_30", "此前 1–30 天有 Found", lambda days: days is not None and days <= 30),
+        ("days_31_180", "此前 31–180 天有 Found", lambda days: days is not None and 31 <= days <= 180),
+        ("over_180", "此前超过 180 天有 Found", lambda days: days is not None and days > 180),
+        ("no_prior_found", "此前无可观察 Found", lambda days: days is None),
+    )
+
+    def days_since_prior_found(row: dict[str, Any]) -> int | None:
+        prior = row.get("first_engagement_cache_prior_found")
+        if not prior:
+            return None
+        days = (row["first_engagement_date"] - prior).days
+        return days if days >= 1 else None
+
+    freshness_bands = []
+    for key, label, predicate in freshness_definitions:
+        group = [row for row in selected if predicate(days_since_prior_found(row))]
+        freshness_bands.append(summarize(key, label, group))
+
+    age_definitions = (
+        ("under_1y", "不足 1 年", 0, 365),
+        ("years_1_3", "1–3 年", 365, 365 * 3),
+        ("years_3_7", "3–7 年", 365 * 3, 365 * 7),
+        ("years_7_plus", "7 年及以上", 365 * 7, None),
+    )
+
+    def cache_age_days(row: dict[str, Any]) -> int | None:
+        placed = row.get("first_engagement_cache_placed_date")
+        if not placed:
+            return None
+        days = (row["first_engagement_date"] - placed).days
+        return days if days >= 0 else None
+
+    age_bands = []
+    for key, label, minimum, maximum in age_definitions:
+        group = [
+            row for row in selected
+            if cache_age_days(row) is not None
+            and cache_age_days(row) >= minimum
+            and (maximum is None or cache_age_days(row) < maximum)
+        ]
+        age_bands.append(summarize(key, label, group))
+
+    prior_dnf_definitions = (
+        ("none", "过去 90 天 0 条 DNF", lambda count: count == 0),
+        ("one", "过去 90 天 1 条 DNF", lambda count: count == 1),
+        ("two_three", "过去 90 天 2–3 条 DNF", lambda count: 2 <= count <= 3),
+        ("four_plus", "过去 90 天 4+ 条 DNF", lambda count: count >= 4),
+    )
+    prior_dnf_bands = []
+    for key, label, predicate in prior_dnf_definitions:
+        group = [
+            row for row in selected
+            if predicate(int(row.get("first_engagement_cache_prior_dnf_90") or 0))
+        ]
+        prior_dnf_bands.append(summarize(key, label, group))
+
+    return {
+        "scope": "reg_place = China；注册年份 >= 2024；首次活动日唯一缓存",
+        "users": len(selected),
+        "eligibleD30": sum(
+            row["registration_date"] <= as_of - timedelta(days=30)
+            for row in selected
+        ),
+        "eligibleM3": sum(
+            row["registration_date"] <= as_of - timedelta(days=120)
+            for row in selected
+        ),
+        "freshnessBands": freshness_bands,
+        "cacheAgeBands": age_bands,
+        "priorDnfBands": prior_dnf_bands,
     }
 
 
@@ -1986,9 +2314,11 @@ def _growth_conclusions_html(growth: dict[str, Any] | None) -> str:
         <div class="insight-callout">{growth_summary}</div>
         <p>当前数据支持把增长拆成三部分：被观察到的新 cohort 规模、注册后 7–90 天的激活效率、以及 M1–M12 的持续或回流活动。报告没有渠道、广告、推荐来源、活动曝光或缓存供给数据，因此不能确认究竟是哪一种外部因素造成新增增长。</p>
         <div class="table-wrap"><table><thead><tr><th>年份</th><th>有效用户</th><th>D7 首找</th><th>D90 首找</th><th>D90 达10找</th><th>M1</th><th>M6</th><th>M12</th></tr></thead><tbody>{annual_rows}</tbody></table></div>
+        <p class="caption">首找与达 10 找只累计 Found it；M1、M6、M12 分别观察注册后第 30–59、180–209、360–389 天的 Found it、DNF 或 Attended。每列使用对应窗口成熟用户作分母。</p>
         <h4>早期行为与后续活跃</h4>
         <p>{evidence}这些差异是筛选后的相关关系，既包含用户自身兴趣差异，也可能包含引导效果，不能直接证明因果。</p>
         <div class="table-wrap"><table><thead><tr><th>范围</th><th>早期行为</th><th>分组用户</th><th>D90 成熟用户</th><th>D90 活跃</th><th>M6 活跃</th><th>M12 活跃</th></tr></thead><tbody>{''.join(behavior_rows)}</tbody></table></div>
+        <p class="caption">“D90 成熟用户”是分组中已完整经过注册后 120 天的人数；D90、M6、M12 活跃率的分母分别是该早期行为组中对应窗口的成熟用户，而不是全部 cohort 用户。</p>
         <h4>新用户引导优先级</h4>
         <ol>
           <li><strong>优先验证 D30 深度：</strong>围绕 3 找、5 找和 10 找设计阶梯任务；对已达到 1–9 找的用户推荐下一处低摩擦缓存。10+ 找是当前与 M6/M12 活跃差异最大的早期行为，但是否具有因果作用仍需实验。</li>
@@ -2118,6 +2448,7 @@ def _early_pathways_html(pathways: dict[str, Any] | None) -> str:
         <h4>控制 D30 找寻深度后的 DNF 对照</h4>
         <p>{controlled_text}{recent_text}该分层减少了找寻深度和历史时期差异，但仍未控制用户动机、可用时间和缓存供给，结果仍是相关关系。</p>
         <div class="table-wrap"><table><thead><tr><th>范围</th><th>找寻深度与 DNF</th><th>用户数</th><th>深度内占比</th><th>M12 成熟用户</th><th>M3 活跃</th><th>M6 活跃</th><th>M12 活跃</th></tr></thead><tbody>{''.join(depth_rows)}</tbody></table></div>
+        <p class="caption">找寻深度按注册后第 0–29 天累计 Found it 数量划分；“深度内占比”以对应深度组为分母。M3/M6/M12 仍以注册日锚定，活跃率只使用各组对应窗口的成熟用户。</p>
         <h4>路径对应的运营动作</h4>
         <ul>
           <li><strong>仅 DNF：</strong>识别为“尝试但未成功”，优先提供提示、维护状态可靠的替代缓存和失败后的再次尝试入口。</li>
@@ -2169,7 +2500,7 @@ def _early_pathways_html(pathways: dict[str, Any] | None) -> str:
         <p>{timing_narrative}该比较用于确定引导触达时点；首找更快也可能源于用户本身意愿更强，不能解释为提前首找必然提高留存。</p>
         <div class="insight-callout">{timing_guidance}</div>
         <div class="table-wrap"><table><thead><tr><th>范围</th><th>首找时机</th><th>用户数</th><th>占比</th><th>M12 成熟用户</th><th>M3 活跃</th><th>M6 活跃</th><th>M12 活跃</th></tr></thead><tbody>{''.join(timing_rows)}</tbody></table></div>
-        <p class="caption">首找时机使用截至数据日观察到的首个 Found it；第 90 天后首找可能发生在 M3/M6/M12 观察窗口之后，因此只能用于描述晚激活，不能作为早期预测变量。</p>
+        <p class="caption">“首找”只统计 Found it；各首找时机档互斥，“占比”以同一范围内全部有效用户为分母。“截至数据日仍无首找”表示未观察到 Found it，不代表没有 DNF、Attended 或其他行动。M3/M6/M12 活跃分别以该时机组中已完整经过第 90–119、180–209、360–389 天窗口的用户为分母；第 90 天后首找可能发生在这些观察窗口之后，因此只能用于描述晚激活，不能作为早期预测变量。</p>
         """
 
     return f"""
@@ -2275,15 +2606,15 @@ def _video_conversion_and_dnf_html(periods: dict[str, Any]) -> str:
         <h4>China视频用户30天转化漏斗</h4>
         <div class="insight-callout"><strong>主要流失点：</strong>2025高播放合并窗口中，完成D30观察的China用户有 {_fmt_int(funnels.get('2025_wave1', {}).get('eligibleD30'))} 人；其中 {_fmt_percent(event_action.get('cohortRate'))} 在30天内留下Found、DNF或Attended，但只有 {_fmt_percent(event_first.get('cohortRate'))} 完成至少1找、{_fmt_percent(event_ten.get('cohortRate'))} 达到10找。相邻月份的至少1找和10找比例分别为 {_fmt_percent(control_first.get('cohortRate'))}、{_fmt_percent(control_ten.get('cohortRate'))}。这把问题定位为“尝试后未成功或首找后没有形成连续找寻”，而不只是注册后完全没有行动。</div>
         <div class="table-wrap"><table><thead><tr><th rowspan="2">D30阶段</th><th colspan="3">2023发布后0–6天</th><th colspan="3">2025高播放合并窗口</th><th colspan="3">2025相邻月份</th></tr><tr><th>人数</th><th>占成熟用户</th><th>上一步转化</th><th>人数</th><th>占成熟用户</th><th>上一步转化</th><th>人数</th><th>占成熟用户</th><th>上一步转化</th></tr></thead><tbody>{''.join(funnel_rows)}</tbody></table></div>
-        <p class="caption">漏斗只使用已经完整经过注册后30天的用户。Found、DNF或Attended构成“有行动”；后续1找、3找、5找、10找均只计算Found it，因此各阶段严格递减。</p>
+        <p class="caption">漏斗只使用已经完整经过注册后 30 天的用户，所有阶段均累计第 0–29 天。“占成熟用户”以该时期 D30 成熟人数为分母；“上一步转化”以上一阶段人数为分母。Found、DNF 或 Attended 构成“有行动”；后续 1 找、3 找、5 找、10 找均只计算 Found it，因此各阶段严格递减。</p>
         <h4>D30找寻深度与后续活跃</h4>
         <div class="table-wrap"><table><thead><tr><th>时期</th><th>D30找寻深度</th><th>用户数</th><th>占比</th><th>M3活跃</th><th>M6活跃</th><th>M12活跃</th></tr></thead><tbody>{''.join(depth_rows)}</tbody></table></div>
-        <p class="caption">M3、M6、M12是独立观察窗口，不属于上述严格漏斗；括号内为已经完整经过相应窗口的成熟用户数。</p>
+        <p class="caption">D30 深度按注册后第 0–29 天累计 Found it 划分为 0、1–2、3–4、5–9、10+。M3、M6、M12 仍以注册日锚定，是独立观察窗口，不属于上述严格漏斗；括号内 n 为该深度组中已经完整经过相应窗口的成熟用户数。</p>
         <h4>首次DNF后的恢复路径</h4>
         <div class="insight-callout"><strong>恢复判断：</strong>2025视频窗口中，注册后30天内出现DNF且DNF早于或同日于首次Found的China用户有 {_fmt_int(event_recovery.get('newcomerFailureUsers'))} 人；其中30天内恢复成功 {_fmt_percent(event_recovery.get('recoveredWithin30Rate'))}，相邻月份为 {_fmt_percent(control_recovery.get('recoveredWithin30Rate'))}。已恢复且缓存代码可比较的用户中，{_fmt_percent(event_recovery.get('sameCacheRecoveryShare'))} 在首次DNF的同一缓存上留下Found，其余通过其他缓存恢复。</div>
         <div class="table-wrap"><table><thead><tr><th>时期</th><th>D30有DNF</th><th>DNF早于/同日首找</th><th>占DNF用户</th><th>先Found后DNF</th><th>30天恢复/成熟</th><th>30天恢复率</th><th>90天恢复率</th><th>同缓存恢复占比</th></tr></thead><tbody>{''.join(recovery_overview_rows)}</tbody></table></div>
         <div class="table-wrap"><table><thead><tr><th>时期</th><th>恢复时间</th><th>用户数</th><th>占新手失败用户</th><th>M3活跃</th><th>M6活跃</th><th>M12活跃</th></tr></thead><tbody>{''.join(recovery_bucket_rows)}</tbody></table></div>
-        <p class="caption">“新手失败”限定为注册后30天内首次DNF早于首次Found，或与首次Found发生在同一天；由于日志只有日期，同日有Found（顺序未知），不能推断当天究竟先失败还是先成功。恢复指首次DNF日期当日或之后观察到Found it，仅覆盖大中华区日志。</p>
+        <p class="caption">“新手失败”限定为注册后 30 天内首次 DNF 早于首次 Found，或与首次 Found 同日；由于日志只有日期，不能推断当天先后。30/90 天恢复率分别以已完整经过首 DNF 后 30/90 天的新手失败用户为分母；恢复指首 DNF 当日或之后观察到 Found it。“同缓存恢复占比”只以恢复者中前后缓存代码可比较的用户为分母。</p>
     """
 
 
@@ -2400,19 +2731,136 @@ def _video_influx_html(video: dict[str, Any] | None) -> str:
         <p>2025 年两条高播放视频分别发布于 8 月 6 日和 8 月 9 日，实际处于同一个传播波峰，而不是两轮相互独立的流量。后续相关投稿延续至 11 月，但播放量主要在 1–16 万之间；下表用统一的发布前后 7 天作描述性对照。8 月 9 日的视频与主视频传播窗口重叠，不能把其后新增单独归因给第二条视频。</p>
         <h4>已核实视频时间线与注册响应</h4>
         <div class="table-wrap"><table><thead><tr><th>视频</th><th>发布时间</th><th>页面播放量</th><th>发布日 全量/China</th><th>前7天 全量/China</th><th>后7天 全量/China</th><th>后/前</th><th>归因说明</th></tr></thead><tbody>{''.join(video_rows)}</tbody></table></div>
-        <p class="caption">播放量为公开页面在 2026-09-10 至 2026-09-11 的快照，会继续变化。注册响应统计的是大中华区日志中可观察到、且注册日期有效的用户，不是 B 站点击到注册的直接转化。</p>
+        <p class="caption">按注册日期自然日统计：前 7 天为发布日前第 7–1 天，不含发布日；后 7 天为发布日到第 6 天，包含发布日；“后/前”是两段全量用户人数之比。播放量为公开页面在 2026-09-10 至 2026-09-11 的快照，会继续变化。注册响应不是 B 站点击到注册的直接转化。</p>
         <h4>注册规模与 China 构成</h4>
         <div class="table-wrap"><table><thead><tr><th>时期</th><th>全量用户</th><th>China 用户</th><th>China 占比</th></tr></thead><tbody>{volume_rows}</tbody></table></div>
+        <p class="caption">全量用户是注册日期落在该时期、且通过主分析有效性筛选的用户；China 用户是其中分析归属为 China 的人数，China 占比以该时期全量用户为分母。China 是日志推导的分析归属，不代表注册地或居住地。</p>
         <h4>日级峰值</h4>
         <div class="table-wrap"><table><thead><tr><th>事件</th><th>注册日期</th><th>全量用户</th><th>China 用户</th><th>China 占比</th></tr></thead><tbody>{''.join(peak_rows)}</tbody></table></div>
+        <p class="caption">日级峰值按用户注册日期计数；每行是一日的注册 cohort，不是视频播放日的点击量。“China 占比”以该日全量有效用户为分母。</p>
         <h4>事件期间 China 用户行为</h4>
         <div class="table-wrap"><table><thead><tr><th>注册时期</th><th>China 用户</th><th>D2 首找</th><th>D7 首找</th><th>D30 首找</th><th>D30 达10找</th><th>D30 有DNF</th><th>找到+DNF</th><th>M3 活跃</th><th>M6 活跃</th><th>M12 活跃</th></tr></thead><tbody>{''.join(behavior_rows)}</tbody></table></div>
+        <p class="caption">D2/D7/D30 均从每位用户注册日累计，只统计 Found it；“D30 有 DNF”表示第 0–29 天至少一条 DNF，“找到+DNF”表示同一第 0–29 天窗口内既有至少一条 Found it、又有至少一条 DNF。两列不是互斥分类：“找到+DNF”用户也包含在“D30 有 DNF”中。M3/M6/M12 分别观察注册后第 90–119、180–209、360–389 天是否至少有一条 Found it、DNF 或 Attended，括号内 n 为对应成熟分母。</p>
         <div class="insight-callout"><strong>行为特征：</strong>2025 两条高播放视频合并窗口内，China 用户的 D7、D30 首找率分别为 {_fmt_percent(wave1.get('firstFindD7Rate'))}、{_fmt_percent(wave1.get('firstFindD30Rate'))}，低于相邻六个月 China 用户的 {_fmt_percent(adjacent_behavior.get('firstFindD7Rate'))}、{_fmt_percent(adjacent_behavior.get('firstFindD30Rate'))}；D30 达10找仅 {_fmt_percent(wave1.get('finds10D30Rate'))}，同时 D30 有 DNF 达 {_fmt_percent(wave1.get('dnfD30Rate'))}，高于相邻月份的 {_fmt_percent(adjacent_behavior.get('dnfD30Rate'))}。更新 DNF-only 地域归属后，结论更清楚：视频显著扩大了入口，但吸引了大量尚未完成首次成功、深度转化较弱的新手。</div>
         {_video_conversion_and_dnf_html(periods)}
         <p>首次找到并未集中在视频中的少数目标：2023立即响应组覆盖 {_fmt_int(spread_2023.get('uniqueCaches'))} 个不同缓存和 {_fmt_int(spread_2023.get('uniqueCities'))} 个城市，单一缓存最多仅 {_fmt_int(spread_2023.get('maxSameCacheUsers'))} 人；2025两条高播放视频合并窗口覆盖 {_fmt_int(spread_wave1.get('uniqueCaches'))} 个缓存和 {_fmt_int(spread_wave1.get('uniqueCities'))} 个城市，8月26日低播放相关视频后的窗口覆盖 {_fmt_int(spread_wave2.get('uniqueCaches'))} 个缓存和 {_fmt_int(spread_wave2.get('uniqueCities'))} 个城市。这更支持视频激发了全国范围的玩法尝试，而不只是观众集中寻找视频展示的宝藏。</p>
         <p>留存判断以 reg_place=China 为主，降低境外用户仅在旅行期间留下大中华区日志造成的误判。2023 立即响应组的 China 样本为 {_fmt_int(wave_2023.get('chinaUsers'))} 人，其 M12 活跃率为 {_fmt_percent((wave_2023.get('chinaBehavior') or {}).get('activeM12Rate'))}；2025 第一轮为 {_fmt_percent(wave1.get('activeM12Rate'))}。这表明视频可以显著扩大入口，但长期价值取决于能否把首找用户继续推进到多次、跨日找寻。</p>
         <p class="caption">这是一项自然事件对照：时间响应、量级异常和 China 构成同时支持“视频是重要来源”的解释，但不能单凭时间重合证明因果，也无法排除同期传播、其他平台转发或数据覆盖变化。较低播放量的后续视频没有形成与8月6日同量级的独立注册峰值。</p>
       </section>
+    """
+
+
+def _yearly_china_trend_chart(
+    trend_summaries: list[tuple[int, str, dict[str, Any]]],
+    as_of: date,
+) -> str:
+    """Render annual China activation and activity rates with YTD visually separated."""
+    if not trend_summaries:
+        return ""
+
+    series = (
+        ("firstFindD7Rate", "D7 首找", "#2563eb"),
+        ("firstFindD30Rate", "D30 首找", "#0f766e"),
+        ("firstFindD90Rate", "D90 首找", "#9333ea"),
+        ("finds10D90Rate", "D90 达10找", "#dc2626"),
+        ("activeD30Rate", "D30窗口活跃", "#d97706"),
+        ("activeD90Rate", "D90窗口活跃", "#0891b2"),
+    )
+    width, height = 920, 390
+    left, right, top, bottom = 62, 18, 76, 52
+    plot_width, plot_height = width - left - right, height - top - bottom
+    values = [
+        float(summary[field])
+        for _year, _label, summary in trend_summaries
+        for field, _series_label, _color in series
+        if summary.get(field) is not None
+    ]
+    y_max = _percent_axis_ceiling(max(values, default=0))
+    tick_values = [round(y_max * index / 4, 1) for index in range(5)]
+    count = len(trend_summaries)
+
+    def x_at(index: int) -> float:
+        return left + (index / max(1, count - 1)) * plot_width
+
+    def y_at(value: float) -> float:
+        return top + plot_height - value / y_max * plot_height
+
+    grid = []
+    for value in tick_values:
+        y = y_at(value)
+        grid.append(f'<line x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}" class="grid"/>')
+        grid.append(f'<text x="{left-10}" y="{y+4:.1f}" text-anchor="end" class="axis">{value:.1f}%</text>')
+
+    ytd_band = ""
+    if trend_summaries[-1][0] == as_of.year:
+        last_x = x_at(count - 1)
+        previous_x = x_at(max(0, count - 2))
+        band_left = (last_x + previous_x) / 2 if count > 1 else left
+        ytd_band = (
+            f'<rect x="{band_left:.1f}" y="{top}" width="{width-right-band_left:.1f}" '
+            f'height="{plot_height}" class="ytd-band"/>'
+        )
+
+    labels = []
+    for index, (_year, label, _summary) in enumerate(trend_summaries):
+        anchor = "end" if index == count - 1 else ("start" if index == 0 else "middle")
+        labels.append(
+            f'<text x="{x_at(index):.1f}" y="{height-18}" text-anchor="{anchor}" '
+            f'class="axis">{html.escape(label)}</text>'
+        )
+
+    paths = []
+    legend = []
+    for series_index, (field, label, color) in enumerate(series):
+        points = []
+        for row_index, (year, year_label, summary) in enumerate(trend_summaries):
+            value = summary.get(field)
+            if value is None:
+                continue
+            points.append((row_index, x_at(row_index), y_at(float(value)), float(value), year, year_label))
+
+        historical_points = [point for point in points if point[4] < as_of.year]
+        if historical_points:
+            path = " ".join(
+                ("M" if index == 0 else "L") + f" {x:.1f} {y:.1f}"
+                for index, (_row, x, y, _value, _year, _year_label) in enumerate(historical_points)
+            )
+            paths.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.4"/>')
+
+        ytd_points = [point for point in points if point[4] == as_of.year]
+        if historical_points and ytd_points:
+            _row1, x1, y1, _value1, _year1, _label1 = historical_points[-1]
+            _row2, x2, y2, _value2, _year2, _label2 = ytd_points[0]
+            paths.append(
+                f'<path d="M {x1:.1f} {y1:.1f} L {x2:.1f} {y2:.1f}" fill="none" '
+                f'stroke="{color}" stroke-width="2.4" stroke-dasharray="6 5"/>'
+            )
+
+        for _row, x, y, value, _year, year_label in points:
+            tooltip = html.escape(f"{year_label}｜{label}: {value:.1f}%")
+            paths.append(
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.5" fill="{color}"><title>{tooltip}</title></circle>'
+            )
+
+        legend_x = 20 + (series_index % 3) * 295
+        legend_y = 18 + (series_index // 3) * 25
+        legend.append(
+            f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x+18}" y2="{legend_y}" '
+            f'stroke="{color}" stroke-width="3"/>'
+        )
+        legend.append(
+            f'<text x="{legend_x+25}" y="{legend_y+4}" class="legend">{html.escape(label)}</text>'
+        )
+
+    return f"""
+        <div class="yearly-trend-chart-wrap">
+          <h4>China 年度激活与活跃趋势</h4>
+          <svg class="yearly-trend-chart" viewBox="0 0 {width} {height}" role="img" aria-label="China 用户按注册年份的激活、找寻深度与活跃率折线图">
+            <rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" class="frame"/>
+            {ytd_band}{''.join(grid)}{''.join(labels)}{''.join(paths)}{''.join(legend)}
+          </svg>
+        </div>
+        <p class="caption">纵轴为成熟用户占比。2017–2025 为完整自然年；虚线连接 2026 YTD，表示截至 {as_of.isoformat()} 的未完整年度，且每项指标只使用已经经过相应观察窗口的成熟用户，不应直接作为完整年度终值。</p>
     """
 
 
@@ -2433,49 +2881,68 @@ def _insights_html(
     else:
         empty = _weighted_insight_summary([])
 
-    available_years = sorted({_cohort_year(row) for row in cohorts})
-    comparison_years = [year for year in (2017, 2024, 2025) if year in available_years]
     mature_rows = [
         row for row in cohorts
         if row.get("validUsers") and row.get("lifecycleEligible") == row.get("validUsers")
     ]
     latest_mature = mature_rows[-1] if mature_rows else None
 
+    china_years = sorted({_cohort_year(row) for row in china_cohorts})
     trend_rows = []
-    trend_summaries: list[tuple[str, dict[str, Any]]] = []
-    for year in comparison_years:
-        trend_summaries.append((str(year), _year_summary(cohorts, year)))
-    if latest_mature and str(latest_mature["cohortQuarter"]) not in {label for label, _ in trend_summaries}:
-        trend_summaries.append(
-            (str(latest_mature["cohortQuarter"]), _weighted_insight_summary([latest_mature]))
+    trend_summaries: list[tuple[int, str, dict[str, Any]]] = []
+
+    def percent_with_n(summary: dict[str, Any], rate_field: str) -> str:
+        _numerator, denominator = INSIGHT_RATE_FIELDS[rate_field]
+        denominator_value = int(summary.get(denominator) or 0)
+        valid_users = int(summary.get("validUsers") or 0)
+        suffix = (
+            f" <span class=\"caption\">(n={_fmt_int(denominator_value)})</span>"
+            if denominator_value != valid_users
+            else ""
         )
-    for label, summary in trend_summaries:
+        return f"{_fmt_percent(summary.get(rate_field))}{suffix}"
+
+    for year in china_years:
+        label = f"{year} YTD" if year == as_of.year else str(year)
+        trend_summaries.append((year, label, _year_summary(china_cohorts, year)))
+    for _year, label, summary in trend_summaries:
         trend_rows.append(
             f"<tr><td>{html.escape(label)}</td><td>{_fmt_int(summary['validUsers'])}</td>"
-            f"{_metric_cells(summary)}</tr>"
+            f"<td>{percent_with_n(summary, 'firstFindD7Rate')}</td>"
+            f"<td>{percent_with_n(summary, 'firstFindD30Rate')}</td>"
+            f"<td>{percent_with_n(summary, 'firstFindD90Rate')}</td>"
+            f"<td>{percent_with_n(summary, 'finds10D90Rate')}</td>"
+            f"<td>{percent_with_n(summary, 'activeD30Rate')}</td>"
+            f"<td>{percent_with_n(summary, 'activeD90Rate')}</td></tr>"
         )
 
     narrative = []
-    if len(trend_summaries) >= 2:
-        first_label, first = trend_summaries[0]
-        last_label, last = trend_summaries[-1]
+    complete_years = [item for item in trend_summaries if item[0] < as_of.year]
+    if len(complete_years) >= 2:
+        lowest = min(complete_years, key=lambda item: int(item[2]["validUsers"] or 0))
+        highest = max(complete_years, key=lambda item: int(item[2]["validUsers"] or 0))
+        counts = [int(item[2]["validUsers"] or 0) for item in complete_years]
+        monotonic = all(later >= earlier for earlier, later in zip(counts, counts[1:]))
         narrative.append(
-            f"从 {html.escape(first_label)} 到 {html.escape(last_label)}，D7 首找由 "
-            f"{_fmt_percent(first['firstFindD7Rate'])} 升至 {_fmt_percent(last['firstFindD7Rate'])}，"
-            f"D90 首找由 {_fmt_percent(first['firstFindD90Rate'])} 升至 {_fmt_percent(last['firstFindD90Rate'])}，"
-            f"D90 达 10 找由 {_fmt_percent(first['finds10D90Rate'])} 升至 {_fmt_percent(last['finds10D90Rate'])}。"
+            "China 分析归属用户规模"
+            f"{'逐年不下降' if monotonic else '并非逐年递增'}：完整年度最低为 {lowest[1]} 年的 "
+            f"{_fmt_int(lowest[2]['validUsers'])} 人，最高为 {highest[1]} 年的 "
+            f"{_fmt_int(highest[2]['validUsers'])} 人，期间存在明显回落与阶段性跃升。"
         )
-        if last.get("deepConditionalD90") is not None and last.get("lightConditionalD90") is not None:
-            ratio = (
-                last["deepConditionalD90"] / last["lightConditionalD90"]
-                if last["lightConditionalD90"] else None
-            )
-            ratio_text = f"，约为 1–9 找用户的 {ratio:.1f} 倍" if ratio is not None else ""
-            narrative.append(
-                f"{html.escape(last_label)} 的生命周期中，1–9 找占 {_fmt_percent(last['lightShare'])}，"
-                f"10+ 找占 {_fmt_percent(last['deepShare'])}；10+ 找用户的条件 D90 活跃率为 "
-                f"{_fmt_percent(last['deepConditionalD90'])}{ratio_text}。"
-            )
+        for metric, name in (("firstFindD7Rate", "D7 首找"), ("firstFindD90Rate", "D90 首找")):
+            comparable = [item for item in complete_years if item[2].get(metric) is not None]
+            if comparable:
+                low = min(comparable, key=lambda item: float(item[2][metric]))
+                high = max(comparable, key=lambda item: float(item[2][metric]))
+                narrative.append(
+                    f"{name}在完整年度间波动于 {low[1]} 年的 {_fmt_percent(low[2][metric])} "
+                    f"至 {high[1]} 年的 {_fmt_percent(high[2][metric])}，不属于稳定线性上升。"
+                )
+    if trend_summaries and trend_summaries[-1][0] == as_of.year:
+        narrative.append(
+            f"{as_of.year} 为截至 {as_of.isoformat()} 的 YTD 数据，各指标仅使用已成熟用户，"
+            "不能与完整自然年直接比较。"
+        )
 
     period_specs = ((2017, 2020, "2017–2020"), (2021, 2023, "2021–2023"), (2024, 2025, "2024–2025"))
     lifecycle_rows = []
@@ -2662,6 +3129,7 @@ def _insights_html(
           <p>该季度共有 {_fmt_int(total)} 名有效观察用户，其中 reg_place = China 为 {_fmt_int(china_count)} 人，占 {_fmt_percent(rate(china_count, total))}。下面拆分注册月份与分析地域归属构成，用于判断异常来自规模集中还是群体差异。</p>
           <div class="insight-callout">集中度信号：{html.escape(str(peak_month))} 注册 {_fmt_int(peak_month_count)} 人，占 {_fmt_percent(rate(int(peak_month_count), total))}；峰值日期 {html.escape(str(peak_day))} 注册 {_fmt_int(peak_day_count)} 人，占 {_fmt_percent(rate(int(peak_day_count), total))}。</div>
           <h4>相邻季度对照</h4>{adjacent_callout}<div class="table-wrap"><table><thead><tr><th>季度</th><th>有效用户</th><th>China 占比</th><th>无首找占比</th><th>最高月份占比</th><th>最高单日占比</th><th>D7 首找</th><th>D90 首找</th><th>D90 达10找</th><th>D90 留存</th></tr></thead><tbody>{adjacent_rows}</tbody></table></div>
+          <p class="caption">“无首找占比”是该季度有效用户中截至数据日仍未观察到任何 Found it 的比例，不等于没有 DNF、Attended 或其他行动。“最高月份占比”和“最高单日占比”分别以该季度注册用户为分母，统计注册量最高的自然月和自然日所占比例。D7/D90 首找与 D90 达10找只累计 Found it；D90 留存观察注册后第 90–119 天的 Found it、DNF 或 Attended。</p>
           <div class="insight-grid"><div><h4>注册月份构成</h4><table class="compact-table"><thead><tr><th>月份</th><th>人数</th><th>占比</th></tr></thead><tbody>{month_rows}</tbody></table></div>
           <div><h4>注册日期 Top 10</h4><table class="compact-table"><thead><tr><th>日期</th><th>人数</th><th>占比</th></tr></thead><tbody>{day_rows}</tbody></table></div></div>
           <h4>reg_place 构成</h4><table class="compact-table"><thead><tr><th>分析地域/状态</th><th>人数</th><th>占比</th></tr></thead><tbody>{place_rows}</tbody></table>
@@ -2673,21 +3141,25 @@ def _insights_html(
     <section class="insights"><h2>数据洞察</h2>
       <div class="insight-callout"><strong>核心判断：</strong>{' '.join(narrative) if narrative else '当前数据不足以形成跨期趋势判断。'}</div>
       <p>以下比例均使用对应成熟用户人数加权，不直接平均季度百分比。结果是描述性关联，不代表因果关系。</p>
-      <section class="insight-block"><h3>激活、找寻深度与留存趋势</h3>
-        <div class="table-wrap"><table><thead><tr><th>时期</th><th>有效用户</th><th>D7 首找</th><th>D30 首找</th><th>D90 首找</th><th>D90 达10找</th><th>D30 留存</th><th>D90 留存</th></tr></thead><tbody>{''.join(trend_rows)}</tbody></table></div>
+      <section class="insight-block"><h3>China 分析归属用户逐年趋势</h3>
+        <p>每一行包含注册日期位于该自然年、且 <code>reg_place = China</code> 的有效用户。这里的 China 是日志推导的分析归属，不是真实账号注册地、居住地或国籍。</p>
+        <div class="table-wrap"><table><thead><tr><th>注册年份</th><th>China 有效用户</th><th>D7 首找</th><th>D30 首找</th><th>D90 首找</th><th>D90 达10找</th><th>D30窗口活跃</th><th>D90窗口活跃</th></tr></thead><tbody>{''.join(trend_rows)}</tbody></table></div>
+        {_yearly_china_trend_chart(trend_summaries, as_of)}
+        <p class="caption">首找和达 10 找是注册日起累计窗口，只统计 Found it；D30/D90 窗口活跃分别观察第 30–59、90–119 天的 Found it、DNF 或 Attended。仅当指标成熟分母与该年 China 有效用户数不同时显示 n；未显示 n 表示两者相同。{as_of.year} YTD 只统计截至 {as_of.isoformat()} 已观察到的注册用户，不与完整年度人数直接比较。</p>
       </section>
       <section class="insight-block"><h3>生命周期结构与条件 D90 活跃</h3>
         <div class="table-wrap"><table><thead><tr><th>时期</th><th>成熟用户</th><th>0找占比</th><th>1–9找占比</th><th>10+找占比</th><th>0找后D90活跃</th><th>1–9找后D90活跃</th><th>10+找后D90活跃</th></tr></thead><tbody>{''.join(lifecycle_rows)}</tbody></table></div>
         <p>“0 找后 D90 活跃”可能表示晚激活、仅 DNF 或仅 Attended；它不等于从未参与。10+ 找与后续活跃高度相关，但不能据此认定达到 10 找会因果性地提高留存。</p>
+        <div class="metric-note"><strong>指标说明：</strong><ul><li>0 找后 D90 活跃：注册后第 0–89 天没有 Found it，但第 90–119 天至少有 1 条 Found it、DNF 或 Attended。</li><li>1–9 找后 D90 活跃和10+ 找后 D90 活跃：先按第 0–89 天累计 Found it 数量分为 1–9 找、10+ 找，再计算各组第 90–119 天的活跃率。</li><li>这里的“后”表示先按前 90 天 Found it 数量分组，再计算该组在第 90–119 天的活跃率；不是“完成某次找到之后立即活跃”。每个条件活跃率的分母都是对应深度组中已完整经过注册后 120 天的用户。</li><li>三个找寻深度组互斥并覆盖全部成熟用户；组内的 D90 活跃与不活跃也是互斥状态。</li></ul></div>
       </section>
       <section class="insight-block"><h3>固定窗口留存洞察</h3>
         <p>{retention_narrative}</p>
         <div class="table-wrap"><table><thead><tr><th>群体</th><th>时期</th><th>M1</th><th>M2</th><th>M3</th><th>M6</th><th>M12</th></tr></thead><tbody>{''.join(retention_rows)}</tbody></table></div>
-        <p class="caption">M1、M2、M3、M6、M12 是独立的 30 天窗口，不要求连续活跃。较晚窗口高于较早窗口可以反映回流，但各窗口只使用已完整成熟的用户，尤其近期 cohort 的 M6/M12 分母更小，不能把曲线直接解释为同一批用户逐月流失。</p>
+        <p class="caption">M1、M2、M3、M6、M12 分别观察注册后第 30–59、60–89、90–119、180–209、360–389 天是否至少有一条 Found it、DNF 或 Attended。它们是彼此独立的 30 天窗口，不要求连续活跃；每列以已完整经过该窗口的用户为分母。较晚窗口高于较早窗口可以反映回流，不能把各列直接解释为同一批用户逐月流失。</p>
       </section>
-      <section class="insight-block"><h3>China 与非 China 对照</h3>
+      <section class="insight-block"><h3>全量与非 China 辅助对照</h3>
         <div class="table-wrap"><table><thead><tr><th>群体</th><th>有效用户</th><th>D7 首找</th><th>D30 首找</th><th>D90 首找</th><th>D90 达10找</th><th>D30 留存</th><th>D90 留存</th></tr></thead><tbody>{''.join(comparison_rows)}</tbody></table></div>
-        <p class="caption">reg_place 是分析用地域归属：通常取用户首次 Found it 缓存所在国家；网站 Find 为 0 且数据库内 DNF 全部在大中华区同一地区时也归入该地区。它不代表注册地、居住地或国籍。</p>
+        <p class="caption">D7/D30/D90 首找分别表示注册后第 0–6、0–29、0–89 天至少一条 Found it；D90 达10找表示第 0–89 天累计至少 10 条 Found it。D30/D90 留存分别观察第 30–59、90–119 天是否至少有一条 Found it、DNF 或 Attended，各比例使用对应成熟用户作分母。reg_place 是日志推导的分析地域归属，不代表注册地、居住地或国籍。</p>
       </section>
       {focus_html}
       {_video_influx_html(video)}
@@ -2847,6 +3319,68 @@ def _percent_axis_ceiling(value: float) -> float:
     return max(5.0, math.ceil(value / 5.0) * 5.0)
 
 
+CHART_METRIC_DEFINITIONS = {
+    "validUsers": "注册人数：注册日期已知、在大中华区缓存日志中被观察到，且通过异常排除的用户数。",
+    "firstFindD7": "D7 首找：注册日起第 0–6 天至少有 1 条 Found it。只有 Found it 算首找；只有 DNF、Attended 或其他记录，都不算首找。",
+    "firstFindD30": "D30 首找：注册日起第 0–29 天至少有 1 条 Found it。只有 Found it 算首找；只有 DNF、Attended 或其他记录，都不算首找。",
+    "firstFindD90": "D90 首找：注册日起第 0–89 天至少有 1 条 Found it。只有 Found it 算首找；只有 DNF、Attended 或其他记录，都不算首找。",
+    "finds10D30": "D30 达 10 找：注册日起第 0–29 天累计至少 10 条 Found it。DNF 与 Attended 不计入找寻次数。",
+    "finds10D90": "D90 达 10 找：注册日起第 0–89 天累计至少 10 条 Found it。DNF 与 Attended 不计入找寻次数。",
+    "activeD30": "D30 留存：注册后第 30–59 天至少有 1 条 Found it、Didn't find it 或 Attended。",
+    "activeD90": "D90 留存：注册后第 90–119 天至少有 1 条 Found it、Didn't find it 或 Attended。",
+    "activeLast30": "截至数据日 30 日内活动：数据截止日前 30 天内至少有 1 次上述有效参与。",
+    "activeM1": "M1：注册后第 30–59 天至少有 1 次有效参与，与本报告的 D30 留存口径相同。",
+    "activeM2": "M2：注册后第 60–89 天至少有 1 次有效参与。",
+    "activeM3": "M3：注册后第 90–119 天至少有 1 次有效参与，与本报告的 D90 留存口径相同。",
+    "activeM6": "M6：注册后第 180–209 天至少有 1 次有效参与。",
+    "activeM12": "M12：注册后第 360–389 天至少有 1 次有效参与。",
+}
+
+
+def _chart_metric_note(series: list[tuple[str, str, str]]) -> str:
+    """Explain every plotted metric and the mature-denominator rule."""
+    definitions = []
+    seen = set()
+    for field, _label, _color in series:
+        base_field = field.removesuffix("Rate").removesuffix("Display")
+        definition = CHART_METRIC_DEFINITIONS.get(base_field)
+        if definition and definition not in seen:
+            definitions.append(f"<li>{html.escape(definition)}</li>")
+            seen.add(definition)
+    definitions.append(
+        "<li>成熟用户：数据截止日已经完整经过对应观察窗口的用户；比例只以成熟用户为分母，未成熟用户显示为空值，不按 0 处理。</li>"
+    )
+    return (
+        '<div class="metric-note"><strong>指标说明：</strong><ul>'
+        + "".join(definitions)
+        + "</ul></div>"
+    )
+
+
+def _metric_glossary_html() -> str:
+    return """
+    <section class="metric-glossary">
+      <h2>指标释义速查</h2>
+      <div class="definition-alert"><strong>先看这条：首找只看 Found it。</strong>例如 D7 首找表示注册日起第 0–6 天至少出现 1 条 Found it。只有 DNF、Attended 或其他记录，都不算首找；若同一天既有 Found it 又有 DNF，则因为存在 Found it，仍算完成首找。</div>
+      <div class="glossary-grid">
+        <div><strong>Cohort</strong><p>按注册时间组成的用户群。本报告的主图按注册季度分组。</p></div>
+        <div><strong>D7 / D30 / D90</strong><p>D 表示从注册日开始计时。用于“首找、达 10 找”时是累计窗口：第 0–6、0–29、0–89 天；用于“D30/D90 留存”时分别指第 30–59、90–119 天的独立活动窗口。</p></div>
+        <div><strong>M1 / M2 / M3 / M6 / M12</strong><p>从注册日起算的独立 30 天活动窗口，分别为第 30–59、60–89、90–119、180–209、360–389 天；不要求连续活跃。</p></div>
+        <div><strong>E30 / EM1 / EM3 / EM6 / EM12</strong><p>E 表示改以“首次有效活动日”为时间零点。E30 是其后第 0–29 天累计结果；EM1、EM3、EM6、EM12 是首次活动后的对应独立 30 天窗口。</p></div>
+        <div><strong>Found it / DNF / Attended</strong><p>Found it 表示找到缓存；DNF 是 Didn't find it，表示未找到；Attended 表示参加活动。首找、找寻次数、达 3/10 找只统计 Found it；“有效参与/活跃”才统计这三种日志中的任意一种。</p></div>
+        <div><strong>观察窗口成熟</strong><p>用户从时间零点到数据截止日已完整经过该指标所需窗口。比例只使用成熟用户作分母；“—”通常表示尚未成熟或分母为 0。</p></div>
+        <div><strong>首次活动与首日仅 DNF</strong><p>首次活动是注册后最早的 Found it、DNF 或 Attended 日期；“首日仅 DNF”表示该日有 DNF、没有 Found it，同日日志没有小时顺序。</p></div>
+        <div><strong>恢复率</strong><p>新手首次 DNF 当日或之后出现 Found it 的比例。“同日 Found”与第 1–30 天跨日恢复分开呈现，同日先后顺序不可知。</p></div>
+        <div><strong>China / 城市归属</strong><p>都是基于已观察日志的分析归属，不代表用户真实注册地、居住地、国籍或常驻城市。</p></div>
+        <div><strong>D / T</strong><p>缓存难度 Difficulty 与地形 Terrain，通常取 1–5。报告将 0 和范围外数值归为未知；它们是缓存属性，不是用户能力评分。</p></div>
+        <div><strong>比例、占比与 n</strong><p>“占比”通常以当前群体全部用户为分母；窗口指标以对应成熟用户为分母；n 表示实际成熟分母。漏斗“上一步转化”则以上一阶段人数为分母。</p></div>
+        <div><strong>视频事件窗口</strong><p>均按注册日期的自然日划分。发布前 7 天不含发布日；发布后 0–6 天包含发布日。2025 高播放合并窗口为 8 月 6–13 日，对照期为 5–7 月与 9–11 月。</p></div>
+        <div><strong>唯一缓存与原缓存恢复</strong><p>“唯一缓存”表示目标日期仅涉及一个可识别缓存；“原缓存恢复占比”只在已经恢复且前后缓存代码都可比较的用户中计算。</p></div>
+      </div>
+    </section>
+    """
+
+
 def _chart(
     title: str,
     description: str,
@@ -2915,6 +3449,7 @@ def _chart(
         <rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" class="frame"/>
         {''.join(grid)}{''.join(labels)}{''.join(paths)}{''.join(legend)}
       </svg>
+      {_chart_metric_note(series)}
       <p class="caption">展示 2017 年起的全部注册季度 cohort；观察期未成熟的指标以空值处理。</p>
     </section>
     """
@@ -2985,6 +3520,7 @@ def _overlaid_bar_chart(
         <rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" class="frame"/>
         {''.join(grid)}{''.join(legend)}{''.join(labels)}{''.join(bars)}
       </svg></div>
+      {_chart_metric_note(series)}
       <p class="caption">纵轴使用平方根刻度，以在保留 cohort 规模差异的同时呈现小规模留存的变化；同一季度的各柱以相同宽度、相同底部重叠绘制，柱高表示各指标的独立用户人数，不表示严格用户分层。最新注册季度仅显示注册人数和截至数据日 30 日内活动人数。</p>
     </section>
     """
@@ -3014,6 +3550,7 @@ def _table(rows: list[dict[str, Any]]) -> str:
         <thead><tr><th>注册季度</th><th>有效观察用户</th><th>D7 首找</th><th>D30 首找</th><th>D30 达 10 找</th><th>D90 首找</th><th>D90 达 10 找</th><th>D30 留存</th><th>D90 留存</th><th>截至数据日 30 日内活动</th></tr></thead>
         <tbody>{''.join(table_rows)}</tbody>
       </table></div>
+      <p class="caption">D7/D30/D90 首找和“达 10 找”是从注册日起累计的第 0–6、0–29、0–89 天窗口；D30/D90 留存却分别是第 30–59、90–119 天的独立活动窗口。所有比例使用各自已经完整经过窗口的成熟用户为分母。</p>
     </section>
     """
 
@@ -3101,6 +3638,7 @@ def _stacked_lifecycle_chart(
         <rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" class="frame"/>
         {''.join(grid)}{''.join(legend)}{''.join(labels)}{''.join(bars)}
       </svg></div>
+      <div class="metric-note"><strong>指标说明：</strong><ul><li>先按注册日起第 0–89 天累计 Found it 数量分为 0、1–9、10+ 三个互斥找寻深度组。</li><li>再在每个深度组内判断 D90 活跃：注册后第 90–119 天至少有 1 条 Found it、DNF 或 Attended；没有上述日志则为 D90 不活跃。</li><li>例如“0 找，D90 活跃”表示前 90 天没有 Found it，但第 90–119 天出现过上述任一有效参与；它不表示前 90 天完全没有 DNF 或 Attended。</li><li>成熟用户指截至数据日已完整经过注册后 120 天；六种状态互斥且合计为全部成熟用户。</li></ul></div>
       <p class="caption">仅纳入注册后已满 120 天的有效用户；没有任何成熟用户的季度不绘制生命周期柱。</p>
     </section>
     """
@@ -3363,16 +3901,19 @@ def _city_cohort_html(city_analysis: dict[str, Any] | None) -> str:
       <h3>首次活动后转化与留存</h3>
       <p>以首次活动日作为城市 cohort 的时间零点。E30 表示首次活动日起 30 天内，EM1/EM3/EM6/EM12 表示首次活动后相应的独立 30 天窗口。这样先确定城市，再观察后续行为，避免用未来城市归属直接解释注册后早期结果。</p>
       <div class="table-wrap"><table><thead><tr><th>首次活动城市</th><th>用户</th><th>占比</th><th>首日Found</th><th>首日仅DNF无Found</th><th>E30成熟</th><th>E30有Found</th><th>E30达3找</th><th>E30达10找</th><th>EM1</th><th>EM3</th><th>EM6</th><th>EM12</th></tr></thead><tbody>{engagement_rows}</tbody></table></div>
+      <p class="caption">首日 Found：首次活动日至少有 1 条 Found it。首日仅 DNF 无 Found：首次活动日有 DNF、但没有 Found it；若同日两者都有则不计入此列。E30 有 Found：首次活动日起第 0–29 天至少有 1 条 Found it；E30 达3找、达10找分别表示同期累计至少 3、10 条 Found it。E30 成熟是已完整经过这 30 天的人数。EM1/EM3/EM6/EM12 分别观察首次活动后第 30–59、90–119、180–209、360–389 天是否至少有一条 Found it、DNF 或 Attended，各率以对应城市和窗口的成熟用户为分母。</p>
       <h3>注册日起算敏感性对照</h3>
       <p>下表保留原有注册日起算口径，主要用于检查“从注册到首次活动的等待时间”是否改变城市排序。它不应单独用于判断城市造成了激活差异。</p>
       <div class="table-wrap"><table><thead><tr><th>首次活动城市</th><th>D30成熟</th><th>D30首找</th><th>D30达10找</th><th>M3成熟</th><th>M3活跃</th><th>M6活跃</th><th>M12活跃</th></tr></thead><tbody>{registration_rows}</tbody></table></div>
+      <p class="caption">“首次活动城市”是注册后最早一日出现 Found it、DNF 或 Attended 的缓存城市分析归属，不是注册地或居住地。D30 首找和达10找从注册日累计第 0–29 天 Found it；M3/M6/M12 分别观察注册后第 90–119、180–209、360–389 天的 Found it、DNF 或 Attended，各率以对应成熟用户为分母。</p>
       <h3>注册年份稳健性</h3>
       <p>对全时期用户数最多的 6 个明确城市按注册年份拆分。若某个差异只在单一年份出现，或成熟人数很小，不应视为稳定城市特征。</p>
       <div class="table-wrap"><table><thead><tr><th>注册年份</th><th>首次活动城市</th><th>用户</th><th>E30成熟</th><th>E30有Found</th><th>E30达10找</th><th>EM3成熟</th><th>EM3活跃</th></tr></thead><tbody>{year_rows}</tbody></table></div>
+      <p class="caption">E30 以首次活动日为第 0 天：E30 有 Found 表示第 0–29 天至少 1 条 Found it，E30 达10找表示同期累计至少 10 条 Found it。EM3 活跃观察首次活动后第 90–119 天是否有 Found it、DNF 或 Attended；成熟人数是各率的实际分母。</p>
       <h3>2025 视频窗口城市构成</h3>
       <p>比较 2025 年 8 月 6–13 日高播放视频合并窗口与 5–7 月、9–11 月对照期。该表用于判断全时期城市差异是否被特殊流量窗口改变，不能把组间差异解释为视频的独立因果效果。</p>
       <div class="table-wrap"><table><thead><tr><th>时期</th><th>首次活动城市</th><th>用户</th><th>时期内占比</th><th>首日仅DNF无Found</th><th>E30有Found</th><th>E30达10找</th><th>EM3活跃</th></tr></thead><tbody>{event_rows}</tbody></table></div>
-      <p class="caption">表格展示用户数最多的 {int(city_analysis.get('topN') or CITY_COHORT_TOP_N)} 个明确城市，其余合并为“其他城市”。城市字段缺失单列为“未知城市”；注册后没有有效活动者单列；同一最早活动日涉及多个城市时列为“同日多城市”，不按任意日志顺序归属。所有比例都使用对应完整观察窗口的成熟用户作为分母。</p>
+      <p class="caption">表格按首次活动用户数展示 Top {int(city_analysis.get('topN') or CITY_COHORT_TOP_N)} 明确城市，其余合并为“其他城市”；城市字段缺失列为“未知城市”，同日多城市不强行归属。“时期内占比”以该时期全部可分析用户为分母。“首日仅 DNF 无 Found”表示首次活动日有 DNF 但没有 Found it；E30 有 Found 与达10找分别统计首次活动日起第 0–29 天至少 1 条、累计至少 10 条 Found it；EM3 活跃观察第 90–119 天的 Found it、DNF 或 Attended，各率以对应成熟用户为分母。</p>
     </section>
     """
 
@@ -3474,12 +4015,14 @@ def _cache_attribute_html(analysis: dict[str, Any] | None) -> str:
         f"<h3>首次活动：{title}</h3>"
         '<div class="table-wrap"><table><thead><tr><th>属性组</th><th>用户</th><th>首日Found</th><th>首日仅DNF无Found</th><th>E30成熟</th><th>E30达10找</th><th>EM3成熟</th><th>EM3活跃</th></tr></thead>'
         f"<tbody>{engagement_rows(engagement_dimensions.get(key) or [])}</tbody></table></div>"
+        '<p class="caption">首日 Found：首次活动日至少有 1 条 Found it。首日仅 DNF 无 Found：首次活动日有 DNF、但没有 Found it。E30 达10找表示首次活动日起第 0–29 天累计至少 10 条 Found it；EM3 活跃表示首次活动后第 90–119 天至少有一条 Found it、DNF 或 Attended。E30/EM3 比例分别以该属性组对应窗口的成熟用户为分母。</p>'
         for key, title in dimension_specs
     )
     recovery_tables = "".join(
         f"<h3>首次 DNF 后恢复：{title}</h3>"
         '<div class="table-wrap"><table><thead><tr><th>属性组</th><th>失败用户</th><th>30天成熟</th><th>30天内含同日Found</th><th>同日Found</th><th>1–30天后续恢复</th><th>后续恢复中位天数</th><th>缓存可比较恢复</th><th>原缓存恢复占比</th></tr></thead>'
         f"<tbody>{recovery_rows(recovery_dimensions.get(key) or [])}</tbody></table></div>"
+        '<p class="caption">30 天内含同日 Found：在首次 DNF 当日至之后第 30 天内观察到 Found it。同日 Found 只统计首次 DNF 当日也有 Found it，日期级日志无法判断先后。1–30 天后续恢复：首次 DNF 后第 1–30 天出现 Found it，与同日 Found 互斥。前三项均以已完整经过首 DNF 后 30 天的失败用户为分母。“后续恢复中位天数”只计算跨日恢复者；“原缓存恢复占比”以已恢复且前后缓存代码可比较的用户为分母。</p>'
         for key, title in dimension_specs
     )
 
@@ -3551,7 +4094,140 @@ def _cache_attribute_html(analysis: dict[str, Any] | None) -> str:
       <h3>2025 视频窗口敏感性对照</h3>
       <p>比较 2025 年 8 月 6–13 日高播放视频合并窗口与 5–7 月、9–11 月对照期。该对照检验全时期属性差异是否可能由渠道构成推动；它不是随机实验。</p>
       <div class="table-wrap"><table><thead><tr><th>时期</th><th>唯一缓存首次活动</th><th>首日Found</th><th>首日仅DNF</th><th>E30达10找</th><th>EM3活跃</th><th>恢复成熟</th><th>30天内含同日Found</th><th>同日Found</th><th>1–30天后续恢复</th></tr></thead><tbody>{period_rows()}</tbody></table></div>
-      <p class="caption">D/T 的 0 值与 1–5 之外数值归为未知。缓存类型与容器类型中少于 30 人的类别合并为“其他”；容器类型因当前数据没有稳定的人类可读映射，保留数据库原始编码。所有差异均为观察性关联。</p>
+      <p class="caption">“首日 Found”与“首日仅 DNF”按首次活动日判定；E30 达10找累计首次活动日起第 0–29 天 Found it，EM3 活跃观察第 90–119 天的 Found it、DNF 或 Attended。“30天内含同日 Found”包含首 DNF 当日，“同日 Found”与“1–30天后续恢复”互斥，后者只统计首 DNF 后第 1–30 天出现 Found it。恢复指标以恢复窗口成熟用户为分母。D/T 分别是缓存难度与地形，0 值及 1–5 之外数值归为未知；少于 30 人的类别合并为“其他”，所有差异均为观察性关联。</p>
+    </section>
+    """
+
+
+def _data_acquisition_plan_html() -> str:
+    sections = []
+    for availability in ("现有数据库可直接聚合", "需要新增采集或实验埋点"):
+        rows = []
+        for item in DATA_ACQUISITION_PRIORITIES:
+            if item["availability"] != availability:
+                continue
+            rows.append(
+                f"<tr><td>{html.escape(item['priority'])}</td>"
+                f"<td>{html.escape(item['topic'])}</td>"
+                f"<td>{html.escape(item['data'])}</td>"
+                f"<td>{html.escape(item['use'])}</td></tr>"
+            )
+        sections.append(
+            f"<h3>{html.escape(availability)}</h3>"
+            f"<div class=\"table-wrap\"><table><thead><tr><th>优先级</th>"
+            f"<th>方向</th><th>所需数据</th><th>预期用途</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+        )
+    return f"""
+    <section class="insights">
+      <h2>新增数据获取优先级</h2>
+      <p>先使用现有数据库可直接形成的聚合指标；需要新增埋点的项目用于后续验证因果和渠道价值。当前快照字段不能替代历史时点记录。</p>
+      {''.join(sections)}
+    </section>
+    """
+
+
+def _cadence_analysis_html(analysis: dict[str, Any] | None) -> str:
+    if not analysis:
+        return ""
+    period_rows = []
+    for item in analysis.get("periodTrends", []):
+        period_rows.append(
+            f"<tr><td>{html.escape(str(item.get('period') or ''))}</td>"
+            f"<td>{_fmt_int(item.get('eligibleD30'))}</td>"
+            f"<td>{_fmt_percent(item.get('finderRate'))}</td>"
+            f"<td>{_fmt_percent(item.get('multiDayShareAmongFinders'))}</td>"
+            f"<td>{_fmt_percent(item.get('fourPlusDayShareAmongFinders'))}</td>"
+            f"<td>{_fmt_percent(item.get('finds3PlusRate'))}</td>"
+            f"<td>{_fmt_percent(item.get('finds10PlusRate'))}</td></tr>"
+        )
+
+    cadence_rows = []
+    cadence_lookup = {}
+    for item in analysis.get("recentDepthCadence", []):
+        cadence_lookup[(item.get("depthKey"), item.get("cadenceKey"))] = item
+        cadence_rows.append(
+            f"<tr><td>{html.escape(str(item.get('depthLabel') or ''))}</td>"
+            f"<td>{html.escape(str(item.get('cadenceLabel') or ''))}</td>"
+            f"<td>{_fmt_int(item.get('users'))}</td>"
+            f"<td>{_fmt_percent(item.get('shareWithinDepth'))}</td>"
+            f"<td>{_fmt_percent(item.get('activeM3Rate'))} (n={_fmt_int(item.get('eligibleM3'))})</td>"
+            f"<td>{_fmt_percent(item.get('activeM6Rate'))} (n={_fmt_int(item.get('eligibleM6'))})</td>"
+            f"<td>{_fmt_percent(item.get('activeM12Rate'))} (n={_fmt_int(item.get('eligibleM12'))})</td></tr>"
+        )
+
+    comparisons = []
+    for depth_key, label in (("finds_1_2", "1–2 找"), ("finds_3_9", "3–9 找")):
+        single = cadence_lookup.get((depth_key, "single_day"), {})
+        multi = cadence_lookup.get((depth_key, "multi_day"), {})
+        if single.get("activeM3Rate") is None or multi.get("activeM3Rate") is None:
+            continue
+        comparisons.append(
+            f"{label}用户的 M3 活跃从单日找寻的 {_fmt_percent(single.get('activeM3Rate'))} "
+            f"提高到多日找寻的 {_fmt_percent(multi.get('activeM3Rate'))}"
+        )
+    comparison_text = "；".join(comparisons) or "当前样本不足以稳定比较单日和多日找寻。"
+    return f"""
+    <section class="insights">
+      <h2>多日找寻节奏与后续活跃</h2>
+      <div class="insight-callout"><strong>稳定信号：</strong>在 2024 年以来的 China 用户中控制 D30 找寻深度后，{comparison_text}。该差异在多个历史时期重复出现，说明“是否跨到第二个找寻日”比单纯增加同一天的找寻次数更适合作为引导目标。</div>
+      <h3>China 用户的 D30 找寻节奏趋势</h3>
+      <div class="table-wrap"><table><thead><tr><th>注册时期</th><th>D30 成熟用户</th><th>D30 有 Found</th><th>找到用户中 2+ 找寻日</th><th>找到用户中 4+ 找寻日</th><th>D30 达3找</th><th>D30 达10找</th></tr></thead><tbody>{''.join(period_rows)}</tbody></table></div>
+      <p class="caption">每一行按注册日期分期；D30 成熟用户已经完整经过注册后第 0–29 天。多日占比只以 D30 内至少有 1 条 Found it 的用户为分母。</p>
+      <h3>控制找寻深度后的活跃差异（2024 年以来）</h3>
+      <div class="table-wrap"><table><thead><tr><th>D30 找寻深度</th><th>D30 找寻节奏</th><th>用户数</th><th>深度组内占比</th><th>M3 活跃</th><th>M6 活跃</th><th>M12 活跃</th></tr></thead><tbody>{''.join(cadence_rows)}</tbody></table></div>
+      <p class="caption">找寻日是第 0–29 天内至少有一条 Found it 的不同自然日；同一天多条 Found it 只算 1 个找寻日。1 个找寻日与 2+ 个找寻日互斥。M3/M6/M12 分别观察注册后第 90–119、180–209、360–389 天的 Found it、DNF 或 Attended，括号内 n 为对应成熟分母。结果为观察性关联，跨多日参与也可能反映用户原始兴趣更强。</p>
+    </section>
+    """
+
+
+def _cache_freshness_analysis_html(analysis: dict[str, Any] | None) -> str:
+    if not analysis:
+        return ""
+    freshness = analysis.get("freshnessBands") or []
+    by_key = {str(item.get("key")): item for item in freshness}
+    recent = by_key.get("within_30", {})
+    stale = by_key.get("over_180", {})
+    callout = (
+        f"首次活动缓存此前 30 天内有人 Found 时，首日成功率为 "
+        f"{_fmt_percent(recent.get('firstDayFoundRate'))}；此前超过 180 天没有 "
+        f"Found 时为 {_fmt_percent(stale.get('firstDayFoundRate'))}。"
+        f"两组首日仅 DNF 分别为 {_fmt_percent(recent.get('firstDayDnfOnlyRate'))} "
+        f"和 {_fmt_percent(stale.get('firstDayDnfOnlyRate'))}。"
+    )
+
+    rows = []
+    for item in freshness:
+        rows.append(
+            f"<tr><td>{html.escape(str(item.get('label') or ''))}</td>"
+            f"<td>{_fmt_int(item.get('users'))}</td>"
+            f"<td>{_fmt_percent(item.get('firstDayFoundRate'))}</td>"
+            f"<td>{_fmt_percent(item.get('firstDayDnfOnlyRate'))}</td>"
+            f"<td>{_fmt_int(item.get('eligibleD30'))}</td>"
+            f"<td>{_fmt_percent(item.get('d30FoundRate'))}</td>"
+            f"<td>{_fmt_int(item.get('eligibleM3'))}</td>"
+            f"<td>{_fmt_percent(item.get('activeM3Rate'))}</td></tr>"
+        )
+
+    age_by_key = {
+        str(item.get("key")): item for item in analysis.get("cacheAgeBands") or []
+    }
+    young = age_by_key.get("under_1y", {})
+    old = age_by_key.get("years_7_plus", {})
+    age_check = (
+        f"缓存年龄本身没有同样清晰的梯度：不足 1 年的缓存首日成功率为 "
+        f"{_fmt_percent(young.get('firstDayFoundRate'))}（{_fmt_int(young.get('users'))} 人），"
+        f"7 年及以上缓存为 {_fmt_percent(old.get('firstDayFoundRate'))}"
+        f"（{_fmt_int(old.get('users'))} 人）。M3 活跃没有形成同样稳定的梯度，"
+        f"因此该信号适合用于提高首次成功率，不能直接解释长期留存。"
+    )
+    return f"""
+    <section class="insights">
+      <h2>首次活动缓存的历史新鲜度</h2>
+      <div class="insight-callout"><strong>明确趋势：</strong>{callout}近期真实 Found 记录比缓存年龄或城市缓存总量更适合作为新手推荐信号。</div>
+      <div class="table-wrap"><table><thead><tr><th>活动前最近一次 Found</th><th>用户数</th><th>首日 Found</th><th>首日仅 DNF</th><th>D30 成熟</th><th>D30 有 Found</th><th>M3 成熟</th><th>M3 活跃</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+      <p>{age_check}</p>
+      <div class="metric-note"><strong>指标说明：</strong><ul><li>范围是 2024 年以来、分析归属为 China、没有注册前找寻异常、且首次有效活动日只能归属到一个缓存的用户。</li><li>“此前 N 天有 Found”只使用首次活动日之前该缓存的历史 Found it 日志；不会使用活动日之后的日志，也不使用当前 <code>last_found_date</code> 或 <code>cache_status</code> 快照。</li><li>首日 Found 与首日仅 DNF 按首次活动日判定；后者要求当天有 DNF 且没有 Found it。D30 有 Found 统计注册日起第 0–29 天至少一条 Found it；M3 活跃观察注册后第 90–119 天至少一条 Found it、DNF 或 Attended。</li><li>“此前无可观察 Found”表示数据库中没有活动日前的 Found it，不等于缓存当时不可用。结果是观察性关联，仍可能受城市、用户意愿和缓存选择影响。</li></ul></div>
     </section>
     """
 
@@ -3567,6 +4243,8 @@ def build_html(
     video_analysis: dict[str, Any] | None = None,
     city_analysis: dict[str, Any] | None = None,
     cache_attribute_analysis: dict[str, Any] | None = None,
+    cadence_analysis: dict[str, Any] | None = None,
+    cache_freshness_analysis: dict[str, Any] | None = None,
 ) -> str:
     valid_users = sum(row["validUsers"] for row in cohorts)
     excluded = sum(row["excludedPreRegistrationFind"] for row in cohorts)
@@ -3591,10 +4269,13 @@ def build_html(
   .meta {{ margin-top:20px; padding:14px 16px; border-left:4px solid #2563eb; background:var(--panel); }}
   .kpis {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-top:22px; }} .kpi {{ background:var(--panel); padding:16px; border:1px solid var(--line); }} .kpi b {{ display:block; font-size:25px; margin-top:5px; }} .kpi span {{ color:var(--muted); font-size:13px; }}
   .chart-section {{ margin-top:28px; }} svg {{ width:100%; height:auto; display:block; overflow:visible; }} .bar-chart-wrap {{ overflow-x:auto; }} .bar-chart-wrap svg.bar-chart {{ max-width:none; }} .frame {{ fill:#fff; stroke:var(--line); }} .grid {{ stroke:var(--line); stroke-width:1; }} .axis,.legend {{ fill:var(--muted); font-size:12px; }} .legend {{ fill:var(--ink); }} .caption {{ font-size:13px; }}
+  .yearly-trend-chart-wrap {{ margin-top:20px; overflow-x:auto; }} .yearly-trend-chart-wrap h4 {{ margin-bottom:8px; }} .yearly-trend-chart {{ min-width:760px; }} .yearly-trend-chart .ytd-band {{ fill:#f1f5f9; }}
+  .metric-note {{ margin:10px 0 6px; padding:10px 14px; background:#f8fafc; border-left:3px solid #94a3b8; color:#475569; font-size:13px; }} .metric-note ul {{ margin:5px 0 0; padding-left:20px; }} .metric-note li {{ margin:2px 0; }}
+  .metric-glossary {{ margin:28px 0 34px; padding:20px; border:1px solid var(--line); background:#fff; }} .metric-glossary h2 {{ margin-top:0; }} .definition-alert {{ margin:0 0 14px; padding:13px 15px; background:#eff6ff; border-left:4px solid #2563eb; }} .glossary-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }} .glossary-grid>div {{ padding:12px 14px; background:var(--panel); border:1px solid var(--line); }} .glossary-grid p {{ margin:4px 0 0; color:var(--muted); font-size:13px; }}
   .table-wrap {{ overflow-x:auto; border:1px solid var(--line); }} table {{ width:100%; border-collapse:collapse; min-width:960px; font-size:13px; }} th,td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }} th {{ background:var(--panel); color:var(--muted); font-weight:600; }} th:first-child,td:first-child {{ text-align:left; }}
   .insights {{ margin-top:38px; padding:24px; background:var(--panel); border:1px solid var(--line); }} .insights>h2 {{ margin-top:0; }} .insight-block {{ margin-top:26px; }} .insight-callout {{ padding:14px 16px; background:#fff; border-left:4px solid #0f766e; }} .insight-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }} .compact-table {{ min-width:0; background:#fff; border:1px solid var(--line); }}
   .method {{ margin-top:40px; padding-top:18px; border-top:1px solid var(--line); }} ul {{ padding-left:20px; }}
-  @media (max-width:760px) {{ main {{ padding:28px 16px 44px; }} h1 {{ font-size:25px; }} .kpis {{ grid-template-columns:repeat(2,1fr); }} .insights {{ padding:18px; }} .insight-grid {{ grid-template-columns:1fr; }} }}
+  @media (max-width:760px) {{ main {{ padding:28px 16px 44px; }} h1 {{ font-size:25px; }} .kpis {{ grid-template-columns:repeat(2,1fr); }} .insights {{ padding:18px; }} .insight-grid,.glossary-grid {{ grid-template-columns:1fr; }} }}
 </style>
 </head>
 <body><main>
@@ -3607,6 +4288,9 @@ def build_html(
     <div class="kpi"><span>注册前找寻异常排除</span><b>{_fmt_int(excluded)}</b></div>
   </div>
   {_insights_html(cohorts, china_cohorts, as_of, focus_analysis, growth_analysis, pathway_analysis, video_analysis)}
+  {_data_acquisition_plan_html()}
+  {_cadence_analysis_html(cadence_analysis)}
+  {_cache_freshness_analysis_html(cache_freshness_analysis)}
   {_city_cohort_html(city_analysis)}
   {_cache_attribute_html(cache_attribute_analysis)}
   {charts}
@@ -3649,6 +4333,8 @@ def main() -> None:
     video_analysis = analyze_video_influx(rows, args.as_of)
     city_analysis = analyze_city_cohorts(rows, args.as_of)
     cache_attribute_analysis = analyze_cache_attributes(rows, args.as_of)
+    cadence_analysis = analyze_engagement_cadence(rows, args.as_of)
+    cache_freshness_analysis = analyze_cache_historical_freshness(rows, args.as_of)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     report = {
@@ -3665,6 +4351,8 @@ def main() -> None:
         "videoInfluxAnalysis": video_analysis,
         "cityCohortAnalysis": city_analysis,
         "cacheAttributeAnalysis": cache_attribute_analysis,
+        "engagementCadenceAnalysis": cadence_analysis,
+        "cacheFreshnessAnalysis": cache_freshness_analysis,
     }
     (args.output_dir / "cohort-dashboard-data.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, default=serialize), encoding="utf-8"
@@ -3673,6 +4361,7 @@ def main() -> None:
         build_html(
             cohorts, quality, args.as_of, china_cohorts, focus_analysis, growth_analysis,
             pathway_analysis, video_analysis, city_analysis, cache_attribute_analysis,
+            cadence_analysis, cache_freshness_analysis,
         ), encoding="utf-8"
     )
     LOGGER.info("Created %s", args.output_dir / "cohort-dashboard.html")

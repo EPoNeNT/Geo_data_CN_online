@@ -397,21 +397,20 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
                                     "https://www.certitudes.org/certitude?wp=GC12345",
                                     datetime(2026, 11, 1, tzinfo=timezone.utc))
         json.dumps(parsed, ensure_ascii=False)
-        manifest, scopes, details = build_dataset(
+        manifest, scopes, facts = build_dataset(
             [cache(archived=True)],
-            {"GC12345": {"descriptionScanStatus": "ok", "descriptionScanCoverage": "complete",
-                         "descriptionLinks": []}},
             {"GC12345": parsed},
         )
-        self.assertEqual(manifest["cacheCount"], 1)
-        self.assertEqual(details["GC12345"]["cache"]["checkers"][0]["publicSolvers"], [])
+        self.assertEqual(scopes[0]["summary"]["cacheCount"], 1)
+        self.assertEqual(facts["GC12345"]["checkers"][0]["publicSolvers"], [])
         output_dir = ROOT / (".test-certitude-output-" + uuid.uuid4().hex)
         try:
-            destination = publish_dataset(manifest, scopes, details, output_dir=output_dir)
+            destination = publish_dataset(manifest, scopes, facts, output_dir=output_dir)
             published = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(published["cacheCount"], 1)
-            self.assertTrue((destination / "caches" / "GC12345.json").is_file())
-            self.assertGreater((destination / "caches" / "GC12345.json").stat().st_size, 0)
+            self.assertEqual(published["datasetVersion"], manifest["datasetVersion"])
+            self.assertFalse((destination / "caches").exists())
+            self.assertEqual(len(list(output_dir.rglob("*.json"))), 16)
+            self.assertTrue((destination / "scopes" / "all" / "archived.json").is_file())
         finally:
             if output_dir.exists() and output_dir.resolve().is_relative_to(ROOT.resolve()):
                 shutil.rmtree(output_dir)

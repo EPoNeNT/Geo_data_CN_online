@@ -128,8 +128,8 @@ def _cache_stats(cache, checkers, certified):
     }
 
 
-def build_cache_detail(cache, checkers, found_logs):
-    """Derive one cache's detail document body; caller adds common envelope."""
+def build_cache_facts(cache, checkers):
+    """Build internal-only cache facts used to derive public summary scopes."""
     raw_cache = dict(cache)
     dedup = {}
     for checker_row in checkers:
@@ -147,125 +147,34 @@ def build_cache_detail(cache, checkers, found_logs):
         for c in checker_rows
     }
     known, final_ids, rule = _rule_state(raw_cache, by_id)
-    candidates = defaultdict(dict)
-    stage_checkers = [c for c in checker_rows if c.get("role") == "stage"]
+    owner_name = raw_cache.get("owner")
+    owner_key = _norm(owner_name)
+    solver_names = {}
+    checker_solver_keys = {}
     for c in checker_rows:
         cid = _checker_id(c)
-        found = {_norm(s.get("normalizedUsername")): s for s in c["publicSolvers"]}
+        checker_solver_keys[cid] = {s["normalizedUsername"] for s in c["publicSolvers"]}
         for solver in c["publicSolvers"]:
-            key = solver["normalizedUsername"]
-            candidates[key].setdefault("username", solver["username"])
-    owner_name = raw_cache.get("owner")
-    owner_key = _norm(raw_cache.get("ownerKey") or owner_name)
-    if owner_key:
-        candidates[owner_key].setdefault("username", owner_name.strip() if isinstance(owner_name, str) else owner_key)
-    logs_by_user = {}
-    for log in found_logs:
-        name = log.get("username")
-        key = _norm(name)
-        if not key:
-            continue
-        candidates[key].setdefault("username", name.strip())
-        current = logs_by_user.get(key)
-        if current is None or (log.get("foundDate") or "9999") < (current.get("foundDate") or "9999"):
-            logs_by_user[key] = log
-    player_records = {}
-    for key, user in candidates.items():
-        checks = []
-        for checker_row in checker_rows:
-            cid = _checker_id(checker_row)
-            solver = solvers_by_checker[cid].get(key)
-            checks.append({
-                "checkerId": cid,
-                "status": "certified" if solver else "no_public_record" if checker_row.get("solverListCoverage") == "complete" else "unknown",
-                "certifiedAt": solver.get("certifiedAt") if solver else None,
-                "sourceRank": solver.get("sourceRank") if solver else None,
-                "solverListCoverage": checker_row.get("solverListCoverage", "unknown"),
-                "solverListObservedAt": checker_row.get("solverListObservedAt"),
-            })
-        present = {r["checkerId"] for r in checks if r["status"] == "certified"}
-        stages = {r["checkerId"] for r in checks if r["status"] == "certified" and by_id[r["checkerId"]].get("role") == "stage"}
-        complete = known and _completion(rule, final_ids, present)
-        if complete:
-            solve_status = "certified"
-        elif not known:
-            solve_status = "unknown"
-        elif stages:
-            solve_status = "partial"
-        elif known and all(by_id[i].get("solverListCoverage") == "complete" for i in final_ids):
-            solve_status = "no_public_record"
-        else:
-            solve_status = "unknown"
-        time_values = []
-        if complete:
-            if rule in ("single_final", "any_final"):
-                satisfied = [i for i in final_ids if i in present] if rule == "any_final" else final_ids
-                times = [next((r.get("certifiedAt") for r in checks if r["checkerId"] == i), None) for i in satisfied]
-                if all(_time_sort(t) is not None for t in times):
-                    time_values = [min(times, key=_time_sort)] if rule == "any_final" else times[:1]
-            else:
-                times = [next((r.get("certifiedAt") for r in checks if r["checkerId"] == i), None) for i in final_ids]
-                if all(_time_sort(t) is not None for t in times):
-                    time_values = [max(times, key=_time_sort)]
-        log = logs_by_user.get(key)
-        stage_coverage = ("complete" if raw_cache.get("checkerSetCoverage") == "complete" else
-                          "partial" if raw_cache.get("checkerSetCoverage") == "partial" else "unknown")
-        relevant = [by_id[i] for i in final_ids] if known else checker_rows
-        list_coverage = _aggregate_list_coverage(relevant)
-        observed_times = [c.get("solverListObservedAt") for c in relevant if _time_sort(c.get("solverListObservedAt")) is not None]
-        attempt_times = [c.get("crawl", {}).get("lastAttemptAt") for c in relevant if _time_sort(c.get("crawl", {}).get("lastAttemptAt")) is not None]
-        player_records[key] = {
-            "username": user["username"], "normalizedUsername": key, "cacheCode": raw_cache["code"],
-            "solveStatus": solve_status,
-            "solveReason": None,
-            "checkerResults": checks,
-            "stageProgress": {"completed": len(stages), "denominator": len(stage_checkers) if stage_coverage == "complete" else None,
-                              "coverage": stage_coverage},
-            "certifiedAt": time_values[0] if time_values else None,
-            "foundStatus": "found" if log else "unknown",
-            "foundAt": log.get("foundAt") if log else None,
-            "foundDate": log.get("foundDate") if log else None,
-            "isOwner": key == owner_key if owner_key else None,
-            "sourceCoverage": {
-                "publicSolverLists": list_coverage,
-                "foundItLogs": raw_cache.get("foundLogsCoverage", "unknown"),
-                "certitudeObservedAt": min(observed_times, key=_time_sort) if observed_times else None,
-                "certitudeLastAttemptAt": max(attempt_times, key=_time_sort) if attempt_times else None,
-                "foundLogsAsOf": raw_cache.get("foundLogsAsOf"),
-                "foundLogsLastAttemptAt": raw_cache.get("foundLogsLastAttemptAt"),
-            },
-        }
+            solver_names.setdefault(solver["normalizedUsername"], solver["username"])
     certified_solvers = []
-    for key, record in player_records.items():
-        if record["solveStatus"] == "certified" and record.get("isOwner") is not True:
-            certified_solvers.append({"key": key, "username": record["username"], "certifiedAt": record["certifiedAt"]})
-    certified_solvers.sort(key=lambda r: r["key"])
+    if known:
+        keys = set().union(*(checker_solver_keys.get(cid, set()) for cid in final_ids))
+        for key in sorted(keys):
+            present = {cid for cid in final_ids if key in checker_solver_keys.get(cid, set())}
+            if not _completion(rule, final_ids, present) or (owner_key and key == owner_key):
+                continue
+            required = [cid for cid in final_ids if cid in present] if rule == "any_final" else final_ids
+            times = [solvers_by_checker[cid][key].get("certifiedAt") for cid in required]
+            certified_at = None
+            if times and all(_time_sort(value) is not None for value in times):
+                certified_at = (min(times, key=_time_sort) if rule == "any_final" else
+                                max(times, key=_time_sort) if rule == "all_final" else times[0])
+            certified_solvers.append({"key": key, "username": solver_names[key], "certifiedAt": certified_at})
     stats = _cache_stats(raw_cache, checker_rows, certified_solvers)
-    raw_cache["checkers"] = checker_rows
-    raw_cache["playerRecords"] = player_records
     raw_cache["completionRule"] = rule
     raw_cache["completionCheckerIds"] = final_ids
     raw_cache["checkerSetCoverage"] = raw_cache.get("checkerSetCoverage", "unknown")
-    relevant_final = [by_id[i] for i in final_ids] if known else checker_rows
-    cache_found_coverage = raw_cache.get("foundLogsCoverage", "unknown")
-    detail = {
-        "cache": raw_cache,
-        "stats": stats,
-        "certifiedSolvers": certified_solvers,
-        "playerOptions": [{"key": k, "username": v["username"]} for k, v in sorted(candidates.items())],
-        "lookupCoverage": {"publicSolverLists": _aggregate_list_coverage(relevant_final), "foundItLogs": cache_found_coverage,
-                           "certitudeObservedAt": min((c.get("solverListObservedAt") for c in relevant_final if _time_sort(c.get("solverListObservedAt")) is not None), key=_time_sort, default=None),
-                           "foundLogsAsOf": raw_cache.get("foundLogsAsOf"), "foundUsers": {}},
-    }
-    return detail
-
-
-def _aggregate_list_coverage(rows):
-    if rows and all(c.get("solverListCoverage") == "complete" for c in rows):
-        return "complete"
-    if any(c.get("solverListCoverage") == "partial" for c in rows):
-        return "partial"
-    return "unknown"
+    return {"cache": raw_cache, "checkers": checker_rows, "stats": stats, "certifiedSolvers": certified_solvers}
 
 
 def _rank_rows(rows, score_field):
@@ -300,9 +209,9 @@ def _puzzle_rankings(caches):
     return result
 
 
-def build_scope(details, region, availability):
+def build_scope(facts, region, availability):
     selected = []
-    for detail in details:
+    for detail in facts:
         c = detail.get("cache", detail)
         if region != "all" and c.get("region") != region:
             continue
@@ -321,12 +230,14 @@ def build_scope(details, region, availability):
         c = detail.get("cache", detail)
         stats = detail.get("stats", {})
         code = c["code"].upper()
-        owner_key = _norm(c.get("ownerKey") or c.get("owner")) or None
+        owner_key = _norm(c.get("owner")) or None
         owner_name = c.get("owner")
-        cache_rows.append({"code": code, "name": c.get("name"), "owner": owner_name, "ownerKey": owner_key,
-                           "geocacheType": c.get("geocacheType", 8), "region": c.get("region"), "city": c.get("city"),
+        public_stats = {field: stats.get(field) for field in
+                        ("publicCorrectCount", "successCount", "failureCount", "attemptCount", "submissionRate")}
+        cache_rows.append({"code": code, "name": c.get("name"), "owner": owner_name,
+                           "geocacheType": c.get("geocacheType", 8), "region": c.get("region"),
                            "cacheStatus": c.get("cacheStatus"), "detailsUrl": c.get("detailsUrl"),
-                           "finalCheckerId": c.get("finalCheckerId"), "finalCertitudeUrl": c.get("finalCertitudeUrl"), "stats": stats})
+                           "finalCertitudeUrl": c.get("finalCertitudeUrl"), "stats": public_stats})
         if owner_key:
             owners[owner_key].add(code)
             owner_names[owner_key] = owner_name or owner_key
@@ -348,13 +259,12 @@ def build_scope(details, region, availability):
         cert_count = sum(len(v) for (ok, _), v in edges.items() if ok == key)
         owner_rows.append({"key": key, "username": owner_names[key], "puzzleCount": len(codes),
                            "solverCount": len({sk for ok, sk in edges if ok == key}),
-                           "certificationCount": cert_count, "cacheCodes": sorted(codes),
-                           "_weight": cert_count})
+                           "cacheCodes": sorted(codes), "_weight": cert_count})
     owner_rows = _rank_rows(owner_rows, "puzzleCount")
     for row in owner_rows:
         row.pop("_weight", None)
     edge_rows = [{"ownerKey": ok, "ownerName": owner_names[ok], "solverKey": sk,
-                  "solverName": solver_names[sk], "count": len(codes), "cacheCodes": sorted(codes)}
+                  "solverName": solver_names[sk], "count": len(codes)}
                  for (ok, sk), codes in sorted(edges.items())]
     owner_weights, solver_weights = defaultdict(int), defaultdict(int)
     for edge in edge_rows:
@@ -364,9 +274,6 @@ def build_scope(details, region, availability):
     for key, name in {**owner_names, **solver_names}.items():
         players[key] = {"key": key, "username": name}
     scope_obj = {"region": region, "availability": availability}
-    coverage = {"ruleUnknownCacheCount": sum(not c["stats"].get("knownRule") for c in cache_rows),
-                "incompleteSolverCacheCount": sum(not c["stats"].get("complete") for c in cache_rows),
-                "noOwnerCacheCount": sum(not c.get("ownerKey") for c in cache_rows)}
     return {"scope": scope_obj,
             "summary": {"cacheCount": len(cache_rows), "solverCount": len(solver_rows), "ownerCount": len(owner_rows),
                         "certificationCount": sum(len(v) for v in solvers.values())},
@@ -374,8 +281,7 @@ def build_scope(details, region, availability):
             "puzzleRankings": _puzzle_rankings(cache_rows),
             "graph": {"players": [players[k] for k in sorted(players)], "edges": edge_rows,
                       "order": {"owners": sorted(owner_weights, key=lambda k: (-owner_weights[k], k)),
-                                "solvers": sorted(solver_weights, key=lambda k: (-solver_weights[k], k))}},
-            "coverage": coverage}
+                                "solvers": sorted(solver_weights, key=lambda k: (-solver_weights[k], k))}}}
 
 
 def _fail(message):
@@ -383,163 +289,296 @@ def _fail(message):
 
 
 def _valid_timestamp(value):
-    return isinstance(value, str) and _time_sort(value) is not None
+    if not isinstance(value, str) or _time_sort(value) is None:
+        return False
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.tzinfo is not None and dt.utcoffset().total_seconds() == 0
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
-def validate_dataset(manifest, scopes, details):
-    """Raise ValueError on inconsistent dataset; return True when valid."""
-    version = manifest.get("datasetVersion")
-    generated = manifest.get("generatedAt")
-    if manifest.get("schemaVersion") != 1 or not isinstance(version, str) or not version:
+def _canonical_scope_projection(scope):
+    """Return the required public fields, ignoring retained legacy extras."""
+    return {
+        "scope": {k: scope["scope"][k] for k in ("region", "availability")},
+        "summary": {k: scope["summary"][k] for k in ("cacheCount", "solverCount", "ownerCount", "certificationCount")},
+        "caches": [{"code": row["code"], "name": row.get("name"), "owner": row.get("owner"),
+                    "geocacheType": row["geocacheType"], "region": row.get("region"),
+                    "cacheStatus": row.get("cacheStatus"), "detailsUrl": row.get("detailsUrl"),
+                    "finalCertitudeUrl": row.get("finalCertitudeUrl"),
+                    "stats": {k: row["stats"].get(k) for k in
+                              ("publicCorrectCount", "successCount", "failureCount", "attemptCount", "submissionRate")}}
+                   for row in scope["caches"]],
+        "rankings": {kind: [{k: row[k] for k in fields} for row in scope["rankings"][kind]]
+                     for kind, fields in (("solvers", ("key", "username", "rank", "solvedCount", "ownerCount", "cacheCodes")),
+                                          ("owners", ("key", "username", "rank", "puzzleCount", "solverCount", "cacheCodes")))},
+        "puzzleRankings": {metric: {direction: [{"code": row["code"], "rank": row["rank"]}
+                                                  for row in scope["puzzleRankings"][metric][direction]]
+                                     for direction in ("asc", "desc")}
+                           for metric in ("rate", "correct", "attempts")},
+        "graph": {"players": [{"key": row["key"], "username": row["username"]} for row in scope["graph"]["players"]],
+                  "edges": [{k: row[k] for k in ("ownerKey", "ownerName", "solverKey", "solverName", "count")}
+                            for row in scope["graph"]["edges"]],
+                  "order": {side: list(scope["graph"]["order"][side]) for side in ("owners", "solvers")}}
+    }
+
+
+def _cross_scope_projection(scope):
+    """Compare scope identity and counts while allowing display-name casing to vary by filter."""
+    projection = _canonical_scope_projection(scope)
+    for kind in ("solvers", "owners"):
+        for row in projection["rankings"][kind]:
+            row["username"] = _norm(row["username"])
+    for player in projection["graph"]["players"]:
+        player["username"] = _norm(player["username"])
+    for edge in projection["graph"]["edges"]:
+        edge["ownerName"] = _norm(edge["ownerName"])
+        edge["solverName"] = _norm(edge["solverName"])
+    return projection
+
+
+def _count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_rank_rows(rows, field, cache_codes):
+    if not isinstance(rows, list):
+        _fail("player rankings must be lists")
+    keys = []
+    prior, rank = object(), 0
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict) or not isinstance(row.get("key"), str) or not row["key"]:
+            _fail("invalid player ranking row")
+        keys.append(row["key"])
+        value = row.get(field)
+        codes = row.get("cacheCodes")
+        if (not isinstance(row.get("username"), str) or not _count(value) or not isinstance(codes, list) or
+                any(not isinstance(c, str) for c in codes) or len(codes) != len(set(codes)) or any(c not in cache_codes for c in codes)):
+            _fail("invalid player ranking counts or cache references")
+        if codes != sorted(codes) or value != len(codes):
+            _fail("player ranking count mismatch")
+        if value != prior:
+            rank, prior = index, value
+        if type(row.get("rank")) is not int or row.get("rank") != rank:
+            _fail("player ranking rank mismatch")
+    if keys != sorted(keys, key=lambda key: (-next(r[field] for r in rows if r["key"] == key), key)) or len(keys) != len(set(keys)):
+        _fail("player ranking order or keys mismatch")
+    return {row["key"]: row for row in rows}
+
+
+def _validate_dataset(manifest, scopes, facts=None):
+    """Validate schema 2 required public fields, tolerating legacy extras."""
+    if not isinstance(manifest, dict):
+        _fail("invalid manifest")
+    version, generated = manifest.get("datasetVersion"), manifest.get("generatedAt")
+    if manifest.get("schemaVersion") != 2 or not isinstance(version, str) or not version:
         _fail("invalid manifest version")
     if not _valid_timestamp(generated):
         _fail("invalid manifest generatedAt")
     if manifest.get("regions") != list(REGIONS) or manifest.get("availabilities") != list(AVAILABILITIES):
         _fail("invalid manifest scope enums")
-    if f"/{version}/scopes/{{region}}/{{availability}}.json" not in manifest.get("scopePathTemplate", "") or \
-       f"/{version}/caches/{{code}}.json" not in manifest.get("cachePathTemplate", ""):
+    path = f"/data/certitude/versions/{version}/scopes/{{region}}/{{availability}}.json"
+    if manifest.get("scopePathTemplate") != path:
         _fail("manifest paths do not match version")
-    if len(scopes) != 15:
+    if not isinstance(scopes, list) or len(scopes) != 15:
         _fail("expected all 15 scopes")
     scope_map = {}
     for scope in scopes:
-        if scope.get("schemaVersion") != 1 or scope.get("datasetVersion") != version or scope.get("generatedAt") != generated:
+        if not isinstance(scope, dict) or scope.get("schemaVersion") != 2 or scope.get("datasetVersion") != version or scope.get("generatedAt") != generated:
             _fail("scope envelope mismatch")
         key = (scope.get("scope", {}).get("region"), scope.get("scope", {}).get("availability"))
-        if key[0] not in REGIONS or key[1] not in AVAILABILITIES or key in scope_map:
+        if key not in {(r, a) for r in REGIONS for a in AVAILABILITIES} or key in scope_map:
             _fail("invalid or duplicate scope")
         scope_map[key] = scope
-        caches = scope.get("caches")
-        if not isinstance(caches, list):
-            _fail("scope caches must be list")
-        codes = [c.get("code") for c in caches]
-        if len(codes) != len(set(codes)) or any(not isinstance(code, str) or not _GC_RE.match(code) for code in codes):
+        summary, caches = scope.get("summary"), scope.get("caches")
+        rankings, graph = scope.get("rankings"), scope.get("graph")
+        if not isinstance(summary, dict) or not isinstance(caches, list) or not isinstance(rankings, dict) or not isinstance(graph, dict):
+            _fail("scope required objects are missing")
+        codes = [row.get("code") for row in caches if isinstance(row, dict)]
+        if len(codes) != len(caches) or len(codes) != len(set(codes)) or any(not isinstance(code, str) or not _GC_RE.match(code) for code in codes):
             _fail("invalid or duplicate cache code")
-        if scope.get("summary", {}).get("cacheCount") != len(caches):
-            _fail("scope cache count mismatch")
-        if any(not isinstance(c.get("stats"), dict) for c in caches):
-            _fail("cache stats missing")
-        for cache_row in caches:
-            st = cache_row["stats"]
-            for field in ("observedCount", "publicCorrectCount", "correctCount", "successCount", "failureCount", "attemptCount"):
-                value = st.get(field)
-                if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+        if any(not _count(summary.get(f)) for f in ("cacheCount", "solverCount", "ownerCount", "certificationCount")) or summary["cacheCount"] != len(caches):
+            _fail("scope summary count mismatch")
+        for row in caches:
+            required = ("code", "name", "owner", "geocacheType", "region", "cacheStatus", "detailsUrl", "finalCertitudeUrl", "stats")
+            if any(field not in row for field in required) or type(row["geocacheType"]) is not int or row["geocacheType"] != 8 or not isinstance(row["stats"], dict):
+                _fail("cache required fields missing or invalid")
+            if (row["name"] is not None and not isinstance(row["name"], str) or
+                    row["owner"] is not None and not isinstance(row["owner"], str) or
+                    row["region"] is not None and row["region"] not in REGIONS[1:] or
+                    row["cacheStatus"] is not None and type(row["cacheStatus"]) is not int or
+                    row["detailsUrl"] is not None and not isinstance(row["detailsUrl"], str) or
+                    row["finalCertitudeUrl"] is not None and not isinstance(row["finalCertitudeUrl"], str)):
+                _fail("invalid cache nullable field")
+            st = row["stats"]
+            stats_fields = ("publicCorrectCount", "successCount", "failureCount", "attemptCount", "submissionRate")
+            if any(field not in st for field in stats_fields):
+                _fail("cache required stats missing")
+            for field in ("publicCorrectCount", "successCount", "failureCount", "attemptCount"):
+                if st.get(field) is not None and not _count(st[field]):
                     _fail("invalid cache stat count")
+            success, failure, attempts = (st.get(k) for k in ("successCount", "failureCount", "attemptCount"))
+            if (success is None) != (failure is None) or (success is None and attempts is not None) or (success is not None and attempts != success + failure):
+                _fail("cache attempt count mismatch")
             rate = st.get("submissionRate")
+            expected_rate = success / attempts if success is not None and attempts else None
             if rate is not None and (not isinstance(rate, (int, float)) or isinstance(rate, bool) or not 0 <= rate <= 1):
                 _fail("invalid submission rate")
-            if not st.get("knownRule") and st.get("publicCorrectCount") is not None:
-                _fail("unknown completion rule has a public correct count")
-            if st.get("attemptCount") is not None and st.get("successCount") is not None and st.get("failureCount") is not None and st["attemptCount"] != st["successCount"] + st["failureCount"]:
-                _fail("attempt count does not match counter pair")
-        for code in codes:
-            detail = details.get(code)
-            if not detail:
-                _fail("scope cache missing detail")
-            if detail.get("schemaVersion") != 1 or detail.get("datasetVersion") != version or detail.get("generatedAt") != generated:
-                _fail("detail envelope mismatch")
-            if detail.get("cache", {}).get("code") != code:
-                _fail("detail code mismatch")
-            if detail.get("stats") != next(c["stats"] for c in caches if c["code"] == code):
-                _fail("detail stats mismatch")
-        if any(code not in details for code in codes):
-            _fail("detail reference missing")
-        for edge in scope.get("graph", {}).get("edges", []):
-            if edge.get("count") != len(edge.get("cacheCodes", [])) or len(set(edge.get("cacheCodes", []))) != len(edge.get("cacheCodes", [])):
-                _fail("graph edge count mismatch")
-            if edge.get("ownerKey") == edge.get("solverKey"):
-                _fail("self solve graph edge")
-            if not set(edge.get("cacheCodes", [])).issubset(set(codes)):
-                _fail("graph edge cache reference missing")
+            if rate != expected_rate:
+                _fail("cache submission rate mismatch")
+        cache_codes = set(codes)
+        solver_rows = _valid_rank_rows(rankings.get("solvers"), "solvedCount", cache_codes)
+        owner_rows = _valid_rank_rows(rankings.get("owners"), "puzzleCount", cache_codes)
+        if summary["solverCount"] != len(solver_rows) or summary["ownerCount"] != len(owner_rows):
+            _fail("scope player count mismatch")
+        if summary["certificationCount"] != sum(row["solvedCount"] for row in solver_rows.values()):
+            _fail("scope certification count mismatch")
+        for row in solver_rows.values():
+            if not _count(row.get("ownerCount")) or row["key"] != _norm(row["username"]):
+                _fail("invalid solver key or owner count")
+        for row in owner_rows.values():
+            if not _count(row.get("solverCount")) or row["key"] != _norm(row["username"]):
+                _fail("invalid owner key or solver count")
+        cache_map = {row["code"]: row for row in caches}
+        expected_owner_codes = defaultdict(list)
+        for cache_row in caches:
+            owner_key = _norm(cache_row.get("owner"))
+            if owner_key:
+                expected_owner_codes[owner_key].append(cache_row["code"])
+            count = cache_row["stats"].get("publicCorrectCount")
+            if count is not None:
+                actual_count = sum(cache_row["code"] in row["cacheCodes"] for row in solver_rows.values())
+                if count != actual_count:
+                    _fail("public correct count does not match solver GC facts")
+        for key, row in owner_rows.items():
+            expected_codes = sorted(expected_owner_codes.get(key, []))
+            if row["cacheCodes"] != expected_codes:
+                _fail("owner cache list does not match cache owners")
+        for key, row in solver_rows.items():
+            if any(_norm(cache_map[code].get("owner")) == key for code in row["cacheCodes"]):
+                _fail("solver cache list includes own cache")
+        player_rows = graph.get("players")
+        edges = graph.get("edges")
+        order = graph.get("order")
+        if not isinstance(player_rows, list) or not isinstance(edges, list) or not isinstance(order, dict):
+            _fail("graph required fields missing")
+        player_keys = [p.get("key") for p in player_rows if isinstance(p, dict)]
+        ranking_keys = set(solver_rows) | set(owner_rows)
+        if len(player_keys) != len(player_rows) or player_keys != sorted(ranking_keys) or len(player_keys) != len(set(player_keys)):
+            _fail("graph player directory mismatch")
+        players = {p["key"]: p for p in player_rows}
+        for p in player_rows:
+            if not isinstance(p.get("username"), str) or p["key"] != _norm(p["username"]):
+                _fail("invalid graph player")
+        for key, player in players.items():
+            canonical_name = solver_rows[key]["username"] if key in solver_rows else owner_rows[key]["username"]
+            if player["username"] != canonical_name:
+                _fail("graph player name mismatch")
+        cache_owners = {row["code"]: _norm(row.get("owner")) or None for row in caches}
+        expected_edges = defaultdict(set)
+        for skey, row in solver_rows.items():
+            for code in row["cacheCodes"]:
+                okey = cache_owners.get(code)
+                if okey and okey != skey:
+                    expected_edges[(okey, skey)].add(code)
+        ow, sw = defaultdict(int), defaultdict(int)
+        owner_solver, solver_owner = defaultdict(set), defaultdict(set)
+        actual_pairs = []
+        for edge in edges:
+            if not isinstance(edge, dict) or any(k not in edge for k in ("ownerKey", "ownerName", "solverKey", "solverName", "count")):
+                _fail("invalid graph edge")
+            pair = (edge["ownerKey"], edge["solverKey"])
+            if pair[0] == pair[1] or pair[0] not in owner_rows or pair[1] not in solver_rows or not _count(edge["count"]) or edge["count"] < 1:
+                _fail("invalid graph edge reference or count")
+            if edge["ownerName"] != owner_rows[pair[0]]["username"] or edge["solverName"] != solver_rows[pair[1]]["username"]:
+                _fail("graph edge player names mismatch")
+            actual_pairs.append(pair)
+            ow[pair[0]] += edge["count"]
+            sw[pair[1]] += edge["count"]
+            owner_solver[pair[0]].add(pair[1]); solver_owner[pair[1]].add(pair[0])
+        if actual_pairs != sorted(set(actual_pairs)):
+            _fail("graph edges duplicated or unsorted")
+        actual_counts = {(e["ownerKey"], e["solverKey"]): e["count"] for e in edges}
+        if actual_counts != {pair: len(gcset) for pair, gcset in expected_edges.items()}:
+            _fail("graph edge counts do not match distinct GC facts")
+        if order.get("owners") != sorted(ow, key=lambda k: (-ow[k], k)) or order.get("solvers") != sorted(sw, key=lambda k: (-sw[k], k)):
+            _fail("graph order mismatch")
+        for key, row in solver_rows.items():
+            if row["ownerCount"] != len(solver_owner[key]):
+                _fail("solver owner count mismatch")
+        for key, row in owner_rows.items():
+            if row["solverCount"] != len(owner_solver[key]):
+                _fail("owner solver count mismatch")
         for metric in ("rate", "correct", "attempts"):
+            field = {"rate": "submissionRate", "correct": "publicCorrectCount", "attempts": "attemptCount"}[metric]
+            if metric not in scope.get("puzzleRankings", {}):
+                _fail("puzzle rankings missing")
+            values = {row["code"]: row["stats"].get(field) for row in caches}
             for direction in ("asc", "desc"):
-                rows = scope.get("puzzleRankings", {}).get(metric, {}).get(direction, [])
-                if {r.get("code") for r in rows} != set(codes) or len(rows) != len(codes):
-                    _fail("puzzle rank coverage mismatch")
-                values = {c["code"]: c["stats"].get({"rate": "submissionRate", "correct": "publicCorrectCount", "attempts": "attemptCount"}[metric]) for c in caches}
-                sorted_values = sorted(values, key=lambda code: (values[code] is None,
-                    (values[code] or 0) * (1 if direction == "asc" else -1), code))
-                if [r["code"] for r in rows] != sorted_values:
-                    _fail("puzzle rank order mismatch")
+                rows = scope["puzzleRankings"][metric].get(direction)
+                if not isinstance(rows, list):
+                    _fail("puzzle rank list missing")
+                ordered = sorted(values, key=lambda c: (values[c] is None, (values[c] or 0) * (1 if direction == "asc" else -1), c))
+                if [r.get("code") for r in rows] != ordered:
+                    _fail("puzzle rank coverage or order mismatch")
                 prior, rank = object(), 0
                 for index, row in enumerate(rows, 1):
                     value = values[row["code"]]
+                    if (not isinstance(row, dict) or not isinstance(row.get("code"), str) or
+                            row.get("rank") is not None and type(row.get("rank")) is not int):
+                        _fail("invalid puzzle rank row")
                     if value is not None and value != prior:
                         rank, prior = index, value
-                    expected = rank if value is not None else None
-                    if row.get("rank") != expected:
+                    if row.get("rank") != (rank if value is not None else None):
                         _fail("puzzle rank value mismatch")
-        rankings = scope.get("rankings", {})
-        for kind, field in (("solvers", "solvedCount"), ("owners", "puzzleCount")):
-            rows = rankings.get(kind, [])
-            if any(not isinstance(row.get(field), int) or row[field] < 0 for row in rows):
-                _fail("invalid player ranking count")
-            expected_order = sorted(rows, key=lambda row: (-row[field], row["key"]))
-            if [row.get("key") for row in rows] != [row.get("key") for row in expected_order]:
-                _fail("player ranking order mismatch")
-            prior, rank = object(), 0
-            for index, row in enumerate(rows, 1):
-                if row[field] != prior:
-                    rank, prior = index, row[field]
-                if row.get("rank") != rank or row.get("cacheCodes") != sorted(set(row.get("cacheCodes", []))) or row[field] != len(row["cacheCodes"]):
-                    _fail("player ranking count or rank mismatch")
-        summary = scope["summary"]
-        if summary.get("solverCount") != len(rankings.get("solvers", [])) or summary.get("ownerCount") != len(rankings.get("owners", [])):
-            _fail("scope player count mismatch")
-        if summary.get("certificationCount") != sum(row["solvedCount"] for row in rankings.get("solvers", [])):
-            _fail("scope certification count mismatch")
-        graph = scope.get("graph", {})
-        player_keys = [p.get("key") for p in graph.get("players", [])]
-        expected_player_keys = sorted({r["key"] for r in rankings.get("solvers", [])} | {r["key"] for r in rankings.get("owners", [])})
-        if player_keys != expected_player_keys:
-            _fail("graph player directory mismatch")
-        owner_weights, solver_weights = defaultdict(int), defaultdict(int)
-        for edge in graph.get("edges", []):
-            owner_weights[edge["ownerKey"]] += edge["count"]
-            solver_weights[edge["solverKey"]] += edge["count"]
-        expected_owner_order = sorted(owner_weights, key=lambda k: (-owner_weights[k], k))
-        expected_solver_order = sorted(solver_weights, key=lambda k: (-solver_weights[k], k))
-        if graph.get("order", {}).get("owners") != expected_owner_order or graph.get("order", {}).get("solvers") != expected_solver_order:
-            _fail("graph order mismatch")
-        expected_scope = build_scope(list(details.values()), key[0], key[1])
-        for field in ("scope", "summary", "caches", "rankings", "puzzleRankings", "graph", "coverage"):
-            if scope.get(field) != expected_scope.get(field):
-                _fail(f"scope {field} does not match cache detail facts")
-    if len(scope_map) != 15:
+    if set(scope_map) != {(r, a) for r in REGIONS for a in AVAILABILITIES}:
         _fail("scope combination missing")
-    if manifest.get("cacheCount") != len(details):
-        _fail("manifest cache count mismatch")
-    if len({c for scope in scope_map.values() if scope["scope"] == {"region": "all", "availability": "all"} for c in [r["code"] for r in scope["caches"]]}) != len(details):
-        _fail("all scope does not represent the dataset detail set")
-    for code, detail in details.items():
-        if not isinstance(code, str) or code != code.upper() or not _GC_RE.match(code):
-            _fail("invalid detail code key")
-        if detail.get("schemaVersion") != 1 or detail.get("datasetVersion") != version or detail.get("generatedAt") != generated:
-            _fail("detail envelope mismatch")
-        if detail.get("cache", {}).get("code") != code:
-            _fail("detail cache code mismatch")
-        cache_data = detail.get("cache", {})
-        checker_rows = cache_data.get("checkers", [])
-        if not isinstance(checker_rows, list):
-            _fail("detail checkers must be a list")
-        for checker_row in checker_rows:
-            for field in ("successCount", "failureCount", "solverRowsRetrieved", "publicSolverCount"):
-                value = checker_row.get(field)
-                if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
-                    _fail("invalid checker count")
-        found_logs = [{"username": row.get("username"), "foundDate": row.get("foundDate"), "foundAt": row.get("foundAt")}
-                      for row in cache_data.get("playerRecords", {}).values() if row.get("foundStatus") == "found"]
-        rebuilt = build_cache_detail(cache_data, checker_rows, found_logs)
-        for field in ("stats", "certifiedSolvers", "playerOptions"):
-            if detail.get(field) != rebuilt.get(field):
-                _fail(f"detail {field} does not match checker facts")
-        player_records = cache_data.get("playerRecords", {})
-        if player_records != rebuilt["cache"].get("playerRecords"):
-            _fail("player records do not match checker and log facts")
-        if detail.get("stats", {}).get("knownRule"):
-            ids = cache_data.get("completionCheckerIds", [])
-            if cache_data.get("completionRule") == "single_final" and len(ids) == 1:
-                final = next((c for c in checker_rows if _checker_id(c) == ids[0]), None)
-                if cache_data.get("finalCheckerId") != ids[0] or not final or cache_data.get("finalCertitudeUrl") != final.get("sourceUrl"):
-                    _fail("final checker link does not match verified final")
+    all_codes = {row["code"] for row in scope_map[("all", "all")]["caches"]}
+    base = scope_map[("all", "all")]
+    base_caches = {row["code"]: row for row in base["caches"]}
+    certified_by_code = defaultdict(list)
+    for solver in base["rankings"]["solvers"]:
+        for code in solver["cacheCodes"]:
+            certified_by_code[code].append({"key": solver["key"], "username": solver["username"], "certifiedAt": None})
+    for (region, availability), scope in scope_map.items():
+        selected = {row["code"] for row in scope["caches"]}
+        if not selected.issubset(all_codes):
+            _fail("filtered scope contains cache outside all scope")
+        expected = {row["code"] for row in scope_map[("all", "all")]["caches"]
+                    if (region == "all" or row.get("region") == region) and
+                    (availability == "all" or (availability == "active" and row.get("cacheStatus") is not None and row.get("cacheStatus") != 2) or
+                     (availability == "archived" and row.get("cacheStatus") == 2))}
+        if selected != expected:
+            _fail("filtered scope cache set mismatch")
+        filtered_cache_rows = [base_caches[code] for code in sorted(expected)]
+        synthetic_facts = [{"cache": cache_row, "stats": cache_row["stats"],
+                            "certifiedSolvers": certified_by_code.get(cache_row["code"], [])}
+                           for cache_row in filtered_cache_rows]
+        expected_scope = build_scope(synthetic_facts, region, availability)
+        if _cross_scope_projection(scope) != _cross_scope_projection(expected_scope):
+            _fail("filtered scope contents do not match all scope")
+    if facts is not None:
+        if isinstance(facts, list):
+            facts = {row.get("cache", {}).get("code"): row for row in facts}
+        if not isinstance(facts, dict) or set(facts) != all_codes:
+            _fail("internal facts do not match all scope")
+        for code, fact in facts.items():
+            if fact.get("cache", {}).get("code") != code or not isinstance(fact.get("checkers"), list):
+                _fail("invalid internal facts")
+            rebuilt = build_cache_facts(fact["cache"], fact["checkers"])
+            if rebuilt["stats"] != fact.get("stats") or rebuilt["certifiedSolvers"] != fact.get("certifiedSolvers"):
+                _fail("internal facts do not match source checker records")
+        for key, scope in scope_map.items():
+            expected = build_scope(list(facts.values()), *key)
+            if _canonical_scope_projection(scope) != _canonical_scope_projection(expected):
+                _fail(f"scope {key} does not match internal facts")
     return True
+
+
+def validate_dataset(manifest, scopes, facts=None):
+    """Validate schema 2 required fields, tolerating legacy extras."""
+    try:
+        return _validate_dataset(manifest, scopes, facts)
+    except (AttributeError, KeyError, TypeError, IndexError) as exc:
+        raise ValueError("malformed required dataset fields") from exc

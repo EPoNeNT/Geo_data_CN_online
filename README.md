@@ -104,13 +104,17 @@ pip install -r requirements.txt
 | `CERTITUDE_REQUEST_DELAY_SECONDS` | Certitude 来源请求间隔（默认 1.5 秒）。 |
 | `CERTITUDE_MAX_RETRIES` | Certitude 来源请求最大重试次数（默认 3）。 |
 | `CERTITUDE_REQUEST_TIMEOUT_SECONDS` | Certitude 来源请求超时（默认 30 秒）。 |
-| `CERTITUDE_FRESHNESS_HOURS` | 生成数据时公开名单的 freshness 阈值（默认 48 小时）。 |
+| `CERTITUDE_FRESHNESS_HOURS` | 标记旧采集结果的时间阈值（默认 48 小时）。 |
 
 本地跨进程保存普通账号 Cookie 续期时，可设置 `GEOCACHING_COOKIE_STATE_KEY` 为 Fernet 生成的 URL-safe Base64 密钥（44 个字符）。可用 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` 生成，然后将密钥只放入本地 `.env` 或 GitHub Actions Secret `GEOCACHING_COOKIE_STATE_KEY`。末尾的 `=` 是密钥的一部分；`.env` 中可用双引号包裹整个值，复制到 Secret 时不包含外层引号。可选的 `GEOCACHING_COOKIE_STATE_FILE` 指定状态文件路径，默认 `.runtime/geocaching-auth/nonpremium.enc`。Actions 在 `crawl-caches`、`crawl-logs`、`crawl-certitude`、`diagnose-auth` 和独立的 `Archived Logs Crawler` job 间恢复并保存该加密文件；需要为这些 job 配置同一 Secret。两个工作流共享缓存前缀和并发组，避免同时更新同一账号的续期状态。文件只以加密形式进入 Actions cache，`.runtime/` 已在 gitignore 中排除。更换 `GEOCOOKIE_NONPREMIUM` 会使旧状态失效并从新配置的 Cookie 开始。服务器是否续期由服务器决定；退出登录可能撤销会话，缓存过期或被驱逐后可能需要手动更新 Cookie。此机制不使用账号密码，也不在 workflow 中执行密码登录。
 
 ## Certitude 每日静态数据
 
-每日 Actions 工作流通过独立的 `crawl-certitude` job 扫描项目内 Mystery 缓存（包括已归档缓存）的描述，刷新已发现验证页的计数和公开名单，并写入 Neon。新发现、近期活动或上次未完成的验证页会抓取详情；dashboard 未列出的历史验证页仍保留，但不会因此被定期重新抓取。公开活动列表按地区增量扫描，覆盖最近活动变化并记录可续跑进度。`generate-data` 中的 Certitude 生成步骤仅读取已保存的数据。完整链路按 `crawl-caches → crawl-logs → crawl-certitude → generate-data` 执行，以共享账号 Cookie 状态并使用最新数据。描述扫描有界、可续跑；普通账号和 Premium 缓存请求沿用现有 `GEOCOOKIE_NONPREMIUM`、`GEOCOOKIE_PREMIUM` 与加密续期状态。无需 Certitude 账号 Cookie，也不采集或保存答案。
+每日 Actions 工作流通过独立的 `crawl-certitude` job 扫描项目内 Mystery 缓存（包括已归档缓存）的描述，刷新已发现验证页的计数和公开名单，并写入 Neon。新发现、近期活动或上次未完成的验证页会抓取来源数据；dashboard 未列出的历史验证页仍保留，但不会因此被定期重新抓取。公开活动列表按地区增量扫描，覆盖最近活动变化并记录可续跑进度。`generate-data` 中的 Certitude 生成步骤仅读取已保存的数据。完整链路按 `crawl-caches → crawl-logs → crawl-certitude → generate-data` 执行，以共享账号 Cookie 状态并使用最新数据。描述扫描有界、可续跑；普通账号和 Premium 缓存请求沿用现有 `GEOCOOKIE_NONPREMIUM`、`GEOCOOKIE_PREMIUM` 与加密续期状态。无需 Certitude 账号 Cookie，也不采集或保存答案。
+
+每个静态批次固定包含 16 个文件：`manifest.json` 和 15 个区域/藏点状态范围 JSON。范围文件包含题目摘要、榜单和关系数据；不生成单题或合并题目详情文件。点击玩家查看关联藏点时，使用范围文件中的缓存摘要和榜单关联 GC 列表。manifest 使用 schema version 2；每批写入独立版本目录并在完成后原子切换入口，既有已发布版本保留。
+
+按数据需求 v1.4.1，manifest 只提供版本、生成时间、筛选范围和文件路径。范围文件不再输出采集覆盖信息、藏点的中间计算字段、出题者的重复认证总数和关系边的 GC 列表；关联藏点列表保留在玩家及出题者榜单中。生成时仍用数据库来源记录校验去重和统计结果，校验器也接受旧文件保留的额外字段。
 
 本地可分别运行采集与生成：
 
@@ -119,7 +123,7 @@ python crawl_certitude.py --description-limit 200
 python generate_certitude.py
 ```
 
-将描述上限设为 `0` 可扫描所有到期描述。活动扫描每次最多读取 100 个页面，可通过 `CERTITUDE_ACTIVITY_PAGE_LIMIT` 或 `--activity-page-limit` 调整。扫描各地区时使用 dashboard 实际提供的筛选和下一页链接；达到上限会保存游标供后续续扫。每轮重新读取筛选列表头，再从已保存游标继续，失败或未完成的 checker 会保留待处理状态并在后续重试。来源时间与缓存响应信息只用于保守识别近期活动窗口；窗口边界可能重复检查少量记录，以避免漏掉边界活动。公开活动年龄是经过的秒数，不是活动发生的绝对时间；精确 `latestActivityAt` 仍来自 checker 详情页。手动 Actions 的 `certitude` 模式只采集并写入 Neon，不生成或发布文件；完成采集后，可选择 `generate` 模式生成和发布数据，该模式不会启动 Certitude 爬虫，并保留原有的用户注册时间补抓流程。`both` 模式及定时运行会执行完整链路。已核验的链接不会因单次扫描缺失而重置；未映射题目、未知角色和不完整日志覆盖会保留为未知状态。Found it 没有匹配记录时，只有存在完整覆盖证据才会判定为未找到。
+将描述上限设为 `0` 可扫描所有到期描述。活动扫描每次最多读取 100 个页面，可通过 `CERTITUDE_ACTIVITY_PAGE_LIMIT` 或 `--activity-page-limit` 调整。扫描各地区时使用 dashboard 实际提供的筛选和下一页链接；达到上限会保存游标供后续续扫。每轮重新读取筛选列表头，再从已保存游标继续，失败或未完成的 checker 会保留待处理状态并在后续重试。来源时间与缓存响应信息只用于保守识别近期活动窗口；窗口边界可能重复检查少量记录，以避免漏掉边界活动。公开活动年龄是经过的秒数，不是活动发生的绝对时间；精确 `latestActivityAt` 仍来自 checker 详情页。手动 Actions 的 `certitude` 模式只采集并写入 Neon，不生成或发布文件；完成采集后，可选择 `generate` 模式生成和发布数据，该模式不会启动 Certitude 爬虫，并保留原有的用户注册时间补抓流程。`both` 模式及定时运行会执行完整链路。已核验的链接不会因单次扫描缺失而重置；未映射题目和未知角色会保留为未知状态。Certitude 静态数据不包含 Found it 状态。
 
 采集器会创建 `certitude_descriptions`、`certitude_checkers`、`certitude_snapshots` 和 `certitude_activity_scans` 四张表；也可手动执行 `sql/certitude_setup.sql`。尚未执行数据库迁移或完成首次全量扫描时，生成结果不代表数据已完整。后续前端应先读取 `/data/certitude/manifest.json`，并在同一 `datasetVersion` 下读取其余文件。
 

@@ -185,7 +185,10 @@ def parse_dashboard_html(html: str, source_url: str, expected_country_id: str | 
                             if item.tag == "a" and item.attrs.get("href") and
                             _id_from_gc_url(urljoin(source_url, item.attrs["href"].strip()))), None)
         cache_code = _id_from_gc_url(parent_link) if parent_link else None
+        published_cell = cell("c-dat")
+        published_epoch = _epoch(published_cell.attrs.get("t", "")) if published_cell else None
         rows.append({"checkerId": checker_id, "sourceUrl": checker_url, "cacheCode": cache_code,
+                     "publishedAt": _iso_utc(published_epoch),
                      "ageSeconds": _dashboard_age(activity_cell),
                      "successCount": _nonnegative_int(success_cell.text()),
                      "failureCount": _nonnegative_int(failure_cell.text())})
@@ -193,14 +196,21 @@ def parse_dashboard_html(html: str, source_url: str, expected_country_id: str | 
     action = urljoin(source_url, form.attrs.get("action", ""))
     action_query = parse_qs(urlsplit(action).query)
     sort_url = None
+    publication_sort_url = None
     for anchor in (node for node in root.descendants() if node.tag == "a" and node.attrs.get("href")):
         candidate = urljoin(source_url, anchor.attrs["href"].strip())
         query = parse_qs(urlsplit(candidate).query)
-        if query.get("sort") == ["act"] and query.get("dir") == ["desc"]:
+        if query.get("sort") == ["act"] and query.get("dir") == ["desc"] and "idx" not in query:
             sort_url = candidate
+        if (query.get("sort") == ["dat"] and query.get("dir") == ["desc"]
+                and "idx" not in query):
+            publication_sort_url = candidate
+        if sort_url is not None and publication_sort_url is not None:
             break
     if sort_url is None and action_query.get("sort") == ["act"] and action_query.get("dir") == ["desc"]:
         sort_url = action
+    if publication_sort_url is None and action_query.get("sort") == ["dat"] and action_query.get("dir") == ["desc"]:
+        publication_sort_url = action
 
     next_url = None
     pagination = []
@@ -232,7 +242,7 @@ def parse_dashboard_html(html: str, source_url: str, expected_country_id: str | 
         if next_url is not None and next_url != candidates[0]:
             raise ValueError("dashboard pagination links conflict")
         next_url = candidates[0]
-    return {"filterAction": action, "activitySortUrl": sort_url,
+    return {"filterAction": action, "activitySortUrl": sort_url, "publicationSortUrl": publication_sort_url,
             "sort": action_query.get("sort", [None])[0], "direction": action_query.get("dir", [None])[0], "countries": countries,
             "selectedCountry": selected_country, "filters": filters, "rows": rows,
             "pagination": pagination, "nextUrl": next_url}

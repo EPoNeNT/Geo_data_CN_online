@@ -5,37 +5,12 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from crawl_certitude import _description_record, description_fingerprint, select_due_candidates
 from generate_certitude import build_dataset, publish_dataset
 
 
 class PipelineTests(unittest.TestCase):
-    def test_description_duplicate_source_occurrences_are_preserved(self):
-        links = [{"sourceUrl": "https://www.certitudes.org/certitude?wp=GC1", "evidence": "LongDescription",
-                  "sourceOccurrence": "LongDescription:1"},
-                 {"sourceUrl": "https://www.certitudes.org/certitude?wp=GC1", "evidence": "LongDescription",
-                  "sourceOccurrence": "LongDescription:2"}]
-        result = _description_record({}, {"code": "GC1"}, "2026-11-01T00:00:00Z", links=links)
-        self.assertEqual(len(result["descriptionLinks"]), 2)
-
-    def test_pending_first_archived_included_and_unchanged_recent_skipped(self):
-        now = datetime(2026, 11, 1, tzinfo=timezone.utc)
-        rows = [{"code": "GC1", "cache_status": 2}, {"code": "GC2"}, {"code": "GC3"}]
-        saved = {"GC2": {"descriptionScanStatus": "ok", "descriptionScanCoverage": "complete",
-                          "descriptionScannedAt": "2026-10-31T00:00:00Z",
-                          "sourceFingerprint": description_fingerprint(rows[1])}}
-        self.assertEqual([r["code"] for r in select_due_candidates(rows, saved, now, 30, 1)], ["GC1"])
-        self.assertEqual([r["code"] for r in select_due_candidates(rows, saved, now, 30, 0)], ["GC1", "GC3"])
-
-    def test_failed_scan_retried_and_metadata_change_triggers_scan(self):
-        rows = [{"code": "GC1", "name": "new"}]
-        saved = {"GC1": {"descriptionScanStatus": "ok", "descriptionScanCoverage": "complete",
-                          "descriptionScannedAt": "2026-10-31T00:00:00Z", "sourceFingerprint": "old"}}
-        self.assertEqual(select_due_candidates(rows, saved, datetime.now(timezone.utc), 30, 10), rows)
-
     def test_empty_dataset_has_fifteen_scopes_and_unique_version(self):
         first = build_dataset([], {})
         second = build_dataset([], {})

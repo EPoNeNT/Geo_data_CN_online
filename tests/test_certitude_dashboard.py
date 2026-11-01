@@ -31,13 +31,37 @@ class DashboardParserTests(unittest.TestCase):
         self.assertEqual(result["filters"]["filter_region"], "All")
         self.assertEqual(result["nextUrl"], "https://www.certitudes.org/?sort=act&dir=desc&idx=a%2Fb%3D")
         self.assertEqual(result["rows"], [{"checkerId": "W1AbC", "sourceUrl": "https://www.certitudes.org/certitude?wp=W1AbC",
-            "cacheCode": "GC12345", "ageSeconds": 83978, "successCount": 3, "failureCount": 2}])
+            "cacheCode": "GC12345", "publishedAt": None, "ageSeconds": 83978, "successCount": 3, "failureCount": 2}])
         self.assertNotIn("owner", result["rows"][0])
 
     def test_age_is_elapsed_seconds_never_epoch(self):
         html = dashboard().replace('t="83978"', 't="1700000000"')
         row = parse_dashboard_html(html, "https://www.certitudes.org/")["rows"][0]
         self.assertEqual(row["ageSeconds"], 1700000000)
+
+    def test_publication_time_comes_from_date_cell_epoch_and_exposes_dat_sort(self):
+        html = dashboard(action='/?sort=dat&amp;dir=desc',
+                         next_markup='<div class="next logo"><a href="/?sort=dat&amp;dir=desc&amp;idx=older">Next</a></div>')
+        html = html.replace('<td class="c-dat">1700000000</td>', '<td class="c-dat date" t="1793549100" title="Asia/Shanghai">ignored</td>')
+        result = parse_dashboard_html(html, "https://www.certitudes.org/")
+        self.assertEqual(result["publicationSortUrl"], "https://www.certitudes.org/?sort=dat&dir=desc")
+        self.assertEqual(result["rows"][0]["publishedAt"], "2026-11-01T16:05:00Z")
+        self.assertEqual(result["nextUrl"], "https://www.certitudes.org/?sort=dat&dir=desc&idx=older")
+
+    def test_publication_time_ignores_text_title_and_missing_or_invalid_epoch(self):
+        html = dashboard().replace('<td class="c-dat">1700000000</td>',
+            '<td class="c-dat date" title="2026-11-02">publication text</td>')
+        self.assertIsNone(parse_dashboard_html(html, "https://www.certitudes.org/")["rows"][0]["publishedAt"])
+        html = dashboard().replace('<td class="c-dat">1700000000</td>',
+            '<td class="c-dat date" t="not-a-time">publication text</td>')
+        self.assertIsNone(parse_dashboard_html(html, "https://www.certitudes.org/")["rows"][0]["publishedAt"])
+
+    def test_activity_and_publication_controls_are_extracted_independently(self):
+        html = dashboard(action='/?sort=act&amp;dir=desc', next_markup='')
+        html = html.replace('<th>Date published</th>', '<th><a href="/?sort=dat&amp;dir=desc">Date published</a></th>')
+        result = parse_dashboard_html(html, "https://www.certitudes.org/")
+        self.assertEqual(result["activitySortUrl"], "https://www.certitudes.org/?sort=act&dir=desc")
+        self.assertEqual(result["publicationSortUrl"], "https://www.certitudes.org/?sort=dat&dir=desc")
 
     def test_activity_age_uses_only_the_whole_second_t_attribute(self):
         html = dashboard().replace('t="83978"', 'title="1700000000"')

@@ -1,21 +1,19 @@
-"""Collect public Certitude statistics and retain resumable discovery in Neon."""
+"""Collect Certitude publication/activity lists and retain resumable data in Neon."""
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
-import hashlib
-import json
+from datetime import datetime, timezone
 import os
 import time
 from urllib.parse import urljoin, urlparse
 
 import requests
 
-from certitude_source import extract_description_links, parse_checker_html
+from certitude_source import parse_checker_html
 from certitude_store import CertitudeStore, merge_checker
 from certitude_activity import index_activity, needs_detail_retry
-from runtime_utils import (connect_postgres, create_geocaching_session,
-                           looks_like_login_page, optional_cookie, require_env, setup_logging)
+from certitude_discovery import index_publications
+from runtime_utils import connect_postgres, require_env, setup_logging
 
 
 COUNTRIES = {"China": "china", "Taiwan": "taiwan", "Hong Kong": "hong-kong", "Macao": "macao"}
@@ -40,40 +38,10 @@ def load_candidates(connection):
         return [dict(zip(fields, row)) for row in cursor.fetchall()]
 
 
-def description_fingerprint(cache):
-    values = [cache.get(k) for k in ("code", "name", "owner_username", "cache_status", "source_version")]
-    return hashlib.sha256(json.dumps(values, default=str, ensure_ascii=False).encode("utf-8")).hexdigest()
-
-
-def select_due_candidates(candidates, descriptions, now, refresh_days, limit):
-    due = []
-    cutoff = now - timedelta(days=refresh_days)
-    for cache in candidates:
-        record = descriptions.get(cache["code"], {})
-        scanned = record.get("descriptionScannedAt")
-        try:
-            scanned_time = datetime.fromisoformat(scanned.replace("Z", "+00:00")) if scanned else None
-            if scanned_time and scanned_time.tzinfo is None:
-                scanned_time = None
-        except (ValueError, TypeError):
-            scanned_time = None
-        complete = record.get("descriptionScanStatus") == "ok" and record.get("descriptionScanCoverage") == "complete"
-        if (not complete or not scanned_time or scanned_time <= cutoff or
-                record.get("sourceFingerprint") != description_fingerprint(cache)):
-            # Unscanned rows precede retries; repeated failures cannot starve discovery.
-            due.append((bool(record), scanned or "", cache["code"], cache))
-    ordered = [item[3] for item in sorted(due, key=lambda item: item[:3])]
-    return ordered[:limit] if limit else ordered
-
-
 class FetchError(RuntimeError):
     def __init__(self, code, *, metadata=None):
         super().__init__(code)
         self.metadata = dict(metadata or {})
-
-
-class AuthenticationError(FetchError):
-    pass
 
 
 class BoundedFetcher:
@@ -155,119 +123,29 @@ class BoundedFetcher:
         raise FetchError("request_failed")
 
 
-def _description_record(previous, cache, now, *, links=None, source=None, error=None):
-    record = dict(previous or {})
-    record["lastAttemptAt"] = now
-    record["sourceFingerprint"] = description_fingerprint(cache)
-    if error:
-        record.update(descriptionScanStatus="error", errorCode=error)
-        record.setdefault("descriptionScanCoverage", "unknown")
-        record.setdefault("descriptionLinks", [])
-        return record
-    # Historical entry links are retained even when a later description omits them.
-    combined = list(record.get("descriptionLinks", []))
-    for link in links or []:
-        if not any(old.get("sourceUrl") == link.get("sourceUrl") and
-                   (old.get("sourceOccurrence") or old.get("descriptionEvidence") or old.get("evidence")) ==
-                   (link.get("sourceOccurrence") or link.get("descriptionEvidence") or link.get("evidence")) for old in combined):
-            combined.append(link)
-    record.update(descriptionLinks=combined, descriptionScanStatus="ok", descriptionScanCoverage="complete",
-                  descriptionScannedAt=now, descriptionSource=source, errorCode=None)
-    return record
-
-
-def collect(connection, *, description_limit=200, refresh_days=30, activity_page_limit=100, fetcher=None, logger=None):
+def collect(connection, *, activity_page_limit=100, publication_page_limit=100, fetcher=None, logger=None):
     store = CertitudeStore(connection)
     store.ensure_schema()
     candidates = load_candidates(connection)
-    descriptions, checkers = store.load_descriptions(), store.load_checkers()
+    checkers = store.load_checkers()
     candidate_codes = {row["code"] for row in candidates}
     fetcher = fetcher or BoundedFetcher()
-    sessions = {}
-    due = select_due_candidates(candidates, descriptions, datetime.now(timezone.utc), refresh_days, description_limit)
-    attempted = scanned = 0
     if logger:
-        logger.info("Certitude description stage started: candidates=%s descriptions_due=%s limit=%s",
-                    len(candidates), len(due), description_limit)
-    for cache in due:
-        code, now = cache["code"], utc_now()
-        attempted += 1
-        try:
-            premium = bool(cache.get("premium_only"))
-            if premium not in sessions:
-                cookie = optional_cookie("GEOCOOKIE_PREMIUM") if premium else optional_cookie("GEOCOOKIE_NONPREMIUM", "GEOCACHING_COOKIE")
-                if not cookie:
-                    raise AuthenticationError("missing_geocaching_cookie")
-                sessions[premium] = create_geocaching_session(cookie, profile="premium" if premium else "nonpremium")
-            url = "https://www.geocaching.com/seek/cache_details.aspx?wp=" + code
-            html, actual_url = fetcher.get(sessions[premium], url, {"www.geocaching.com", "geocaching.com"})
-            if looks_like_login_page(actual_url, html):
-                raise AuthenticationError("geocaching_login_required")
-            links = extract_description_links(html, actual_url, expected_gc=code)
-            record = _description_record(descriptions.get(code), cache, utc_now(), links=links, source=actual_url)
-            scanned += 1
-        except (FetchError, ValueError) as exc:
-            error = str(exc) if isinstance(exc, FetchError) else "description_parse_failed"
-            record = _description_record(descriptions.get(code), cache, now, error=error)
-            if logger:
-                logger.warning("Description scan failed: %s (%s)", code, error)
-            store.save_description(code, record)
-            descriptions[code] = record
-            if isinstance(exc, AuthenticationError):
-                if logger:
-                    logger.info("Certitude description progress: attempted=%s successful=%s failed=%s",
-                                attempted, scanned, attempted - scanned)
-                break
-            if logger and (attempted % 25 == 0 or attempted == len(due)):
-                logger.info("Certitude description progress: attempted=%s successful=%s failed=%s",
-                            attempted, scanned, attempted - scanned)
-            continue
-        store.save_description(code, record)
-        descriptions[code] = record
-        if logger and (attempted % 25 == 0 or attempted == len(due)):
-            logger.info("Certitude description progress: attempted=%s successful=%s failed=%s",
-                        attempted, scanned, attempted - scanned)
-
-    # Retain discovered links independently of the daily activity index.
-    for code, description in descriptions.items():
-        if code not in candidate_codes:
-            continue
-        for link in description.get("descriptionLinks", []):
-            cid = link.get("checkerId") or link.get("sourceWaypoint")
-            if cid and cid not in checkers and link.get("sourceUrl"):
-                pending = {
-                    "checkerId": cid, "sourceUrl": link["sourceUrl"], "cacheCode": None,
-                    "mappingStatus": "pending", "mappingEvidence": link.get("evidence"),
-                    "role": "unknown", "stageLabel": None, "answerType": "unknown", "matchingMode": "unknown",
-                    "successCount": None, "failureCount": None, "counterObservedAt": None,
-                    "publicSolvers": [], "solverListCoverage": "unknown", "solverListObservedAt": None,
-                    "solverRowsRetrieved": 0, "solverReportedTotal": None, "publicSolverCount": None,
-                    "publishedAt": None, "latestActivityAt": None, "sourceTimezone": None,
-                    "crawl": {"status": "not_collected", "lastAttemptAt": None, "lastSuccessAt": None,
-                              "errorCode": None, "fieldCoverage": "unknown", "stale": None},
-                }
-                store.save_checker(pending)
-                checkers[cid] = pending
-            if cid and not link.get("checkerId"):
-                link["checkerId"] = cid
-        store.save_description(code, description)
+        logger.info("Certitude publication discovery started: candidates=%s page_limit=%s",
+                    len(candidates), publication_page_limit)
+    publication_result = index_publications(store, fetcher, candidates, checkers, page_limit=publication_page_limit,
+                                            logger=logger, session_factory=requests.Session)
     if logger:
         logger.info("Certitude index stage started: candidates=%s page_limit=%s", len(candidates), activity_page_limit)
     activity_result = index_activity(store, fetcher, candidates, checkers, page_limit=activity_page_limit,
                                      logger=logger, session_factory=requests.Session)
     sources = {}
     for cid, record in checkers.items():
+        parent = record.get("cacheCode") or record.get("activity", {}).get("expectedCacheCode")
+        if parent and parent not in candidate_codes:
+            continue
         if record.get("sourceUrl") and needs_detail_retry(record):
             sources.setdefault(record["sourceUrl"], set()).add(cid)
-    for code, record in descriptions.items():
-        if code not in candidate_codes:
-            continue
-        for link in record.get("descriptionLinks", []):
-            cid = link.get("checkerId")
-            needs_read = (not cid or needs_detail_retry(checkers.get(cid)) or
-                          link.get("mappingStatus") == "pending" or bool(link.get("errorCode")))
-            if link.get("sourceUrl") and needs_read:
-                sources.setdefault(link["sourceUrl"], set()).update([link["checkerId"]] if link.get("checkerId") else [])
     source_session = requests.Session()
     source_session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; public-read research)"})
     fetched_ids = set()
@@ -320,19 +198,6 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
             checkers[cid] = merged
             fetched_ids.add(cid)
             valid_reads += 1
-            for code, description in descriptions.items():
-                changed = False
-                for link in description.get("descriptionLinks", []):
-                    if link.get("sourceUrl") == source_url:
-                        description_evidence = link.get("descriptionEvidence") or link.get("evidence")
-                        link.setdefault("descriptionEvidence", description_evidence)
-                        link.update(checkerId=cid, mappingStatus=(merged.get("mappingStatus") if merged.get("cacheCode") == code else "conflict"),
-                                    mappingEvidence=merged.get("mappingEvidence"),
-                                    evidence="; ".join(str(item) for item in (description_evidence, merged.get("mappingEvidence")) if item),
-                                    lastAttemptAt=now, errorCode=None)
-                        changed = True
-                if changed:
-                    store.save_description(code, description)
         except (FetchError, ValueError) as exc:
             detail_failed += 1
             error = str(exc) if isinstance(exc, FetchError) else "checker_parse_failed"
@@ -351,46 +216,34 @@ def collect(connection, *, description_limit=200, refresh_days=30, activity_page
                         failed.setdefault("crawl", {})["errorResponse"] = dict(exc.metadata)
                     store.save_checker(failed)
                     checkers[cid] = failed
-            for code, description in descriptions.items():
-                changed = False
-                for link in description.get("descriptionLinks", []):
-                    if link.get("sourceUrl") == source_url:
-                        link.update(lastAttemptAt=now, errorCode=error)
-                        changed = True
-                if changed:
-                    store.save_description(code, description)
         if logger and (detail_processed % 25 == 0 or detail_processed == len(sources)):
             logger.info("Certitude detail progress: processed=%s successful=%s failed=%s skipped_aliases=%s",
                         detail_processed, valid_reads, detail_failed, detail_skipped)
-    for session in sessions.values():
-        session.close()
     source_session.close()
     if logger:
-        logger.info("Certitude collection: candidates=%s descriptions_due=%s attempted=%s complete=%s index_pages=%s queued=%s skipped=%s partial_regions=%s checker_reads=%s retained=%s",
-                    len(candidates), len(due), attempted, scanned, activity_result["pages"],
+        logger.info("Certitude collection: candidates=%s publication_pages=%s publication_queued=%s publication_partial_regions=%s index_pages=%s queued=%s skipped=%s partial_regions=%s checker_reads=%s retained=%s",
+                    len(candidates), publication_result["pages"],
+                    publication_result["queued"], len(publication_result["partialRegions"]), activity_result["pages"],
                     activity_result["queued"], activity_result["skipped"],
                     len(activity_result["partialRegions"]), valid_reads, len(checkers))
-    if activity_result["failedRegions"]:
+    if publication_result["failedRegions"] or activity_result["failedRegions"]:
         raise RuntimeError("certitude_dashboard_scan_failed; previous scan boundaries retained")
-    if candidates and not scanned and not checkers and due:
-        raise RuntimeError("no_valid_certitude_discovery; previous publication retained")
     if sources and not valid_reads and not any(c.get("mappingStatus") == "verified" for c in checkers.values()):
         raise RuntimeError("no_valid_checker_observation; previous publication retained")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--description-limit", type=int, default=int(os.getenv("CERTITUDE_DESCRIPTION_LIMIT", "200")))
     parser.add_argument("--activity-page-limit", type=int, default=int(os.getenv("CERTITUDE_ACTIVITY_PAGE_LIMIT", "100")))
+    parser.add_argument("--publication-page-limit", type=int, default=int(os.getenv("CERTITUDE_PUBLICATION_PAGE_LIMIT", "100")))
     args = parser.parse_args()
-    refresh_days = float(os.getenv("CERTITUDE_DESCRIPTION_REFRESH_DAYS", "30"))
-    if args.description_limit < 0 or refresh_days <= 0 or args.activity_page_limit < 1:
-        parser.error("description limit must be nonnegative; refresh days and activity page limit must be positive")
+    if args.activity_page_limit < 1 or args.publication_page_limit < 1:
+        parser.error("page limits must be positive")
     logger = setup_logging("crawl_certitude.log")
     connection = connect_postgres(require_env("DATABASE_URL"), logger=logger)
     try:
-        collect(connection, description_limit=args.description_limit, refresh_days=refresh_days,
-                activity_page_limit=args.activity_page_limit, logger=logger,
+        collect(connection, activity_page_limit=args.activity_page_limit,
+                publication_page_limit=args.publication_page_limit, logger=logger,
                 fetcher=BoundedFetcher(delay=float(os.getenv("CERTITUDE_REQUEST_DELAY_SECONDS", "1.5")),
                                        retries=int(os.getenv("CERTITUDE_MAX_RETRIES", "3")),
                                        timeout=float(os.getenv("CERTITUDE_REQUEST_TIMEOUT_SECONDS", "30"))))

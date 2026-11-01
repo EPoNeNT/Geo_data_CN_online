@@ -25,10 +25,10 @@ on:
           - generate
           - certitude
           - diagnose-auth
-      description_limit:
-        description: '单次扫描缓存描述数量上限（0 表示扫描全部到期项）'
+      publication_page_limit:
+        description: '每个地区单次最多扫描的发布时间列表页数（未完成会保存进度）'
         required: false
-        default: '200'
+        default: '100'
         type: string
 
 concurrency:
@@ -210,8 +210,7 @@ jobs:
     if: always() && (github.event.inputs.mode == 'certitude' || github.event.inputs.mode == 'both' || github.event_name == 'schedule')
     timeout-minutes: 300
     env:
-      GEOCACHING_COOKIE_STATE_KEY: ${{ secrets.GEOCACHING_COOKIE_STATE_KEY }}
-      CERTITUDE_DESCRIPTION_LIMIT: ${{ github.event.inputs.description_limit || '200' }}
+      CERTITUDE_PUBLICATION_PAGE_LIMIT: ${{ github.event.inputs.publication_page_limit || '100' }}
 
     steps:
       - name: Checkout code
@@ -231,28 +230,11 @@ jobs:
       - name: Run offline Certitude tests
         run: python -m unittest discover -s tests -p 'test_certitude*.py'
 
-      - name: Restore encrypted nonpremium cookie state
-        if: env.GEOCACHING_COOKIE_STATE_KEY != ''
-        uses: actions/cache/restore@v5
-        continue-on-error: true
-        with:
-          path: .runtime/geocaching-auth/nonpremium.enc
-          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-          restore-keys: geocaching-basic-state-v1-
-
-      - name: Crawl Certitude cache descriptions and checkers
-        run: python crawl_certitude.py --description-limit "$CERTITUDE_DESCRIPTION_LIMIT"
+      - name: Crawl Certitude publication lists and checkers
+        run: python crawl_certitude.py --publication-page-limit "$CERTITUDE_PUBLICATION_PAGE_LIMIT"
         timeout-minutes: 300
         env:
           LOG_TO_FILE: '1'
-
-      - name: Save encrypted nonpremium cookie state
-        if: always() && env.GEOCACHING_COOKIE_STATE_KEY != '' && hashFiles('.runtime/geocaching-auth/nonpremium.enc') != ''
-        uses: actions/cache/save@v5
-        continue-on-error: true
-        with:
-          path: .runtime/geocaching-auth/nonpremium.enc
-          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
 
       - name: Upload logs on failure
         if: failure()

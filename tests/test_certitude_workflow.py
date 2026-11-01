@@ -28,11 +28,11 @@ class CertitudeWorkflowTests(unittest.TestCase):
 
     def test_dispatch_has_certitude_options(self):
         self.assertIn('certitude', TEXT)
-        self.assertIn('description_limit', TEXT)
+        self.assertIn('publication_page_limit', TEXT)
 
     def test_job_runs_certitude_and_preserves_static_deploy_paths(self):
         self.assertIn("run: python -m unittest discover -s tests -p 'test_certitude*.py'", TEXT)
-        self.assertIn('python crawl_certitude.py --description-limit "$CERTITUDE_DESCRIPTION_LIMIT"', TEXT)
+        self.assertIn('python crawl_certitude.py --publication-page-limit "$CERTITUDE_PUBLICATION_PAGE_LIMIT"', TEXT)
         self.assertIn('crawl-certitude:', TEXT)
         self.assertIn('python generate_certitude.py', TEXT)
         self.assertIn('cp public/data/*.json /tmp/Geodataing/public/data/', TEXT)
@@ -61,13 +61,13 @@ class CertitudeWorkflowTests(unittest.TestCase):
 
     def test_cookie_state_settings_and_collection_command_are_only_in_crawler(self):
         collector, generator = job_block('crawl-certitude'), job_block('generate-data')
-        self.assertIn('GEOCACHING_COOKIE_STATE_KEY', collector)
-        self.assertIn('CERTITUDE_DESCRIPTION_LIMIT', collector)
-        self.assertIn('Restore encrypted nonpremium cookie state', collector)
-        self.assertIn('Save encrypted nonpremium cookie state', collector)
+        self.assertNotIn('GEOCACHING_COOKIE_STATE_KEY', collector)
+        self.assertIn('CERTITUDE_PUBLICATION_PAGE_LIMIT', collector)
+        self.assertNotIn('Restore encrypted nonpremium cookie state', collector)
+        self.assertNotIn('Save encrypted nonpremium cookie state', collector)
         self.assertNotIn('Restore encrypted nonpremium cookie state', generator)
         self.assertNotIn('Save encrypted nonpremium cookie state', generator)
-        self.assertNotIn('CERTITUDE_DESCRIPTION_LIMIT', generator)
+        self.assertNotIn('CERTITUDE_PUBLICATION_PAGE_LIMIT', generator)
         self.assertNotIn('python crawl_certitude.py', generator)
 
     def test_offline_tests_run_before_collection(self):

@@ -82,10 +82,6 @@ def cache(code="GC12345", *, archived=True, premium=False):
     }
 
 
-def description_html(link=None):
-    anchor = f'<a href="{link}">Certitude</a>' if link else ""
-    return f'<div id="ShortDescription">{anchor}</div><div id="LongDescription"></div>'
-
 
 def checker_html(checker_id="GC12345", parent="GC12345", success=4, failure=2, solvers="[]"):
     return f'''<h1><a href="?wp={checker_id}">{checker_id}</a>
@@ -101,10 +97,11 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.patches = [
             patch.object(crawl_certitude, "CertitudeStore", FakeStore),
-            patch.object(crawl_certitude, "load_candidates", return_value=[]),
-            patch.object(crawl_certitude, "optional_cookie", return_value="offline-cookie"),
-            patch.object(crawl_certitude, "create_geocaching_session", return_value=FakeSession()),
+            patch.object(crawl_certitude, "load_candidates", return_value=[cache(), cache("GC54321")]),
             patch.object(crawl_certitude.requests, "Session", return_value=FakeSession()),
+            patch.object(crawl_certitude, "index_publications", return_value={
+                "pages": 0, "queued": 0, "skipped": 0, "failedRegions": [], "partialRegions": [],
+            }),
             patch.object(crawl_certitude, "index_activity", return_value={
                 "pages": 0, "queued": 0, "skipped": 0, "failedRegions": [], "partialRegions": [],
             }),
@@ -113,42 +110,71 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
             active.start()
             self.addCleanup(active.stop)
 
-    def collect(self, conn, fetcher, *, limit=200, logger=None):
-        return crawl_certitude.collect(conn, description_limit=limit, refresh_days=30,
+    def collect(self, conn, fetcher, *, activity_limit=100, publication_limit=100, logger=None):
+        return crawl_certitude.collect(conn, activity_page_limit=activity_limit,
+                                       publication_page_limit=publication_limit,
                                        fetcher=fetcher, logger=logger)
 
-    def test_archived_candidates_are_scanned_and_limited_work_resumes(self):
+    def test_default_discovery_does_not_load_descriptions_or_use_geocaching_session(self):
         conn = FakeConnection()
-        rows = [cache("GC00001"), cache("GC00002"), cache("GC00003")]
-        crawl_certitude.load_candidates = lambda _conn: rows
-        fetcher = FakeFetcher({"default": description_html()})
-        self.collect(conn, fetcher, limit=1)
-        self.assertEqual(len(fetcher.calls), 1)
-        self.assertIn("GC00001", conn.state["descriptions"])
-        self.collect(conn, fetcher, limit=1)
-        self.assertEqual(len(fetcher.calls), 2)
-        self.assertIn("GC00002", conn.state["descriptions"])
-        self.assertEqual(conn.state["descriptions"]["GC00001"]["descriptionScanStatus"], "ok")
+        crawl_certitude.load_candidates = lambda _conn: [cache()]
+        with patch.object(FakeStore, "load_descriptions", side_effect=AssertionError("description read")), \
+                patch.object(FakeStore, "save_description", side_effect=AssertionError("description write")):
+            crawl_certitude.collect(conn, fetcher=FakeFetcher({}))
 
-    def test_detail_progress_counts_processed_urls_and_both_alias_paths(self):
+    def test_publication_discovery_supplies_detail_without_cookie_or_description(self):
         conn = FakeConnection()
-        row = cache()
-        crawl_certitude.load_candidates = lambda _conn: [row]
-        primary = "https://www.certitudes.org/a-primary"
-        known_alias = "https://www.certitudes.org/b-known-alias"
-        learned_alias = "https://www.certitudes.org/c-learned-alias"
-        conn.state["checkers"]["GC12345"] = {
-            "checkerId": "GC12345", "sourceUrl": primary, "crawl": {"status": "error"},
-        }
-        conn.state["descriptions"]["GC12345"] = {
-            "descriptionScannedAt": crawl_certitude.utc_now(), "descriptionScanStatus": "ok",
-            "descriptionScanCoverage": "complete",
-            "sourceFingerprint": crawl_certitude.description_fingerprint(row),
-            "descriptionLinks": [
-                {"checkerId": "GC12345", "sourceUrl": known_alias},
-                {"sourceUrl": learned_alias},
-            ],
-        }
+        crawl_certitude.load_candidates = lambda _conn: [cache()]
+        url = "https://www.certitudes.org/certitude?wp=GC12345"
+
+        def discover(store, fetcher, candidates, checkers, **kwargs):
+            pending = {"checkerId": "GC12345", "sourceUrl": url, "mappingStatus": "pending",
+                       "activity": {"pending": True, "expectedCacheCode": "GC12345"},
+                       "crawl": {"status": "not_collected"}}
+            store.save_checker(pending)
+            checkers["GC12345"] = pending
+            return {"pages": 4, "queued": 1, "skipped": 0, "failedRegions": [], "partialRegions": []}
+
+        with patch.object(crawl_certitude, "index_publications", side_effect=discover):
+            fetcher = FakeFetcher({url: checker_html()})
+            crawl_certitude.collect(conn, fetcher=fetcher)
+        saved = conn.state["checkers"]["GC12345"]
+        self.assertEqual(saved["mappingStatus"], "verified")
+        self.assertEqual(saved["cacheCode"], "GC12345")
+        self.assertFalse(saved["activity"]["pending"])
+        self.assertEqual(fetcher.calls, [url])
+        self.assertEqual(conn.state["descriptions"], {})
+
+    def test_stored_descriptions_are_preserved_without_read_or_write(self):
+        conn = FakeConnection()
+        original = {"legacy": {"descriptionLinks": [{"sourceUrl": "https://www.certitudes.org/old"}]}}
+        conn.state["descriptions"] = copy.deepcopy(original)
+        with patch.object(FakeStore, "load_descriptions", side_effect=AssertionError("description read")), \
+                patch.object(FakeStore, "save_description", side_effect=AssertionError("description write")):
+            self.collect(conn, FakeFetcher({}))
+        self.assertEqual(conn.state["descriptions"], original)
+
+    def test_saved_checker_outside_current_mystery_set_is_retained_without_detail_read(self):
+        conn = FakeConnection()
+        url = "https://www.certitudes.org/certitude?wp=OUT"
+        old = {"checkerId": "OUT", "cacheCode": "GCOUT", "sourceUrl": url,
+               "mappingStatus": "verified", "crawl": {"status": "error"}}
+        conn.state["checkers"]["OUT"] = copy.deepcopy(old)
+        fetcher = FakeFetcher({url: crawl_certitude.FetchError("http_500")})
+        self.collect(conn, fetcher)
+        self.assertEqual(fetcher.calls, [])
+        self.assertEqual(conn.state["checkers"]["OUT"], old)
+
+    def test_detail_progress_counts_unique_source_urls(self):
+        conn = FakeConnection()
+        url_a = "https://www.certitudes.org/a-primary"
+        url_b = "https://www.certitudes.org/b-alias"
+        for cid, url in (("GC12345", url_a), ("GC54321", url_b)):
+            conn.state["checkers"][cid] = {
+                "checkerId": cid, "sourceUrl": url,
+                "cacheCode": cid, "mappingStatus": "verified",
+                "crawl": {"status": "error"},
+            }
         fresh = {"checkerId": "GC12345", "cacheCode": "GC12345", "successCount": 1,
                  "failureCount": 0, "counterObservedAt": "2026-11-01T00:00:00Z",
                  "solverListCoverage": "complete", "solverListObservedAt": "2026-11-01T00:00:00Z",
@@ -157,11 +183,12 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
         class Logger:
             def info(self, message, *args): messages.append(message % args)
             def warning(self, message, *args): messages.append(message % args)
-        with patch.object(crawl_certitude, "parse_checker_html", return_value=fresh):
-            self.collect(conn, FakeFetcher({primary: "page", learned_alias: "page"}), logger=Logger())
+        parsed = iter([fresh, {**fresh, "checkerId": "GC54321", "cacheCode": "GC54321"}])
+        with patch.object(crawl_certitude, "parse_checker_html", side_effect=lambda *_args: next(parsed)):
+            self.collect(conn, FakeFetcher({url_a: "page", url_b: "page"}), logger=Logger())
         progress = [line for line in messages if "detail progress" in line]
         self.assertTrue(progress, messages)
-        self.assertEqual(progress[-1], "Certitude detail progress: processed=3 successful=1 failed=0 skipped_aliases=2")
+        self.assertEqual(progress[-1], "Certitude detail progress: processed=2 successful=2 failed=0 skipped_aliases=0")
 
     def test_unchanged_verified_checker_is_not_refreshed_without_activity_index_hit(self):
         conn = FakeConnection()
@@ -178,7 +205,6 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
         conn.state["descriptions"]["GC12345"] = {
             "descriptionScannedAt": crawl_certitude.utc_now(), "descriptionScanStatus": "ok",
             "descriptionScanCoverage": "complete",
-            "sourceFingerprint": crawl_certitude.description_fingerprint(row), "descriptionLinks": [],
         }
         fresh = checker_html(success=0, failure=0)
         fetcher = FakeFetcher({old["sourceUrl"]: fresh})
@@ -298,6 +324,30 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
         self.assertEqual(saved["publicSolvers"], old["publicSolvers"])
         self.assertEqual(saved["solverListObservedAt"], old["solverListObservedAt"])
 
+    def test_unmapped_pending_checker_is_retained_after_detail_failure(self):
+        conn = FakeConnection()
+        url = "https://www.certitudes.org/certitude?wp=GCUNKNOWN"
+        pending = {"checkerId": "GCUNKNOWN", "sourceUrl": url, "cacheCode": None,
+                   "mappingStatus": "pending", "activity": {"pending": True},
+                   "crawl": {"status": "not_collected"}}
+
+        def discover(store, fetcher, candidates, checkers, **kwargs):
+            store.save_checker(pending)
+            checkers["GCUNKNOWN"] = copy.deepcopy(pending)
+            return {"pages": 1, "queued": 1, "skipped": 0,
+                    "failedRegions": [], "partialRegions": []}
+
+        fetcher = FakeFetcher({url: crawl_certitude.FetchError("http_500")})
+        with patch.object(crawl_certitude, "index_publications", side_effect=discover):
+            with self.assertRaisesRegex(RuntimeError, "no_valid_checker_observation"):
+                self.collect(conn, fetcher)
+        saved = conn.state["checkers"]["GCUNKNOWN"]
+        self.assertIsNone(saved["cacheCode"])
+        self.assertEqual(saved["mappingStatus"], "pending")
+        self.assertTrue(saved["activity"]["pending"])
+        self.assertEqual(saved["crawl"]["status"], "error")
+        self.assertEqual(saved["crawl"]["errorCode"], "http_500")
+
     def test_failed_dashboard_region_raises_without_fetching_unchanged_details(self):
         conn = FakeConnection()
         old = {"checkerId": "GC12345", "sourceUrl": "https://www.certitudes.org/certitude?wp=GC12345",
@@ -335,62 +385,29 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
         self.assertFalse(conn.state["checkers"]["GC12345"]["activity"]["pending"])
         self.assertEqual(len(conn.state["snapshots"]), 1)
 
-    def test_failed_pending_waypoint_keeps_link_and_attempt_error(self):
+    def test_failed_publication_scan_still_processes_existing_pending_details(self):
         conn = FakeConnection()
-        crawl_certitude.load_candidates = lambda _conn: [cache()]
-        link = {"sourceUrl": "https://www.certitudes.org/certitude?wp=NewID",
-                "sourceWaypoint": "NewID", "checkerId": None, "mappingStatus": "pending"}
-        conn.state["descriptions"]["GC12345"] = {
-            "descriptionScannedAt": crawl_certitude.utc_now(), "descriptionScanStatus": "ok",
-            "descriptionScanCoverage": "complete", "sourceFingerprint":
-                crawl_certitude.description_fingerprint(cache()), "descriptionLinks": [link],
-        }
-        fetcher = FakeFetcher({link["sourceUrl"]: crawl_certitude.FetchError("http_500")})
-        with self.assertRaisesRegex(RuntimeError, "no_valid_checker_observation"):
-            self.collect(conn, fetcher)
-        saved = conn.state["descriptions"]["GC12345"]["descriptionLinks"][0]
-        self.assertEqual(saved["sourceWaypoint"], "NewID")
-        self.assertEqual(saved["checkerId"], "NewID")
-        self.assertEqual(saved["mappingStatus"], "pending")
-        self.assertEqual(saved.get("errorCode"), "http_500",
-                         (fetcher.calls, conn.state["descriptions"]))
-        self.assertIn("lastAttemptAt", saved)
-        self.assertIn("NewID", conn.state["checkers"])
-        pending = conn.state["checkers"]["NewID"]
-        self.assertIsNone(pending["cacheCode"])
-        self.assertEqual(pending["mappingStatus"], "pending")
-        self.assertEqual(pending["crawl"]["status"], "error")
-        self.assertEqual(pending["crawl"]["errorCode"], "http_500")
-        self.assertEqual(pending["sourceUrl"], link["sourceUrl"])
-
-    def test_auth_failure_stops_description_batch_without_marking_remaining_complete(self):
-        conn = FakeConnection()
-        rows = [cache("GC00001", premium=True), cache("GC00002", premium=False)]
-        crawl_certitude.load_candidates = lambda _conn: rows
-        cookie_patch = patch.object(crawl_certitude, "optional_cookie", return_value=None)
-        with cookie_patch:
-            with self.assertRaisesRegex(RuntimeError, "no_valid_certitude_discovery"):
-                self.collect(conn, FakeFetcher({}))
-        self.assertEqual(conn.state["descriptions"]["GC00001"]["descriptionScanStatus"], "error")
-        self.assertNotIn("GC00002", conn.state["descriptions"])
-
-    def test_description_fetch_failure_does_not_create_fake_empty_success(self):
-        conn = FakeConnection()
-        crawl_certitude.load_candidates = lambda _conn: [cache()]
-        old_link = {"sourceUrl": "https://www.certitudes.org/certitude?wp=OldID",
-                    "checkerId": "OldID", "mappingStatus": "verified", "evidence": "old source"}
-        conn.state["descriptions"]["GC12345"] = {"descriptionLinks": [old_link],
-                                                  "descriptionScanStatus": "ok"}
-        fetcher = FakeFetcher({"default": crawl_certitude.FetchError("http_500")})
-        with self.assertRaisesRegex(RuntimeError, "no_valid_"):
-            self.collect(conn, fetcher)
-        saved = conn.state["descriptions"]["GC12345"]
-        self.assertEqual(saved["descriptionScanStatus"], "error")
-        self.assertEqual(saved["descriptionLinks"][0]["sourceUrl"], old_link["sourceUrl"])
-        self.assertEqual(saved["descriptionLinks"][0]["mappingStatus"], "verified")
-        self.assertEqual(saved["descriptionLinks"][0]["errorCode"], "http_500")
-        self.assertIn("lastAttemptAt", saved["descriptionLinks"][0])
-        self.assertNotEqual(saved["descriptionScanCoverage"], "complete")
+        url = "https://www.certitudes.org/certitude?wp=GC12345"
+        old = {"checkerId": "GC12345", "sourceUrl": url, "cacheCode": "GC12345",
+               "mappingStatus": "verified", "successCount": 7, "failureCount": 3,
+               "counterObservedAt": "2026-10-31T00:00:00Z", "publicSolvers": [],
+               "solverListCoverage": "complete", "solverListObservedAt": "2026-10-31T00:00:00Z",
+               "activity": {"pending": True}, "crawl": {"status": "ok"}}
+        conn.state["checkers"]["GC12345"] = old
+        fresh = {**old, "successCount": 8, "counterObservedAt": "2026-11-01T03:00:00Z",
+                 "solverListObservedAt": "2026-11-01T03:01:00Z",
+                 "crawl": {"status": "ok", "lastAttemptAt": "2026-11-01T03:00:00Z",
+                           "lastSuccessAt": "2026-11-01T03:00:00Z"}}
+        fetcher = FakeFetcher({url: "fresh html"})
+        failed = {"pages": 0, "queued": 0, "skipped": 0,
+                  "failedRegions": ["china"], "partialRegions": []}
+        with patch.object(crawl_certitude, "parse_checker_html", return_value=fresh), \
+                patch.object(crawl_certitude, "index_publications", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "dashboard_scan_failed"):
+                self.collect(conn, fetcher)
+        self.assertEqual(fetcher.calls, [url])
+        self.assertFalse(conn.state["checkers"]["GC12345"]["activity"]["pending"])
+        self.assertEqual(len(conn.state["snapshots"]), 1)
 
     def test_anonymous_checker_builds_json_and_publishes_nonempty_batch(self):
         parsed = parse_checker_html(checker_html(solvers="[]"),

@@ -19,7 +19,7 @@ from generate_certitude import build_dataset, publish_dataset
 
 class FakeConnection:
     def __init__(self):
-        self.state = {"descriptions": {}, "checkers": {}, "snapshots": [], "activity_scans": {}}
+        self.state = {"descriptions": {}, "checkers": {}, "snapshots": [], "activity_scans": {}, "usage_audits": {}}
 
 
 class FakeStore:
@@ -34,6 +34,12 @@ class FakeStore:
 
     def load_checkers(self):
         return copy.deepcopy(self.state["checkers"])
+
+    def load_usage_audits(self):
+        return copy.deepcopy(self.state["usage_audits"])
+
+    def save_usage_audit(self, code, record):
+        self.state["usage_audits"][code] = copy.deepcopy(record)
 
     def load_activity_scans(self):
         return copy.deepcopy(self.state["activity_scans"])
@@ -153,6 +159,38 @@ class CertitudeCollectionIntegrationTests(unittest.TestCase):
                 patch.object(FakeStore, "save_description", side_effect=AssertionError("description write")):
             self.collect(conn, FakeFetcher({}))
         self.assertEqual(conn.state["descriptions"], original)
+
+    def test_audit_discovered_link_is_verified_once_and_keeps_description_time(self):
+        conn = FakeConnection()
+        source = "https://www.certitudes.org/certitude?wp=GC12345"
+        observed = "2026-11-01T00:00:00Z"
+        conn.state["usage_audits"]["GC12345"] = {
+            "lastValidStatus": "linked", "checkedAt": observed, "links": [{"sourceUrl": source}],
+        }
+        fetcher = FakeFetcher({source: checker_html()})
+        self.collect(conn, fetcher)
+        self.assertEqual(fetcher.calls, [source])
+        self.assertEqual(conn.state["checkers"]["GC12345"]["mappingStatus"], "verified")
+        audit = conn.state["usage_audits"]["GC12345"]
+        self.assertEqual(audit["links"][0]["checkerId"], "GC12345")
+        self.assertEqual(audit["checkedAt"], observed)
+        self.collect(conn, fetcher)
+        self.assertEqual(fetcher.calls, [source])
+
+    def test_failed_audit_link_keeps_last_valid_evidence_for_next_retry(self):
+        conn = FakeConnection()
+        source = "https://www.certitudes.org/certitude?wp=GC12345"
+        observed = "2026-11-01T00:00:00Z"
+        conn.state["usage_audits"]["GC12345"] = {
+            "lastValidStatus": "linked", "checkedAt": observed, "links": [{"sourceUrl": source}],
+        }
+        with self.assertRaisesRegex(RuntimeError, "no_valid_checker_observation"):
+            self.collect(conn, FakeFetcher({source: crawl_certitude.FetchError("http_500")}))
+        audit = conn.state["usage_audits"]["GC12345"]
+        self.assertEqual(audit["checkedAt"], observed)
+        self.assertEqual(audit["lastValidStatus"], "linked")
+        self.assertEqual(audit["links"][0]["errorCode"], "http_500")
+        self.assertNotIn("checkerId", audit["links"][0])
 
     def test_saved_checker_outside_current_mystery_set_is_retained_without_detail_read(self):
         conn = FakeConnection()

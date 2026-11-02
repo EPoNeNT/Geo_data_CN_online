@@ -54,6 +54,14 @@ class CertitudeFactsTests(unittest.TestCase):
                 scopes.append(scope)
         return m, scopes, {f["cache"]["code"]: f for f in facts}
 
+    def guid_facts(self):
+        owner_guid = "11111111-1111-4111-8111-111111111111"
+        solver_guid = "22222222-2222-4222-8222-222222222222"
+        owner_cache = cache(code="GC12345", owner="Owner", ownerGuid=owner_guid)
+        final = checker(solvers=["Solver"])
+        final["publicSolvers"][0]["guid"] = solver_guid
+        return [self.facts(owner_cache, [final])], owner_guid, solver_guid
+
     def test_facts_are_internal_only_and_deduplicate_checker_ids_and_users(self):
         final = checker(solvers=[" Alice ", "alice"])
         final["publicSolvers"][0]["sourceUserId"] = "u1"
@@ -166,6 +174,65 @@ class CertitudeFactsTests(unittest.TestCase):
         self.assertEqual(f["stats"]["publicCorrectCount"], 1)
         scope = build_scope([f], "all", "all")
         self.assertEqual(scope["summary"]["certificationCount"], 1)
+
+    def test_guid_metadata_projects_to_owner_solver_and_directory_without_changing_counts(self):
+        facts, owner_guid, solver_guid = self.guid_facts()
+        fact = facts[0]
+        self.assertEqual(fact["certifiedSolvers"][0]["guid"], solver_guid)
+        rebuilt = build_cache_facts(fact["cache"], fact["checkers"])
+        self.assertEqual(rebuilt["certifiedSolvers"], fact["certifiedSolvers"])
+        scope = build_scope(facts, "all", "all")
+        self.assertEqual(scope["summary"]["certificationCount"], 1)
+        self.assertEqual(scope["rankings"]["owners"][0]["guid"], owner_guid)
+        self.assertEqual(scope["rankings"]["solvers"][0]["guid"], solver_guid)
+        self.assertEqual({p["guid"] for p in scope["graph"]["players"]}, {owner_guid, solver_guid})
+
+    def test_guid_user_with_both_roles_requires_consistent_metadata(self):
+        guid = "11111111-1111-4111-8111-111111111111"
+        final = checker(solvers=["Solver"])
+        owner_solver = checker(solvers=["Owner"])
+        owner_solver["publicSolvers"][0]["guid"] = guid
+        facts = [self.facts(cache(ownerGuid=guid), [final]),
+                 self.facts(cache(code="GC12346", owner="Other"), [owner_solver])]
+        scope = build_scope(facts, "all", "all")
+        owner = next(row for row in scope["rankings"]["owners"] if row["key"] == "owner")
+        solver = next(row for row in scope["rankings"]["solvers"] if row["key"] == "owner")
+        player = next(row for row in scope["graph"]["players"] if row["key"] == "owner")
+        self.assertEqual((owner["guid"], solver["guid"], player["guid"]), (guid, guid, guid))
+        facts[1]["certifiedSolvers"][0]["guid"] = "33333333-3333-4333-8333-333333333333"
+        with self.assertRaises(ValueError):
+            build_scope(facts, "all", "all")
+
+    def test_guid_optional_null_and_legacy_omission_are_accepted(self):
+        m, scopes, facts = self.dataset()
+        self.assertTrue(validate_dataset(m, scopes, facts))
+        for scope in scopes:
+            for kind in ("solvers", "owners"):
+                for row in scope["rankings"][kind]:
+                    row.pop("guid", None)
+            for player in scope["graph"]["players"]:
+                player.pop("guid", None)
+        self.assertTrue(validate_dataset(m, scopes, facts))
+
+    def test_guid_projection_rejects_malformed_values_and_fact_mismatch(self):
+        m, scopes, facts = self.dataset(self.guid_facts()[0])
+        self.assertTrue(validate_dataset(m, scopes, facts))
+        scopes[0]["rankings"]["solvers"][0]["guid"] = "not-a-uuid"
+        with self.assertRaises(ValueError):
+            validate_dataset(m, scopes, facts)
+        m, scopes, facts = self.dataset(self.guid_facts()[0])
+        scopes[0]["rankings"]["solvers"][0].pop("guid")
+        scopes[0]["graph"]["players"][1].pop("guid")
+        with self.assertRaises(ValueError):
+            validate_dataset(m, scopes, facts)
+
+    def test_conflicting_same_key_guid_across_caches_is_rejected(self):
+        facts, _, solver_guid = self.guid_facts()
+        second = self.facts(cache(code="GC12346", owner="DifferentOwner"),
+                            [checker(solvers=["Solver"])])
+        second["certifiedSolvers"][0]["guid"] = "33333333-3333-4333-8333-333333333333"
+        with self.assertRaises(ValueError):
+            build_scope(facts + [second], "all", "all")
 
     def test_unknown_rule_and_partial_solver_list_preserve_available_correct_count(self):
         c = cache(completionRule="unknown", completionCheckerIds=[])

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime
 import re
+import uuid
 
 
 REGIONS = ("all", "china", "taiwan", "hong-kong", "macao")
@@ -12,6 +13,31 @@ AVAILABILITIES = ("all", "active", "archived")
 RULES = {"single_final", "any_final", "all_final"}
 STATUSES = {"complete", "partial", "unknown"}
 _GC_RE = re.compile(r"^GC[A-Z0-9]+$")
+
+
+def _guid(value):
+    """Return a canonical UUID string, accepting missing metadata as None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _valid_optional_guid(value):
+    return value is None or (isinstance(value, str) and _guid(value) is not None)
+
+
+def _remember_guid(mapping, key, value):
+    value = _guid(value)
+    prior = mapping.get(key)
+    if prior is not None and value is not None and prior != value:
+        raise ValueError(f"conflicting GUID metadata for {key}")
+    if value is not None:
+        mapping[key] = value
 
 
 def _norm(value):
@@ -50,6 +76,7 @@ def _solver_rows(checker):
             "sourceUserId": row.get("sourceUserId"),
             "certifiedAt": row.get("certifiedAt"),
             "sourceRank": row.get("sourceRank"),
+            "guid": row.get("guid"),
         }
         identity = ("id", row["sourceUserId"]) if row.get("sourceUserId") else ("name", key)
         prev = result.get(identity)
@@ -169,7 +196,13 @@ def build_cache_facts(cache, checkers):
             if times and all(_time_sort(value) is not None for value in times):
                 certified_at = (min(times, key=_time_sort) if rule == "any_final" else
                                 max(times, key=_time_sort) if rule == "all_final" else times[0])
-            certified_solvers.append({"key": key, "username": solver_names[key], "certifiedAt": certified_at})
+            solver_guid = {}
+            for cid in final_ids:
+                candidate = solvers_by_checker.get(cid, {}).get(key)
+                if candidate is not None:
+                    _remember_guid(solver_guid, key, candidate.get("guid"))
+            certified_solvers.append({"key": key, "username": solver_names[key], "certifiedAt": certified_at,
+                                      "guid": solver_guid.get(key)})
     stats = _cache_stats(raw_cache, checker_rows, certified_solvers)
     raw_cache["completionRule"] = rule
     raw_cache["completionCheckerIds"] = final_ids
@@ -225,6 +258,7 @@ def build_scope(facts, region, availability):
     solvers, owners = defaultdict(set), defaultdict(set)
     solver_owners = defaultdict(set)
     solver_names, owner_names = {}, {}
+    solver_guids, owner_guids = {}, {}
     edges = defaultdict(set)
     for detail in selected:
         c = detail.get("cache", detail)
@@ -241,23 +275,26 @@ def build_scope(facts, region, availability):
         if owner_key:
             owners[owner_key].add(code)
             owner_names[owner_key] = owner_name or owner_key
+            _remember_guid(owner_guids, owner_key, c.get("ownerGuid"))
         for solver in detail.get("certifiedSolvers", []):
             skey = _norm(solver.get("key") or solver.get("username"))
             if not skey or (owner_key and skey == owner_key):
                 continue
             solvers[skey].add(code)
             solver_names[skey] = solver.get("username") or skey
+            _remember_guid(solver_guids, skey, solver.get("guid"))
             if owner_key:
                 solver_owners[skey].add(owner_key)
                 edges[(owner_key, skey)].add(code)
     cache_rows.sort(key=lambda r: r["code"])
-    solver_rows = _rank_rows([{"key": k, "username": solver_names[k], "solvedCount": len(v), "ownerCount": len(solver_owners[k]),
+    solver_rows = _rank_rows([{"key": k, "username": solver_names[k], "guid": solver_guids.get(k),
+                                "solvedCount": len(v), "ownerCount": len(solver_owners[k]),
                                 "cacheCodes": sorted(v)} for k, v in solvers.items()], "solvedCount")
     owner_rows = []
     for key, codes in owners.items():
         solver_codes = set().union(*(edges[(key, sk)] for sk in solvers if (key, sk) in edges)) if solvers else set()
         cert_count = sum(len(v) for (ok, _), v in edges.items() if ok == key)
-        owner_rows.append({"key": key, "username": owner_names[key], "puzzleCount": len(codes),
+        owner_rows.append({"key": key, "username": owner_names[key], "guid": owner_guids.get(key), "puzzleCount": len(codes),
                            "solverCount": len({sk for ok, sk in edges if ok == key}),
                            "cacheCodes": sorted(codes), "_weight": cert_count})
     owner_rows = _rank_rows(owner_rows, "puzzleCount")
@@ -272,7 +309,10 @@ def build_scope(facts, region, availability):
         solver_weights[edge["solverKey"]] += edge["count"]
     players = {}
     for key, name in {**owner_names, **solver_names}.items():
-        players[key] = {"key": key, "username": name}
+        player_guid = solver_guids.get(key) or owner_guids.get(key)
+        if solver_guids.get(key) and owner_guids.get(key) and solver_guids[key] != owner_guids[key]:
+            raise ValueError(f"conflicting GUID metadata for {key}")
+        players[key] = {"key": key, "username": name, "guid": player_guid}
     scope_obj = {"region": region, "availability": availability}
     return {"scope": scope_obj,
             "summary": {"cacheCount": len(cache_rows), "solverCount": len(solver_rows), "ownerCount": len(owner_rows),
@@ -310,14 +350,14 @@ def _canonical_scope_projection(scope):
                     "stats": {k: row["stats"].get(k) for k in
                               ("publicCorrectCount", "successCount", "failureCount", "attemptCount", "submissionRate")}}
                    for row in scope["caches"]],
-        "rankings": {kind: [{k: row[k] for k in fields} for row in scope["rankings"][kind]]
-                     for kind, fields in (("solvers", ("key", "username", "rank", "solvedCount", "ownerCount", "cacheCodes")),
-                                          ("owners", ("key", "username", "rank", "puzzleCount", "solverCount", "cacheCodes")))},
+        "rankings": {kind: [{k: row.get(k) for k in fields} for row in scope["rankings"][kind]]
+                     for kind, fields in (("solvers", ("key", "username", "guid", "rank", "solvedCount", "ownerCount", "cacheCodes")),
+                                          ("owners", ("key", "username", "guid", "rank", "puzzleCount", "solverCount", "cacheCodes")))},
         "puzzleRankings": {metric: {direction: [{"code": row["code"], "rank": row["rank"]}
                                                   for row in scope["puzzleRankings"][metric][direction]]
                                      for direction in ("asc", "desc")}
                            for metric in ("rate", "correct", "attempts")},
-        "graph": {"players": [{"key": row["key"], "username": row["username"]} for row in scope["graph"]["players"]],
+        "graph": {"players": [{"key": row["key"], "username": row["username"], "guid": row.get("guid")} for row in scope["graph"]["players"]],
                   "edges": [{k: row[k] for k in ("ownerKey", "ownerName", "solverKey", "solverName", "count")}
                             for row in scope["graph"]["edges"]],
                   "order": {side: list(scope["graph"]["order"][side]) for side in ("owners", "solvers")}}
@@ -351,6 +391,8 @@ def _valid_rank_rows(rows, field, cache_codes):
         if not isinstance(row, dict) or not isinstance(row.get("key"), str) or not row["key"]:
             _fail("invalid player ranking row")
         keys.append(row["key"])
+        if "guid" in row and row["guid"] is not None and _guid(row["guid"]) is None:
+            _fail("invalid player GUID")
         value = row.get(field)
         codes = row.get("cacheCodes")
         if (not isinstance(row.get("username"), str) or not _count(value) or not isinstance(codes, list) or
@@ -440,6 +482,9 @@ def _validate_dataset(manifest, scopes, facts=None):
         for row in owner_rows.values():
             if not _count(row.get("solverCount")) or row["key"] != _norm(row["username"]):
                 _fail("invalid owner key or solver count")
+        guid_by_key = {}
+        for row in list(solver_rows.values()) + list(owner_rows.values()):
+            _remember_guid(guid_by_key, row["key"], row.get("guid"))
         cache_map = {row["code"]: row for row in caches}
         expected_owner_codes = defaultdict(list)
         for cache_row in caches:
@@ -471,10 +516,14 @@ def _validate_dataset(manifest, scopes, facts=None):
         for p in player_rows:
             if not isinstance(p.get("username"), str) or p["key"] != _norm(p["username"]):
                 _fail("invalid graph player")
+            if "guid" in p and p["guid"] is not None and _guid(p["guid"]) is None:
+                _fail("invalid graph player GUID")
         for key, player in players.items():
             canonical_name = solver_rows[key]["username"] if key in solver_rows else owner_rows[key]["username"]
             if player["username"] != canonical_name:
                 _fail("graph player name mismatch")
+            if _guid(player.get("guid")) != guid_by_key.get(key):
+                _fail("graph player GUID mismatch")
         cache_owners = {row["code"]: _norm(row.get("owner")) or None for row in caches}
         expected_edges = defaultdict(set)
         for skey, row in solver_rows.items():
@@ -540,7 +589,9 @@ def _validate_dataset(manifest, scopes, facts=None):
     certified_by_code = defaultdict(list)
     for solver in base["rankings"]["solvers"]:
         for code in solver["cacheCodes"]:
-            certified_by_code[code].append({"key": solver["key"], "username": solver["username"], "certifiedAt": None})
+            certified_by_code[code].append({"key": solver["key"], "username": solver["username"],
+                                            "certifiedAt": None, "guid": solver.get("guid")})
+    owner_guid_by_key = {row["key"]: row.get("guid") for row in base["rankings"]["owners"]}
     for (region, availability), scope in scope_map.items():
         selected = {row["code"] for row in scope["caches"]}
         if not selected.issubset(all_codes):
@@ -552,7 +603,8 @@ def _validate_dataset(manifest, scopes, facts=None):
         if selected != expected:
             _fail("filtered scope cache set mismatch")
         filtered_cache_rows = [base_caches[code] for code in sorted(expected)]
-        synthetic_facts = [{"cache": cache_row, "stats": cache_row["stats"],
+        synthetic_facts = [{"cache": dict(cache_row, ownerGuid=owner_guid_by_key.get(_norm(cache_row.get("owner")))),
+                            "stats": cache_row["stats"],
                             "certifiedSolvers": certified_by_code.get(cache_row["code"], [])}
                            for cache_row in filtered_cache_rows]
         expected_scope = build_scope(synthetic_facts, region, availability)
@@ -566,6 +618,13 @@ def _validate_dataset(manifest, scopes, facts=None):
         for code, fact in facts.items():
             if fact.get("cache", {}).get("code") != code or not isinstance(fact.get("checkers"), list):
                 _fail("invalid internal facts")
+            if not _valid_optional_guid(fact.get("cache", {}).get("ownerGuid")):
+                _fail("invalid internal owner GUID")
+            if any(not isinstance(checker, dict) or any(
+                    not _valid_optional_guid(solver.get("guid"))
+                    for solver in checker.get("publicSolvers", []) if isinstance(solver, dict))
+                   for checker in fact["checkers"]):
+                _fail("invalid internal solver GUID")
             rebuilt = build_cache_facts(fact["cache"], fact["checkers"])
             if rebuilt["stats"] != fact.get("stats") or rebuilt["certifiedSolvers"] != fact.get("certifiedSolvers"):
                 _fail("internal facts do not match source checker records")

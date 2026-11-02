@@ -230,6 +230,24 @@ class CertitudeStore:
         rows = self._run("SELECT cache_code, record FROM certitude_descriptions", fetch=True)
         return {code: self._decode(record) for code, record in rows}
 
+    def load_usage_audits(self):
+        rows = self._run(
+            "SELECT cache_code, record->'usageAudit' FROM certitude_descriptions "
+            "WHERE jsonb_typeof(record->'usageAudit') = 'object'",
+            fetch=True,
+        )
+        return {code: self._decode(record) for code, record in rows}
+
+    def save_usage_audit(self, code, record):
+        if not isinstance(record, dict):
+            raise ValueError("usage audit record must be a JSON object")
+        self._run(
+            "INSERT INTO certitude_descriptions (cache_code, record) VALUES (%s, %s::jsonb) "
+            "ON CONFLICT (cache_code) DO UPDATE SET record = "
+            "jsonb_set(certitude_descriptions.record, '{usageAudit}', EXCLUDED.record->'usageAudit', true)",
+            (code, json.dumps({"usageAudit": record}, ensure_ascii=False)),
+        )
+
     def load_checkers(self):
         rows = self._run("SELECT checker_id, record FROM certitude_checkers", fetch=True)
         return {checker_id: self._decode(record) for checker_id, record in rows}

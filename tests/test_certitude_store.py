@@ -166,6 +166,55 @@ class CertitudeStoreTests(unittest.TestCase):
             CertitudeStore(conn).save_activity_scan("region:North", [])
         self.assertEqual(conn.cur.calls, [])
 
+    def test_usage_audits_load_decodes_json_strings_and_objects(self):
+        conn = FakeConnection()
+        first = {"status": "ok", "count": 0}
+        second = {"status": "error", "message": "未找到"}
+        conn.cur.rows = [("GC001", json.dumps(first)), ("GC002", second)]
+        self.assertEqual(CertitudeStore(conn).load_usage_audits(), {
+            "GC001": first, "GC002": second,
+        })
+        query = conn.cur.calls[0][0].lower()
+        self.assertIn("record->'usageaudit'", query)
+        self.assertIn("jsonb_typeof(record->'usageaudit') = 'object'", query)
+
+    def test_usage_audit_save_only_merges_nested_key_and_preserves_columns(self):
+        conn = FakeConnection()
+        audit = {"status": "ok", "message": "已检查", "count": 0}
+        CertitudeStore(conn).save_usage_audit("GC001", audit)
+        query, params = conn.cur.calls[0]
+        lowered = query.lower()
+        self.assertNotIn("GC001", query)
+        self.assertEqual(params[0], "GC001")
+        self.assertEqual(json.loads(params[1]), {"usageAudit": audit})
+        self.assertIn("jsonb_set(certitude_descriptions.record, '{usageaudit}', excluded.record->'usageaudit', true)", lowered)
+        self.assertNotIn("last_attempt_at", lowered)
+        self.assertNotIn("scanned_at", lowered)
+        self.assertNotIn("descriptionlinks", lowered)
+        self.assertNotIn("delete", lowered)
+        self.assertNotIn("drop", lowered)
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(conn.rollbacks, 0)
+
+    def test_usage_audit_must_be_object(self):
+        conn = FakeConnection()
+        with self.assertRaises(ValueError):
+            CertitudeStore(conn).save_usage_audit("GC001", [])
+        self.assertEqual(conn.cur.calls, [])
+
+    def test_usage_audit_save_rolls_back_on_database_error(self):
+        class FailingCursor(FakeCursor):
+            def execute(self, query, params=None):
+                super().execute(query, params)
+                raise RuntimeError("database error")
+
+        conn = FakeConnection()
+        conn.cur = FailingCursor()
+        with self.assertRaises(RuntimeError):
+            CertitudeStore(conn).save_usage_audit("GC001", {"status": "ok"})
+        self.assertEqual(conn.commits, 0)
+        self.assertEqual(conn.rollbacks, 1)
+
     def test_description_uses_contract_scanned_timestamp_and_preserves_link_evidence(self):
         conn = FakeConnection()
         prior = {"descriptionLinks": [

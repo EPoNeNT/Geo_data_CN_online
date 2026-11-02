@@ -128,6 +128,7 @@ def collect(connection, *, activity_page_limit=100, publication_page_limit=100, 
     store.ensure_schema()
     candidates = load_candidates(connection)
     checkers = store.load_checkers()
+    usage_audits = store.load_usage_audits()
     candidate_codes = {row["code"] for row in candidates}
     fetcher = fetcher or BoundedFetcher()
     if logger:
@@ -146,6 +147,18 @@ def collect(connection, *, activity_page_limit=100, publication_page_limit=100, 
             continue
         if record.get("sourceUrl") and needs_detail_retry(record):
             sources.setdefault(record["sourceUrl"], set()).add(cid)
+    by_source = {record.get("sourceUrl"): cid for cid, record in checkers.items() if record.get("sourceUrl")}
+    for code, audit in usage_audits.items():
+        if code not in candidate_codes or audit.get("lastValidStatus") != "linked":
+            continue
+        for link in audit.get("links", []):
+            source = link.get("sourceUrl")
+            if not source:
+                continue
+            cid = link.get("checkerId") or by_source.get(source)
+            if cid in checkers and not needs_detail_retry(checkers[cid]):
+                continue
+            sources.setdefault(source, set()).update([cid] if cid in checkers else [])
     source_session = requests.Session()
     source_session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; public-read research)"})
     fetched_ids = set()
@@ -198,6 +211,7 @@ def collect(connection, *, activity_page_limit=100, publication_page_limit=100, 
             checkers[cid] = merged
             fetched_ids.add(cid)
             valid_reads += 1
+            _save_audit_link_result(store, usage_audits, source_url, now, checker=merged)
         except (FetchError, ValueError) as exc:
             detail_failed += 1
             error = str(exc) if isinstance(exc, FetchError) else "checker_parse_failed"
@@ -216,6 +230,7 @@ def collect(connection, *, activity_page_limit=100, publication_page_limit=100, 
                         failed.setdefault("crawl", {})["errorResponse"] = dict(exc.metadata)
                     store.save_checker(failed)
                     checkers[cid] = failed
+            _save_audit_link_result(store, usage_audits, source_url, now, error=error)
         if logger and (detail_processed % 25 == 0 or detail_processed == len(sources)):
             logger.info("Certitude detail progress: processed=%s successful=%s failed=%s skipped_aliases=%s",
                         detail_processed, valid_reads, detail_failed, detail_skipped)
@@ -230,6 +245,21 @@ def collect(connection, *, activity_page_limit=100, publication_page_limit=100, 
         raise RuntimeError("certitude_dashboard_scan_failed; previous scan boundaries retained")
     if sources and not valid_reads and not any(c.get("mappingStatus") == "verified" for c in checkers.values()):
         raise RuntimeError("no_valid_checker_observation; previous publication retained")
+
+
+def _save_audit_link_result(store, audits, source_url, attempted_at, *, checker=None, error=None):
+    """Resolve audit-discovered URLs without changing description observation times."""
+    for code, audit in audits.items():
+        changed = False
+        for link in audit.get("links", []):
+            if link.get("sourceUrl") != source_url:
+                continue
+            link.update(lastAttemptAt=attempted_at, errorCode=error)
+            if checker is not None:
+                link.update(checkerId=checker["checkerId"], mappingStatus=checker.get("mappingStatus"))
+            changed = True
+        if changed:
+            store.save_usage_audit(code, audit)
 
 
 def main():

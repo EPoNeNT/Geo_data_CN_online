@@ -24,12 +24,28 @@ on:
           - both
           - generate
           - certitude
+          - certitude-audit
           - diagnose-auth
       publication_page_limit:
         description: '每个地区的发布时间列表页数上限（0 表示不限页数；未完成会保存进度）'
         required: false
         default: '100'
         type: string
+      audit_limit:
+        description: 'Certitude 使用情况排查数量上限（0 为全部 Mystery，未完成会保存进度）'
+        required: false
+        default: '0'
+        type: string
+      audit_restart:
+        description: 'Certitude 使用情况排查：放弃断点并重新全量检查'
+        required: false
+        default: false
+        type: boolean
+      audit_apply_exclusions:
+        description: 'Certitude 使用情况排查：将已确认的自动排除项保存到 Neon，供 generate 使用'
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: geocache-crawler-${{ github.ref }}
@@ -43,6 +59,72 @@ env:
   GEOCACHING_COOKIE_STATE_FILE: .runtime/geocaching-auth/nonpremium.enc
 
 jobs:
+  audit-certitude-usage:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'certitude-audit'
+    timeout-minutes: 360
+    env:
+      GEOCACHING_COOKIE_STATE_KEY: ${{ secrets.GEOCACHING_COOKIE_STATE_KEY }}
+      CERTITUDE_AUDIT_LIMIT: ${{ github.event.inputs.audit_limit || '0' }}
+      CERTITUDE_AUDIT_RESTART: ${{ github.event.inputs.audit_restart || 'false' }}
+      CERTITUDE_AUDIT_APPLY: ${{ github.event.inputs.audit_apply_exclusions || 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run offline Certitude tests
+        run: python -m unittest discover -s tests -p 'test_certitude*.py'
+
+      - name: Restore encrypted nonpremium cookie state
+        if: env.GEOCACHING_COOKIE_STATE_KEY != ''
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          restore-keys: geocaching-basic-state-v1-
+
+      - name: Audit Certitude use in all Mystery descriptions
+        run: |
+          args=(--limit "$CERTITUDE_AUDIT_LIMIT")
+          if [ "$CERTITUDE_AUDIT_RESTART" = "true" ]; then args+=(--restart); fi
+          if [ "$CERTITUDE_AUDIT_APPLY" = "true" ]; then args+=(--apply-exclusions); fi
+          python audit_certitude_usage.py "${args[@]}"
+        env:
+          LOG_TO_FILE: '1'
+
+      - name: Save encrypted nonpremium cookie state
+        if: always() && env.GEOCACHING_COOKIE_STATE_KEY != '' && hashFiles('.runtime/geocaching-auth/nonpremium.enc') != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: .runtime/geocaching-auth/nonpremium.enc
+          key: geocaching-basic-state-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+
+      - name: Upload Certitude audit report
+        if: always() && hashFiles('.runtime/certitude-usage-audit/report.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: certitude-usage-audit
+          include-hidden-files: true
+          path: .runtime/certitude-usage-audit/*.json
+
+      - name: Upload audit logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: certitude-usage-audit-logs
+          path: audit_certitude_usage.log
+
   diagnose-auth:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'diagnose-auth'

@@ -30,6 +30,26 @@ class CertitudeWorkflowTests(unittest.TestCase):
         self.assertIn('certitude', TEXT)
         self.assertIn('publication_page_limit', TEXT)
 
+    def test_usage_audit_is_manual_independent_and_never_generates_or_pushes(self):
+        audit = job_block('audit-certitude-usage')
+        self.assertIn('          - certitude-audit\n', TEXT)
+        self.assertIn("github.event_name == 'workflow_dispatch'", audit)
+        self.assertIn("github.event.inputs.mode == 'certitude-audit'", audit)
+        self.assertNotIn("github.event_name == 'schedule'", audit)
+        self.assertNotIn('needs:', audit)
+        self.assertIn('python audit_certitude_usage.py "${args[@]}"', audit)
+        self.assertIn('args+=(--apply-exclusions)', audit)
+        self.assertIn('timeout-minutes: 360', audit)
+        self.assertIn('Restore encrypted nonpremium cookie state', audit)
+        self.assertIn('Save encrypted nonpremium cookie state', audit)
+        self.assertIn('include-hidden-files: true', audit)
+        self.assertIn('.runtime/certitude-usage-audit/*.json', audit)
+        self.assertNotIn('python generate_certitude.py', audit)
+        self.assertNotIn('git push', audit)
+        self.assertNotIn('git commit', audit)
+        apply_input = TEXT.split('      audit_apply_exclusions:', 1)[1].split('concurrency:', 1)[0]
+        self.assertIn('default: true', apply_input)
+
     def test_job_runs_certitude_and_preserves_static_deploy_paths(self):
         self.assertIn("run: python -m unittest discover -s tests -p 'test_certitude*.py'", TEXT)
         self.assertIn('python crawl_certitude.py --publication-page-limit "$CERTITUDE_PUBLICATION_PAGE_LIMIT"', TEXT)

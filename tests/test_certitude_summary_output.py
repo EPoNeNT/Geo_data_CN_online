@@ -60,8 +60,11 @@ class SummaryOutputTests(unittest.TestCase):
         connection = Connection()
         with patch("generate_certitude.load_candidates", return_value=[]):
             inputs = load_inputs(connection)
-        self.assertEqual(inputs, ([], {}))
-        self.assertEqual(connection.cur.queries, ["SELECT checker_id, record FROM certitude_checkers"])
+        self.assertEqual(inputs, ([], {}, [], {}))
+        self.assertEqual(connection.cur.queries, ["SELECT checker_id, record FROM certitude_checkers",
+                                                  'SELECT user_name, guid FROM "user"',
+                                                  "SELECT cache_code, record->'usageAudit' FROM certitude_descriptions "
+                                                  "WHERE record->'usageAudit'->'autoExcluded' = 'true'::jsonb"])
 
 
 if __name__ == "__main__":

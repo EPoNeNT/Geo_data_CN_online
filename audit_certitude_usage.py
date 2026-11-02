@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -68,6 +69,18 @@ def _cookie(premium):
     return optional_cookie("GEOCOOKIE_PREMIUM") if premium else optional_cookie("GEOCOOKIE_NONPREMIUM", "GEOCACHING_COOKIE")
 
 
+def _inspect_usage_page(html, url, code):
+    if looks_like_login_page(url, html):
+        return {"status": "unknown", "reason": "login_or_premium", "links": []}
+    result = inspect_description(html, url, code)
+    if (result.get("reason") == "login_or_premium"
+            and re.search(r'"isAuthenticated"\s*:\s*true\b', html)):
+        # A logged-in listing can discuss login requirements in its puzzle text.
+        # Keep the description unconfirmed without treating it as a failed session.
+        result = {"status": "unknown", "reason": "access_text_requires_review", "links": []}
+    return result
+
+
 def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
             output_dir=".runtime/certitude-usage-audit", fetcher=None, logger=None,
             session_factory=create_geocaching_session):
@@ -115,6 +128,7 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
                     run_id, len(rows), len(pending), limit)
     attempted = linked = not_linked = unknown_count = new_links = 0
     auth_stopped = False
+    stop_reason = None
     scan = {"runId": run_id, "lastAttemptAt": _now(), "status": "partial",
             "applyExclusions": apply_exclusions, "discoveryFailed": discovery_failed, "attempted": 0}
     store.save_activity_scan(SCOPE, deepcopy(scan))
@@ -140,18 +154,14 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
                             sessions[profile] = session
                         url = DETAIL_BASE + "?" + urlencode({"wp": code})
                         html, actual_url = fetcher.get(sessions[profile], url, GEOCACHING_HOSTS)
-                        if looks_like_login_page(actual_url, html):
-                            result = {"status": "unknown", "reason": "login_or_premium", "links": []}
-                        else:
-                            result = inspect_description(html, actual_url, code)
+                        result = _inspect_usage_page(html, actual_url, code)
                         if result.get("reason") == "login_or_premium" and not premium and _cookie(True):
                             premium_cookie = _cookie(True)
                             if "premium" not in sessions:
                                 sessions["premium"] = session_factory(premium_cookie, profile="premium")
                                 sessions["premium"].headers.update({"User-Agent": "Mozilla/5.0 (compatible; public-read research)"})
                             html, actual_url = fetcher.get(sessions["premium"], url, GEOCACHING_HOSTS)
-                            result = ( {"status": "unknown", "reason": "login_or_premium", "links": []}
-                                       if looks_like_login_page(actual_url, html) else inspect_description(html, actual_url, code))
+                            result = _inspect_usage_page(html, actual_url, code)
                         status = result.get("status", "unknown")
                         reason = result.get("reason", "unknown")
                         links = result.get("links", []) if status == "linked" else []
@@ -193,6 +203,10 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
                 logger.info("Certitude usage audit progress: attempted=%s linked=%s not_linked=%s unknown=%s",
                             attempted, linked, not_linked, unknown_count)
             if auth_stopped:
+                stop_reason = {"cacheCode": code, "reason": reason}
+                if logger:
+                    logger.warning("Certitude usage audit stopped: code=%s reason=%s; checkpoint saved for resume",
+                                   code, reason)
                 break
     finally:
         for session in sessions.values():
@@ -205,7 +219,8 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
     remaining = any((audits.get(row["code"].strip().upper()) or {}).get("runId") != run_id or
                     (audits.get(row["code"].strip().upper()) or {}).get("retryPending") for row in rows)
     complete = not remaining and not discovery_failed
-    scan.update(lastAttemptAt=_now(), status="complete" if complete else "partial", attempted=attempted)
+    scan.update(lastAttemptAt=_now(), status="complete" if complete else "partial", attempted=attempted,
+                stopReason=stop_reason)
     store.save_activity_scan(SCOPE, scan)
 
     excluded_codes = sorted(code for code, row in ((row["code"].strip().upper(), row) for row in rows)
@@ -220,25 +235,36 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
     report_rows = []
     for code, row in ((row["code"].strip().upper(), row) for row in rows):
         record = audits.get(code) or {}
-        item = {"code": code, "status": record.get("status", "unknown"),
+        current = record.get("runId") == run_id
+        item = {"code": code, "status": record.get("status", "unknown") if current else "not_checked",
                 "reason": record.get("reason"), "hasKnownChecker": code in known,
                 "candidateExcluded": code in excluded_codes, "checkedAt": record.get("checkedAt"),
                 "lastAttemptAt": record.get("lastAttemptAt"), "linkCount": len(record.get("links", []))}
         report_rows.append(item)
-    summary = {"total": len(rows), "attempted": attempted,
-               "linked": sum((audits.get(row["code"].strip().upper()) or {}).get("status") == "linked" for row in rows),
-               "not_linked": sum((audits.get(row["code"].strip().upper()) or {}).get("status") == "not_linked" for row in rows),
-               "unknown": sum((audits.get(row["code"].strip().upper()) or {}).get("status", "unknown") == "unknown" for row in rows),
+    current_records = [audits[row["code"].strip().upper()] for row in rows
+                       if (audits.get(row["code"].strip().upper()) or {}).get("runId") == run_id]
+    failed_count = sum(bool(record.get("retryPending")) for record in current_records)
+    unchecked_count = len(rows) - len(current_records)
+    summary = {"total": len(rows), "attempted": attempted, "checked": len(current_records),
+               "linked": sum(record.get("status") == "linked" for record in current_records),
+               "not_linked": sum(record.get("status") == "not_linked" for record in current_records),
+               "unknown": sum(record.get("status") == "unknown" and not record.get("retryPending")
+                              for record in current_records),
+               "failed": failed_count, "unchecked": unchecked_count,
+               "pending": unchecked_count + failed_count,
+               "reasonCounts": dict(Counter(record.get("reason", "unknown") for record in current_records)),
                "newlinks": new_links, "excludedCandidates": len(excluded_codes)}
     report = {"runId": run_id, "partial": not complete or discovery_failed,
               "retryPending": retry_pending,
-              "discoveryFailed": discovery_failed, "summary": summary, "items": report_rows}
+              "discoveryFailed": discovery_failed, "stopReason": stop_reason,
+              "summary": summary, "items": report_rows}
     _atomic_json(output_dir, "report.json", report)
     _atomic_json(output_dir, "certitude_exclusions.json", merged_exclusions)
     if logger:
-        logger.info("Certitude usage audit completed: run_id=%s status=%s total=%s attempted=%s linked=%s not_linked=%s unknown=%s excluded=%s",
-                    run_id, scan["status"], len(rows), attempted, summary["linked"], summary["not_linked"],
-                    summary["unknown"], len(excluded_codes))
+        logger.info("Certitude usage audit finished: run_id=%s status=%s total=%s attempted=%s checked=%s linked=%s not_linked=%s review_unknown=%s failed=%s unchecked=%s pending=%s excluded=%s discovery_failed=%s",
+                    run_id, scan["status"], len(rows), attempted, summary["checked"], summary["linked"], summary["not_linked"],
+                    summary["unknown"], summary["failed"], summary["unchecked"], summary["pending"],
+                    len(excluded_codes), discovery_failed)
     return report
 
 
@@ -260,6 +286,10 @@ def main():
         report = collect(connection, apply_exclusions=args.apply_exclusions, limit=args.limit,
                          restart=args.restart, output_dir=args.output_dir, logger=logger)
         if report["discoveryFailed"] or report["retryPending"]:
+            stopped = report.get("stopReason") or {}
+            logger.error("Certitude usage audit incomplete: discovery_failed=%s failed=%s pending=%s stopped_cache=%s stop_reason=%s; saved progress will resume without --restart",
+                         report["discoveryFailed"], report["summary"]["failed"], report["summary"]["pending"],
+                         stopped.get("cacheCode"), stopped.get("reason"))
             raise SystemExit(1)
     finally:
         connection.close()

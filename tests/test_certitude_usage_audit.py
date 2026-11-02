@@ -64,6 +64,58 @@ class InterruptingFetcher:
 
 
 class AuditRunnerTests(unittest.TestCase):
+    def test_authenticated_access_text_does_not_abort_all_remaining_caches(self):
+        candidates = [{"code": code, "premium_only": False} for code in ("GC12345", "GC12346")]
+        html, url = page("GC12345", 'You must be logged in to another puzzle service.')
+        html = html.replace('</body>', '<script>var state={"isAuthenticated":true};</script></body>')
+        report, store = self.run_audit(candidates, {"GC12345": (html, url), "GC12346": page("GC12346")})
+        self.assertEqual(report["summary"]["attempted"], 2)
+        self.assertEqual(store.audits["GC12345"]["status"], "unknown")
+        self.assertFalse(store.audits["GC12345"]["retryPending"])
+        self.assertFalse(report["retryPending"])
+        self.assertFalse(report["partial"])
+
+    def test_actual_login_page_still_stops_even_with_authenticated_text(self):
+        candidates = [{"code": code, "premium_only": False} for code in ("GC12345", "GC12346")]
+        html = '<html><body><script>{"isAuthenticated":true}</script></body></html>'
+        report, store = self.run_audit(candidates, {
+            "GC12345": (html, "https://www.geocaching.com/account/signin"),
+            "GC12346": page("GC12346"),
+        })
+        self.assertEqual(report["summary"]["attempted"], 1)
+        self.assertTrue(report["retryPending"])
+        self.assertEqual(report["stopReason"], {"cacheCode": "GC12345", "reason": "login_or_premium"})
+
+    def test_summary_separates_unchecked_caches_from_unknown_and_failed(self):
+        candidates = [{"code": code, "premium_only": False} for code in ("GC12345", "GC12346")]
+        report, _ = self.run_audit(candidates, {"GC12345": page("GC12345")}, limit=1,
+                                  audits={"GC12346": {"status": "unknown", "runId": "older-run"}})
+        summary = report["summary"]
+        self.assertEqual((summary["checked"], summary["unchecked"], summary["unknown"], summary["failed"]),
+                         (1, 1, 0, 0))
+        self.assertEqual(summary["pending"], 1)
+        self.assertEqual(next(row for row in report["items"] if row["code"] == "GC12346")["status"], "not_checked")
+
+    def test_old_auth_checkpoint_retries_stopped_cache_and_continues_remaining(self):
+        candidates = [{"code": code, "premium_only": code == "GC12346"}
+                      for code in ("GC12345", "GC12346", "GC12347")]
+        run_id = "saved-run"
+        audits = {"GC12345": {"runId": run_id, "status": "linked", "retryPending": False},
+                  "GC12346": {"runId": run_id, "status": "unknown", "reason": "login_or_premium", "retryPending": True}}
+        scans = {audit.SCOPE: {"runId": run_id, "status": "partial", "applyExclusions": True,
+                               "discoveryFailed": True}}
+        html, url = page("GC12346", "You must be logged in to another puzzle service.")
+        html = html.replace('</body>', '<script>{"isAuthenticated":true}</script></body>')
+        report, store = self.run_audit(candidates, {"GC12346": (html, url), "GC12347": page("GC12347")},
+                                      audits=audits, scans=scans, apply_exclusions=True)
+        self.assertEqual(report["runId"], run_id)
+        self.assertEqual(report["summary"]["attempted"], 2)
+        self.assertEqual(report["summary"]["checked"], 3)
+        self.assertEqual(report["summary"]["unchecked"], 0)
+        self.assertEqual(report["summary"]["failed"], 0)
+        self.assertFalse(report["partial"])
+        self.assertEqual(store.audits["GC12346"]["reason"], "access_text_requires_review")
+
     def test_applied_audit_exclusion_is_consumed_by_generation(self):
         import generate_certitude
         from unittest.mock import MagicMock

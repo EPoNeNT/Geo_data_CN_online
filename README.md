@@ -107,6 +107,8 @@ pip install -r requirements.txt
 
 手动完整描述排查由 `audit_certitude_usage.py` 执行：`--limit` 默认 `0`（全部 Mystery，包括归档），`--restart` 从头开始完整扫描（默认恢复未完成任务，完整结束后下次默认重新开始），命令行显式传入 `--apply-exclusions` 才启用数据库自动排除（Actions 的 `audit_apply_exclusions` 默认勾选），`--output-dir` 指定报告目录。手动 Actions 模式 `certitude-audit` 的超时为 360 分钟。排查需要普通和 Premium Geocaching Cookie，并恢复、续存加密普通账号会话状态；每日 Certitude job 仍只匿名读取 dashboard，不请求 cache 描述。
 
+排查报告将本轮已检查数（`checked`）、尚未检查数（`unchecked`）、请求失败且待重试数（`failed`）和已读取但待确认数（`unknown`）分别统计，`pending` 为尚未检查与待重试之和。页面已明确登录、但正文触发登录或会员关键词判断时，只保留待确认，不当作账号失效中止；真正登录页或访问失败仍停止并说明藏点编号与原因。列表发现失败或仍有待重试请求时返回失败状态，已保存的断点不受影响，再次运行时不要勾选 `audit_restart` 即可续跑。
+
 本地跨进程保存普通账号 Cookie 续期时，可设置 `GEOCACHING_COOKIE_STATE_KEY` 为 Fernet 生成的 URL-safe Base64 密钥（44 个字符）。可用 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` 生成，然后将密钥只放入本地 `.env` 或 GitHub Actions Secret `GEOCACHING_COOKIE_STATE_KEY`。末尾的 `=` 是密钥的一部分；`.env` 中可用双引号包裹整个值，复制到 Secret 时不包含外层引号。可选的 `GEOCACHING_COOKIE_STATE_FILE` 指定状态文件路径，默认 `.runtime/geocaching-auth/nonpremium.enc`。Actions 的 cache、logs、auth 诊断和独立归档日志 job 会恢复并保存该加密文件；常规 `crawl-certitude` job 不读取或保存这份状态，也不依赖 Geocaching Cookie。两个工作流共享缓存前缀和并发组，避免同时更新同一账号的续期状态。文件只以加密形式进入 Actions cache，`.runtime/` 已在 gitignore 中排除。更换 `GEOCOOKIE_NONPREMIUM` 会使旧状态失效并从新配置的 Cookie 开始。服务器是否续期由服务器决定；退出登录可能撤销会话，缓存过期或被驱逐后可能需要手动更新 Cookie。此机制不使用账号密码，也不在 workflow 中执行密码登录。
 
 ## Certitude 每日静态数据

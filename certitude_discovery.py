@@ -3,12 +3,21 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import re
 from urllib.parse import parse_qs, urlsplit
 
 import requests
 
 from certitude_activity import ALLOWED_HOSTS, BASE, REGIONS, _iso, _now, _time, needs_detail_retry
 from certitude_source import parse_dashboard_html
+
+
+def _safe_error_code(exc):
+    """Return a short error code without exposing arbitrary exception text."""
+    message = str(exc)
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,79}", message):
+        return message
+    return type(exc).__name__
 
 
 def _candidate_fingerprint(codes):
@@ -67,10 +76,10 @@ def index_publications(store, fetcher, candidates, checkers, *, page_limit=100, 
         for region in REGIONS:
             result["failedRegions"].append(region)
             old = deepcopy(scans.get("published:" + region) or {})
-            old.update(lastAttemptAt=_iso(_now()), status="error", errorCode=type(exc).__name__)
+            old.update(lastAttemptAt=_iso(_now()), status="error", errorCode=_safe_error_code(exc))
             store.save_activity_scan("published:" + region, old)
         if logger:
-            logger.warning("Certitude publication controls failed (%s)", type(exc).__name__)
+            logger.warning("Certitude publication controls failed (%s)", _safe_error_code(exc))
         return result
     finally:
         session.close()
@@ -193,10 +202,11 @@ def index_publications(store, fetcher, candidates, checkers, *, page_limit=100, 
                     break
                 page = read(cursor, country)
         except (ValueError, RuntimeError, requests.RequestException) as exc:
-            save(cursor, "error", error=type(exc).__name__)
+            error_code = _safe_error_code(exc)
+            save(cursor, "error", error=error_code)
             result["failedRegions"].append(region)
             if logger:
-                logger.warning("Certitude publication scan failed: %s (%s)", region, type(exc).__name__)
+                logger.warning("Certitude publication scan failed: %s (%s)", region, error_code)
         finally:
             if logger:
                 logger.info("Certitude publication region finished: region=%s status=%s pages=%s",

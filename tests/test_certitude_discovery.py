@@ -33,7 +33,9 @@ class Fetcher:
     def post(self, session, url, hosts, data):
         session.calls.append(("POST", dict(data)))
         self.calls.append(("POST", data["filter_country"]))
-        return self.pages["POST:" + data["filter_country"]], "https://www.certitudes.org/"
+        val = self.pages["POST:" + data["filter_country"]]
+        if isinstance(val, Exception): raise val
+        return val, "https://www.certitudes.org/"
 
 
 def page(country, rows=(), next_url=None):
@@ -51,7 +53,7 @@ class PublicationDiscoveryTests(unittest.TestCase):
     controls = {"countries": {"china": "1", "taiwan": "2", "hong-kong": "3", "macao": "4"},
                 "publicationSortUrl": "https://www.certitudes.org/?sort=dat&dir=desc"}
 
-    def run_index(self, page_map, candidates=({"code": "GC1"},), checks=None, limit=100, scans=None):
+    def run_index(self, page_map, candidates=({"code": "GC1"},), checks=None, limit=100, scans=None, logger=None):
         for state in (scans or {}).values():
             state.setdefault("candidateFingerprint", discovery._candidate_fingerprint({c["code"] for c in candidates}))
         store, fetcher = Store(scans), Fetcher(page_map)
@@ -59,7 +61,7 @@ class PublicationDiscoveryTests(unittest.TestCase):
         with patch.object(discovery, "parse_dashboard_html", side_effect=parser), \
              patch.object(discovery, "_now", return_value=__import__("datetime").datetime(2026, 11, 2, tzinfo=__import__("datetime").timezone.utc)):
             result = discovery.index_publications(store, fetcher, list(candidates), checks if checks is not None else {},
-                                                  page_limit=limit, session_factory=Session)
+                                                  page_limit=limit, logger=logger, session_factory=Session)
         return result, store, fetcher
 
     def test_initial_scan_walks_all_pages_even_when_checker_already_known_and_filters_parent(self):
@@ -229,6 +231,45 @@ class PublicationDiscoveryTests(unittest.TestCase):
             out = discovery.index_publications(store, fetcher, [{"code": "GC1"}], {}, session_factory=Session)
         self.assertEqual(out["failedRegions"], ["china", "taiwan", "hong-kong", "macao"])
         self.assertTrue(all(store.scans["published:" + r]["status"] == "error" for r in discovery.REGIONS))
+
+    def test_fetch_error_code_is_saved_and_logged_for_controls(self):
+        from crawl_certitude import FetchError
+        messages = []
+        class Logger:
+            def warning(self, message, *args): messages.append(message % args)
+        pages = {"https://www.certitudes.org/": FetchError("http_403")}
+        out, store, _ = self.run_index(pages, logger=Logger())
+        self.assertEqual(out["failedRegions"], list(discovery.REGIONS))
+        self.assertTrue(all(store.scans["published:" + r]["errorCode"] == "http_403"
+                            for r in discovery.REGIONS))
+        self.assertIn("http_403", messages[0])
+
+    def test_region_error_logs_safe_code_and_never_raw_exception_text(self):
+        from crawl_certitude import FetchError
+        error = FetchError("http_403")
+        messages = []
+        class Logger:
+            def info(self, message, *args): messages.append(message % args)
+            def warning(self, message, *args): messages.append(message % args)
+        pages = {"https://www.certitudes.org/": "controls", "POST:1": error}
+        for country in "234": pages["POST:" + country] = page(country)
+        out, store, _ = self.run_index(pages, logger=Logger())
+        self.assertIn("china", out["failedRegions"])
+        self.assertEqual(store.scans["published:china"]["errorCode"], "http_403")
+        self.assertIn("scan failed: china (http_403)", "\n".join(messages))
+
+    def test_region_error_does_not_log_untrusted_exception_text(self):
+        secret = "https://example.test/private?cookie=secret-token"
+        messages = []
+        class Logger:
+            def info(self, message, *args): messages.append(message % args)
+            def warning(self, message, *args): messages.append(message % args)
+        pages = {"https://www.certitudes.org/": "controls", "POST:1": RuntimeError(secret)}
+        for country in "234": pages["POST:" + country] = page(country)
+        out, store, _ = self.run_index(pages, logger=Logger())
+        self.assertIn("china", out["failedRegions"])
+        self.assertEqual(store.scans["published:china"]["errorCode"], "RuntimeError")
+        self.assertNotIn(secret, "\n".join(messages))
 
     def test_new_local_mystery_restarts_discovery_before_old_publication_cutoff(self):
         cursor = "https://www.certitudes.org/?sort=dat&dir=desc&idx=older"

@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 
 import requests
 
-from certitude_usage_source import inspect_description
+from certitude_usage_source import USAGE_RULE_VERSION, inspect_description
 from crawl_certitude import BoundedFetcher, FetchError, load_candidates
 from certitude_discovery import index_publications
 from certitude_store import CertitudeStore
@@ -27,6 +27,7 @@ SCOPE = "usage-audit:all"
 GEOCACHING_HOSTS = {"www.geocaching.com", "geocaching.com"}
 DETAIL_BASE = "https://www.geocaching.com/seek/cache_details.aspx"
 _GC = re.compile(r"GC[A-Z0-9]+", re.I)
+_UPDATED_REVIEW_REASONS = {"unverified_description_image", "image_only_description", "unverified_interactive_content"}
 
 
 def _now():
@@ -81,6 +82,12 @@ def _inspect_usage_page(html, url, code):
     return result
 
 
+def _needs_rule_recheck(record):
+    version = record.get("ruleVersion", 0)
+    return (record.get("status") == "unknown" and record.get("reason") in _UPDATED_REVIEW_REASONS
+            and (not isinstance(version, int) or version < USAGE_RULE_VERSION))
+
+
 def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
             output_dir=".runtime/certitude-usage-audit", fetcher=None, logger=None,
             session_factory=create_geocaching_session):
@@ -90,6 +97,7 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
     store = CertitudeStore(connection)
     store.ensure_schema()
     candidates = load_candidates(connection)
+    candidate_codes = {row["code"].strip().upper() for row in candidates}
     checkers = store.load_checkers()
     audits = deepcopy(store.load_usage_audits())
     scans = store.load_activity_scans()
@@ -103,7 +111,10 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
 
     previous_run = scans.get(SCOPE) if isinstance(scans.get(SCOPE), dict) else {}
     old_run_id = previous_run.get("runId")
-    if (restart or previous_run.get("status") == "complete" or not old_run_id
+    rule_upgrade = any(code in candidate_codes and isinstance(record, dict)
+                       and record.get("runId") == old_run_id and _needs_rule_recheck(record)
+                       for code, record in audits.items())
+    if (restart or previous_run.get("status") == "complete" and not rule_upgrade or not old_run_id
             or previous_run.get("applyExclusions", False) != apply_exclusions):
         run_id = str(uuid.uuid4())
     else:
@@ -117,7 +128,7 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
     for row in rows:
         code = row["code"].strip().upper()
         record = audits.get(code) if isinstance(audits.get(code), dict) else {}
-        if (record.get("runId") != run_id or record.get("retryPending")
+        if (record.get("runId") != run_id or record.get("retryPending") or _needs_rule_recheck(record)
                 or apply_exclusions and code in known and record.get("lastValidStatus") == "not_linked"
                 and record.get("autoExcluded") is not True):
             pending.append((code, row, record))
@@ -130,7 +141,8 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
     auth_stopped = False
     stop_reason = None
     scan = {"runId": run_id, "lastAttemptAt": _now(), "status": "partial",
-            "applyExclusions": apply_exclusions, "discoveryFailed": discovery_failed, "attempted": 0}
+            "applyExclusions": apply_exclusions, "discoveryFailed": discovery_failed, "attempted": 0,
+            "ruleVersion": USAGE_RULE_VERSION}
     store.save_activity_scan(SCOPE, deepcopy(scan))
     sessions = {}
     try:
@@ -178,7 +190,7 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
             # A batch stopped by auth still records every attempted item only.
             updated = deepcopy(previous)
             updated.update(runId=run_id, lastAttemptAt=stamp, status=status, reason=reason,
-                           retryPending=bool(retry))
+                           retryPending=bool(retry), ruleVersion=USAGE_RULE_VERSION)
             if status in {"linked", "not_linked"}:
                 updated.update(checkedAt=_now(), lastValidStatus=status, links=links)
                 updated.pop("lastValidReason", None)
@@ -217,7 +229,8 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
 
     retry_pending = any((audits.get(row["code"].strip().upper()) or {}).get("retryPending") for row in rows)
     remaining = any((audits.get(row["code"].strip().upper()) or {}).get("runId") != run_id or
-                    (audits.get(row["code"].strip().upper()) or {}).get("retryPending") for row in rows)
+                    (audits.get(row["code"].strip().upper()) or {}).get("retryPending") or
+                    _needs_rule_recheck(audits.get(row["code"].strip().upper()) or {}) for row in rows)
     complete = not remaining and not discovery_failed
     scan.update(lastAttemptAt=_now(), status="complete" if complete else "partial", attempted=attempted,
                 stopReason=stop_reason)
@@ -244,6 +257,7 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
     current_records = [audits[row["code"].strip().upper()] for row in rows
                        if (audits.get(row["code"].strip().upper()) or {}).get("runId") == run_id]
     failed_count = sum(bool(record.get("retryPending")) for record in current_records)
+    rule_pending = sum(_needs_rule_recheck(record) and not record.get("retryPending") for record in current_records)
     unchecked_count = len(rows) - len(current_records)
     summary = {"total": len(rows), "attempted": attempted, "checked": len(current_records),
                "linked": sum(record.get("status") == "linked" for record in current_records),
@@ -251,7 +265,8 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
                "unknown": sum(record.get("status") == "unknown" and not record.get("retryPending")
                               for record in current_records),
                "failed": failed_count, "unchecked": unchecked_count,
-               "pending": unchecked_count + failed_count,
+               "ruleRecheckPending": rule_pending,
+               "pending": unchecked_count + failed_count + rule_pending,
                "reasonCounts": dict(Counter(record.get("reason", "unknown") for record in current_records)),
                "newlinks": new_links, "excludedCandidates": len(excluded_codes)}
     report = {"runId": run_id, "partial": not complete or discovery_failed,
@@ -261,9 +276,9 @@ def collect(connection, *, apply_exclusions=False, limit=0, restart=False,
     _atomic_json(output_dir, "report.json", report)
     _atomic_json(output_dir, "certitude_exclusions.json", merged_exclusions)
     if logger:
-        logger.info("Certitude usage audit finished: run_id=%s status=%s total=%s attempted=%s checked=%s linked=%s not_linked=%s review_unknown=%s failed=%s unchecked=%s pending=%s excluded=%s discovery_failed=%s",
+        logger.info("Certitude usage audit finished: run_id=%s status=%s total=%s attempted=%s checked=%s linked=%s not_linked=%s review_unknown=%s failed=%s unchecked=%s rule_recheck_pending=%s pending=%s excluded=%s discovery_failed=%s",
                     run_id, scan["status"], len(rows), attempted, summary["checked"], summary["linked"], summary["not_linked"],
-                    summary["unknown"], summary["failed"], summary["unchecked"], summary["pending"],
+                    summary["unknown"], summary["failed"], summary["unchecked"], rule_pending, summary["pending"],
                     len(excluded_codes), discovery_failed)
     return report
 

@@ -52,7 +52,8 @@
 - 每日自动采集以发布时间列表作为发现基线，不代表完整历史收录。Certitude 官方说明已归档方案会从 Dashboard 隐藏，且未发布数月的方案会自动删除；每日采集不扫描 Geocaching 描述。手动全量描述排查见下文，也不能证明完整历史覆盖。
 - 手动 `audit_certitude_usage.py` 可扫描全部数据库 Mystery（含归档），识别现有 Certitude 记录是否仍有描述链接，并发现未知 checker 链接。启动前先运行 `index_publications`，`page_limit=0` 以补充当前可见的已知 checker。此工作流不能证明覆盖世界上的全部历史页面。
 - 完整、身份匹配、非空描述中没有直链且无歧义证据时，只对已有 Certitude 记录自动排除。没有已知 checker 的 Mystery 不因描述缺链排除。已发现的链接作为原始正证据入队，由下一次常规 Certitude 采集读取并核验详情；stage checker 允许保留。
-- 登录或 Premium 限制、解析/网络失败、截断或身份不匹配、空描述、无直链的图片、交互/嵌入/脚本内容、未链接 Certitude 标记或短链接均是 `unknown`；不创建排除，也不覆盖旧有效观测。任何未直连 checker 的描述图片都按未知处理，不能尝试 OCR 或执行页面脚本。
+- 以完整描述中的 Certitude HTML 引用判断使用情况，识别图片外层链接、HTML 转义和真实阶段编号。普通图片、纯图片正文和没有 Certitude 线索的交互/嵌入/脚本内容不再导致 `unknown`。登录或 Premium 限制、解析/网络失败、截断或身份不匹配、空描述、未识别的 Certitude 标记或短链接仍保留 `unknown`；不创建排除，也不覆盖旧有效观测，不执行 OCR 或页面脚本。
+- 排查记录保存 `ruleVersion=2`。旧规则因图片或普通交互内容待确认的项目在下次排查时自动入队，复用未完成或刚完成的旧批次；其他已确认结果保留。仅对当前 Mystery 范围进行规则升级补查，分批和中断后仍可续跑，强制全量使用 `--restart`。
 - 每项结果与批次检查点保存在既有 `certitude_descriptions.record.usageAudit` 与 `certitude_activity_scans['usage-audit:all']`，不新增表或迁移。普通与 Premium Geocaching Cookie 用于页面请求，普通会话的加密状态按现有机制恢复和保存；每日 Certitude job 继续匿名且不请求描述。认证失败会停止本批次，网络与认证中断可续跑。
 - 自动排除默认写入 Neon；未传入 `--apply-exclusions` 时只生成诊断结果。生成时同一只读事务合并 Neon 自动排除和手动 `certitude_exclusions.json`，手动条目优先。仅数据库中 `autoExcluded=true`、最后有效状态为 `not_linked`、UTC 检查时间有效且原因非空的记录生效。成功复查链接会清除自动标记，不改手动清单；删除手动项仅在没有自动排除时恢复纳入。
 - 每次排查产生独立 `report.json` 和 `certitude_exclusions.json`，仅包含 GC、状态、原因、计数和时间，不包含原始 URL 查询参数、HTML、答案、Cookie 或凭据。排查只写 Neon 与报告，不运行 Git、数据生成或发布；结束后需单独启动一次新的生成批次。schema version 2 和 16 个静态文件不变。

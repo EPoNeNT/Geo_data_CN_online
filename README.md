@@ -107,7 +107,7 @@ pip install -r requirements.txt
 
 手动完整描述排查由 `audit_certitude_usage.py` 执行：`--limit` 默认 `0`（全部 Mystery，包括归档），`--restart` 从头开始完整扫描（默认恢复未完成任务，完整结束后下次默认重新开始），命令行显式传入 `--apply-exclusions` 才启用数据库自动排除（Actions 的 `audit_apply_exclusions` 默认勾选），`--output-dir` 指定报告目录。手动 Actions 模式 `certitude-audit` 的超时为 360 分钟。排查需要普通和 Premium Geocaching Cookie，并恢复、续存加密普通账号会话状态；每日 Certitude job 仍只匿名读取 dashboard，不请求 cache 描述。
 
-排查报告将本轮已检查数（`checked`）、尚未检查数（`unchecked`）、请求失败且待重试数（`failed`）和已读取但待确认数（`unknown`）分别统计，`pending` 为尚未检查与待重试之和。页面已明确登录、但正文触发登录或会员关键词判断时，只保留待确认，不当作账号失效中止；真正登录页或访问失败仍停止并说明藏点编号与原因。列表发现失败或仍有待重试请求时返回失败状态，已保存的断点不受影响，再次运行时不要勾选 `audit_restart` 即可续跑。
+排查报告将本轮已检查数（`checked`）、尚未检查数（`unchecked`）、请求失败且待重试数（`failed`）和已读取但待确认数（`unknown`）分别统计，`pending` 包含尚未检查、待重试及旧规则待复查项（`ruleRecheckPending`）。页面已明确登录、但正文触发登录或会员关键词判断时，只保留待确认，不当作账号失效中止；真正登录页或访问失败仍停止并说明藏点编号与原因。列表发现失败或仍有待重试请求时返回失败状态，已保存的断点不受影响，再次运行时不要勾选 `audit_restart` 即可续跑。
 
 本地跨进程保存普通账号 Cookie 续期时，可设置 `GEOCACHING_COOKIE_STATE_KEY` 为 Fernet 生成的 URL-safe Base64 密钥（44 个字符）。可用 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` 生成，然后将密钥只放入本地 `.env` 或 GitHub Actions Secret `GEOCACHING_COOKIE_STATE_KEY`。末尾的 `=` 是密钥的一部分；`.env` 中可用双引号包裹整个值，复制到 Secret 时不包含外层引号。可选的 `GEOCACHING_COOKIE_STATE_FILE` 指定状态文件路径，默认 `.runtime/geocaching-auth/nonpremium.enc`。Actions 的 cache、logs、auth 诊断和独立归档日志 job 会恢复并保存该加密文件；常规 `crawl-certitude` job 不读取或保存这份状态，也不依赖 Geocaching Cookie。两个工作流共享缓存前缀和并发组，避免同时更新同一账号的续期状态。文件只以加密形式进入 Actions cache，`.runtime/` 已在 gitignore 中排除。更换 `GEOCOOKIE_NONPREMIUM` 会使旧状态失效并从新配置的 Cookie 开始。服务器是否续期由服务器决定；退出登录可能撤销会话，缓存过期或被驱逐后可能需要手动更新 Cookie。此机制不使用账号密码，也不在 workflow 中执行密码登录。
 
@@ -123,7 +123,9 @@ pip install -r requirements.txt
 
 手动 `audit-certitude-usage` 扫描所有数据库 Mystery（含归档），在完整身份匹配且描述非空、无 Certitude 直链或歧义证据时，可将已有 Certitude 记录标为自动排除；没有已知 checker 的藏点不会因此排除。发现的链接保存为待详情核验记录，供下一次常规 Certitude 采集读取。未知、解析失败或请求失败不会排除，也不会覆盖旧的有效观测。每项结果与断点写入现有 `certitude_descriptions.record.usageAudit` 和 `certitude_activity_scans` 的 `usage-audit:all`，不新增数据库表或迁移。自动排除保存在 Neon；生成时在同一只读事务中合并数据库自动排除与 `certitude_exclusions.json`，手动清单优先。成功复查为有链接只清除自动排除标记，不修改手动清单。删除手动 JSON 条目只在该项没有自动排除标记时恢复纳入。
 
-排查只写数据库和报告，不运行 Git、生成或发布。报告目录包含 `report.json` 与 `certitude_exclusions.json`；文件仅列 GC 编号、状态、原因、计数和时间，不包含原始 URL 查询参数、页面 HTML、答案、Cookie 或凭据。页面 URL 仅供后端请求使用。只有完整匹配的非空描述能产生自动排除；登录或 Premium 限制、解析错误、内容不完整、空描述、无直链的图片、交互或嵌入内容、未链接 Certitude 标记及短链接均记为未知。部分有效结果可独立保存，但不代表完整历史世界覆盖。
+排查只写数据库和报告，不运行 Git、生成或发布。报告目录包含 `report.json` 与 `certitude_exclusions.json`；文件仅列 GC 编号、状态、原因、计数和时间，不包含原始 URL 查询参数、页面 HTML、答案、Cookie 或凭据。页面 URL 仅供后端请求使用。只有完整匹配的非空描述能产生自动排除。排查直接识别描述中的 Certitude HTML 链接，包括标准图片按钮、HTML 转义参数和阶段编号；普通图片、纯图片正文、普通脚本或嵌入内容不再阻止“未引用”的判断。登录或 Premium 限制、解析错误、内容不完整、空描述、仅有未识别的 Certitude 文字或属性线索、短链接仍保留待确认。部分有效结果可独立保存，但不代表完整历史世界覆盖。
+
+每项排查记录保存 `ruleVersion`。新版会自动补查旧规则因普通图片或交互内容而待确认的项目，即使上一批已完成，也会复用原批次补查受影响项；已确认的其他结果不因此全部重爬。不在本次 Mystery 范围内的旧待确认项目不触发升级补查。如需放弃断点并强制重新全量检查，可使用 `audit_restart`。本次补查完成后，再次手动运行仍按全量排查模式开始新一轮。
 
 按数据需求 v1.4.1，manifest 只提供版本、生成时间、筛选范围和文件路径。范围文件不再输出采集覆盖信息、藏点的中间计算字段、出题者的重复认证总数和关系边的 GC 列表；关联藏点列表保留在玩家及出题者榜单中。生成时仍用数据库来源记录校验去重和统计结果，校验器也接受旧文件保留的额外字段。
 

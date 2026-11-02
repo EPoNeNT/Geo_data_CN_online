@@ -17,6 +17,7 @@ from certitude_source import (
 
 
 _GEOCACHING_HOSTS = {"geocaching.com", "www.geocaching.com"}
+USAGE_RULE_VERSION = 2
 _SHORTENER_HOSTS = {
     "bit.ly", "tinyurl.com", "t.co", "goo.gl", "cutt.ly", "url.cn", "shorturl.at",
 }
@@ -90,20 +91,12 @@ def inspect_description(html: str, page_url: str, expected_gc: str) -> dict:
         return _result("linked", links, "direct_link_found")
 
     text = " ".join(node.text() for node in containers).strip()
-    images = any(node.tag == "img" for container in containers for node in container.descendants())
-    if not text and not images:
+    if not text and not any(node.tag == "img" for container in containers for node in container.descendants()):
         return _result("unknown", reason="empty_description")
-    if images and not text:
-        return _result("unknown", reason="image_only_description")
-    if images:
-        return _result("unknown", reason="unverified_description_image")
     if _CERTITUDE_MARKER.search(text):
         return _result("unknown", reason="ambiguous_certitude_text")
     for container in containers:
         nodes = [container, *container.descendants()]
-        if any(node.tag in {"iframe", "object", "embed", "script"}
-               or any(key.lower().startswith("on") for key in node.attrs) for node in nodes):
-            return _result("unknown", reason="unverified_interactive_content")
         if any(_CERTITUDE_MARKER.search(str(value or ""))
                for node in nodes for value in node.attrs.values()):
             return _result("unknown", reason="ambiguous_certitude_attribute")
@@ -111,8 +104,6 @@ def inspect_description(html: str, page_url: str, expected_gc: str) -> dict:
             href = anchor.attrs.get("href")
             if not href:
                 continue
-            if href.strip().lower().startswith("javascript:"):
-                return _result("unknown", reason="unverified_interactive_content")
             try:
                 host = (urlsplit(urljoin(page_url, href.strip())).hostname or "").lower()
             except ValueError:

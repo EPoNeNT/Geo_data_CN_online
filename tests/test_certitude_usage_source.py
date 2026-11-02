@@ -28,13 +28,22 @@ class InspectDescriptionTests(unittest.TestCase):
         html, url = page("A description", "A hint")
         self.assertEqual(inspect_description(html, url, "GC12345")["status"], "not_linked")
 
-    def test_unlinked_visual_or_interactive_content_is_not_proof_of_absence(self):
+    def test_standard_certitude_image_button_is_linked(self):
+        snippet = ('<A TARGET="_blank" HREF="https://www.certitudes.org/?wp=GCSTAGE&amp;c=9">'
+                   '<img alt="Check" src="https://example.org/logo.png"></A>')
+        html, url = page(snippet)
+        result = inspect_description(html, url, "GC12345")
+        self.assertEqual(result["status"], "linked")
+        self.assertEqual(result["links"][0]["sourceWaypoint"], "GCSTAGE")
+
+    def test_unlinked_ordinary_visual_or_interactive_content_is_negative(self):
         for content in ('Scan the code <img src="qr.png">',
                         '<iframe src="https://example.org/checker"></iframe>puzzle',
-                        '<button onclick="goToChecker()">Validate</button>'):
+                        '<button onclick="goToChecker()">Validate</button>',
+                        '<a href="javascript:goToChecker()">Validate</a>'):
             html, url = page(content, "Puzzle text")
             with self.subTest(content=content):
-                self.assertEqual(inspect_description(html, url, "GC12345")["status"], "unknown")
+                self.assertEqual(inspect_description(html, url, "GC12345")["status"], "not_linked")
 
     def test_incomplete_or_unverifiable_pages_are_unknown(self):
         html, url = page("text", "text")
@@ -49,12 +58,16 @@ class InspectDescriptionTests(unittest.TestCase):
             with self.subTest(url=candidate_url):
                 self.assertEqual(inspect_description(candidate, candidate_url, expected)["status"], "unknown")
 
-    def test_empty_image_only_plain_domain_and_shortener_are_unknown(self):
-        cases = [page("", ""), page('<img src="qr.png">', ""), page("certitudes.org checker", ""),
+    def test_empty_plain_domain_and_shortener_are_unknown(self):
+        cases = [page("", ""), page("certitudes.org checker", ""),
                  page('<a href="https://bit.ly/abc">checker</a>', "")]
         for html, url in cases:
             with self.subTest(html=html):
                 self.assertEqual(inspect_description(html, url, "GC12345")["status"], "unknown")
+
+    def test_ordinary_image_only_description_is_negative(self):
+        html, url = page('<img src="qr.png">', "")
+        self.assertEqual(inspect_description(html, url, "GC12345")["status"], "not_linked")
 
     def test_description_attribute_certitude_markers_are_unknown(self):
         cases = [

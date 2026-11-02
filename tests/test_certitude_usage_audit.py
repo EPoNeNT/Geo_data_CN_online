@@ -193,7 +193,7 @@ class AuditRunnerTests(unittest.TestCase):
         candidates = [{"code": "GC12345", "premium_only": False}]
         previous = {"autoExcluded": True, "lastValidStatus": "not_linked", "checkedAt": "old",
                     "links": [{"url": "https://certitudes.org/?wp=GCAAA"}]}
-        html, url = page("GC12345", "<img src='qr.png'>")
+        html, url = page("GC12345", "Certitude checker reference without a direct link")
         html = html.replace('<div id="LongDescription">Hint</div>', '<div id="LongDescription"></div>')
         report, store = self.run_audit(candidates, {"GC12345": (html, url)},
                                        audits={"GC12345": previous}, apply_exclusions=True)
@@ -275,7 +275,7 @@ class AuditRunnerTests(unittest.TestCase):
         checkers = {"opaque": {"mappingStatus": "verified", "cacheCode": "GC12345"}}
         old = {"runId": "old-run", "status": "not_linked", "lastValidStatus": "not_linked",
                "checkedAt": "old-check", "autoExcluded": False, "links": []}
-        html, url = page("GC12345", "<img src='qr.png'>")
+        html, url = page("GC12345", "Certitude checker reference without a direct link")
         html = html.replace('<div id="LongDescription">Hint</div>', '<div id="LongDescription"></div>')
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
             report, store = self.run_audit(candidates, {"GC12345": (html, url)}, checkers=checkers,
@@ -339,6 +339,47 @@ class AuditRunnerTests(unittest.TestCase):
                                    session_factory=audit.create_geocaching_session)
         self.assertTrue(report["items"][0]["hasKnownChecker"])
         self.assertTrue(report["items"][0]["candidateExcluded"])
+
+    def test_changed_html_rule_rechecks_only_affected_unknowns_from_completed_run(self):
+        candidates = [{"code": code} for code in ("GC12345", "GC12346", "GC12347")]
+        audits = {"GC12345": {"runId": "old-run", "status": "linked", "retryPending": False},
+                  "GC12346": {"runId": "old-run", "status": "unknown", "reason": "unverified_description_image"},
+                  "GC12347": {"runId": "old-run", "status": "unknown", "reason": "image_only_description"}}
+        scans = {audit.SCOPE: {"runId": "old-run", "status": "complete", "applyExclusions": True}}
+        checkers = {"Opaque": {"mappingStatus": "verified", "cacheCode": "GC12346"}}
+        first, store = self.run_audit(candidates, {"GC12346": page("GC12346", '<img src="puzzle.png">')},
+                                      checkers=checkers, audits=audits, scans=scans, limit=1,
+                                      apply_exclusions=True)
+        self.assertEqual(first["runId"], "old-run")
+        self.assertEqual(first["summary"]["attempted"], 1)
+        self.assertEqual(first["summary"]["ruleRecheckPending"], 1)
+        self.assertTrue(first["partial"])
+        self.assertTrue(store.audits["GC12346"]["autoExcluded"])
+        self.assertEqual(store.audits["GC12346"]["ruleVersion"], 2)
+        second, store = self.run_audit(candidates, {"GC12347": page("GC12347", '<img src="map.png">')},
+                                       checkers=checkers, audits=store.audits, scans=store.scans,
+                                       apply_exclusions=True)
+        self.assertEqual(second["summary"]["attempted"], 1)
+        self.assertEqual(second["summary"]["ruleRecheckPending"], 0)
+        self.assertFalse(second["partial"])
+
+    def test_current_rule_unknown_does_not_get_rechecked_repeatedly(self):
+        candidates = [{"code": "GC12345"}, {"code": "GC12346"}]
+        audits = {"GC12345": {"runId": "saved", "ruleVersion": 2,
+                              "status": "unknown", "reason": "ambiguous_certitude_text"}}
+        scans = {audit.SCOPE: {"runId": "saved", "status": "partial", "applyExclusions": False}}
+        report, _ = self.run_audit(candidates, {"GC12346": page("GC12346")}, audits=audits, scans=scans)
+        self.assertEqual(report["summary"]["attempted"], 1)
+        self.assertFalse(report["partial"])
+
+    def test_old_review_for_cache_outside_mystery_scope_does_not_hold_run_open(self):
+        candidates = [{"code": "GC12345"}]
+        audits = {"GC12345": {"runId": "old-run", "status": "linked"},
+                  "GCOUT": {"runId": "old-run", "status": "unknown", "reason": "unverified_description_image"}}
+        scans = {audit.SCOPE: {"runId": "old-run", "status": "complete", "applyExclusions": False}}
+        report, _ = self.run_audit(candidates, {"GC12345": page("GC12345")}, audits=audits, scans=scans)
+        self.assertNotEqual(report["runId"], "old-run")
+        self.assertEqual(report["summary"]["attempted"], 1)
 
 
 if __name__ == "__main__":

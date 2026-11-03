@@ -350,6 +350,7 @@ jobs:
 
       - name: Crawl missing user registration dates
         if: github.event.inputs.mode == 'both' || github.event.inputs.mode == 'logs-full' || github.event.inputs.mode == 'generate' || github.event_name == 'schedule'
+        continue-on-error: true
         run: python crawl_user_regdates.py
         timeout-minutes: 360
         env:
@@ -362,7 +363,7 @@ jobs:
           LOG_TO_FILE: '1'
 
       - name: Generate Certitude static data
-        if: success() && needs.crawl-certitude.result != 'failure' && needs.crawl-certitude.result != 'cancelled'
+        if: success()
         run: python generate_certitude.py
         timeout-minutes: 30
         env:

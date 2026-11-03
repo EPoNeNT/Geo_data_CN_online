@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import logging
 import os
 import time
 from urllib.parse import urljoin, urlparse
@@ -52,6 +54,7 @@ class BoundedFetcher:
         self.delay, self.retries, self.timeout, self.max_bytes = delay, retries, timeout, max_bytes
         self.last_request = None
         self.last_response_headers = {}
+        self._certitude_denial = None
 
     def get(self, session, url, allowed_hosts):
         return self._request(session, url, allowed_hosts, method="GET")
@@ -66,6 +69,10 @@ class BoundedFetcher:
 
     def _request(self, session, url, allowed_hosts, method="GET", data=None):
         self.last_response_headers = {}
+        if (urlparse(url).hostname in ("certitudes.org", "www.certitudes.org")
+                and self._certitude_denial is not None):
+            code, metadata = self._certitude_denial
+            raise FetchError(code, metadata={**metadata, "requestSuppressed": True})
         for attempt in range(self.retries):
             try:
                 current = url
@@ -95,11 +102,13 @@ class BoundedFetcher:
                                 current_method, current_data = "GET", None
                             continue
                         if response.status_code != 200:
-                            raise FetchError("http_" + str(response.status_code), metadata={
+                            metadata = {
                                 "status": response.status_code, "server": response.headers.get("Server"),
                                 "contentType": response.headers.get("Content-Type"),
                                 "challenge": response.headers.get("cf-mitigated") == "challenge",
-                                "host": parsed.hostname, "path": parsed.path, "scheme": parsed.scheme})
+                                "host": parsed.hostname, "path": parsed.path, "scheme": parsed.scheme}
+                            metadata["retryAfterSeconds"] = _retry_after_seconds(response.headers.get("Retry-After"))
+                            raise FetchError("http_" + str(response.status_code), metadata=metadata)
                         if "html" not in response.headers.get("Content-Type", "").lower():
                             raise FetchError("non_html_source")
                         chunks, size = [], 0
@@ -117,10 +126,42 @@ class BoundedFetcher:
                 raise FetchError("too_many_redirects")
             except (requests.RequestException, FetchError, UnicodeError) as exc:
                 code = str(exc) if isinstance(exc, FetchError) else "request_" + type(exc).__name__.lower()
+                metadata = getattr(exc, "metadata", {})
+                if (code in ("http_403", "http_429")
+                        and metadata.get("host") in ("certitudes.org", "www.certitudes.org")):
+                    wait = max(min(300, 30 * 2 ** attempt), metadata.get("retryAfterSeconds") or 0)
+                    if attempt + 1 < self.retries and not metadata.get("challenge") and wait <= 300:
+                        logging.getLogger(__name__).warning(
+                            "Certitude access denied: code=%s attempt=%s/%s cooldown_seconds=%s response=%r",
+                            code, attempt + 1, self.retries, wait, metadata)
+                        time.sleep(wait)
+                        continue
+                    self._certitude_denial = (code, dict(metadata))
+                    logging.getLogger(__name__).warning(
+                        "Certitude access remains denied: code=%s; suppressing further site requests for this run response=%r",
+                        code, metadata)
+                    raise FetchError(code, metadata=metadata) from None
                 if code in ("untrusted_source_url", "non_html_source", "response_too_large", "http_401", "http_403", "http_404") or attempt + 1 == self.retries:
                     raise FetchError(code, metadata=getattr(exc, "metadata", None)) from None
                 time.sleep(min(30, 2 ** attempt))
         raise FetchError("request_failed")
+
+
+def _retry_after_seconds(value):
+    """Parse the server's delay without retaining arbitrary response text."""
+    if not value:
+        return None
+    try:
+        seconds = int(value)
+        return max(0, seconds)
+    except (ValueError, TypeError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                return None
+            return max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds()) + 1)
+        except (ValueError, TypeError, OverflowError):
+            return None
 
 
 def collect(connection, *, activity_page_limit=100, publication_page_limit=100, fetcher=None, logger=None):

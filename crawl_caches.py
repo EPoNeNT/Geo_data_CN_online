@@ -774,6 +774,13 @@ def _extract_owner_guid_from_detail_page(code: str, premium_only: bool = False) 
     return None
 
 
+def _resolve_owner_guid(existing: dict, latest: dict, code: str) -> Optional[str]:
+    """Preserve a known GUID unless the owner changed; then resolve the new one."""
+    if latest.get('owner_username') == existing.get('owner_username'):
+        return existing.get('owner_guid')
+    return _extract_owner_guid_from_detail_page(code, latest.get('premium_only', False))
+
+
 def _fetch_detail_page_jsonld(code: str) -> Optional[dict]:
     """访问缓存详情页并提取坐标和 owner GUID。依次尝试 nonpremium / premium cookie。"""
     urls = [
@@ -1050,11 +1057,12 @@ def run_crawler():
                             cache_record['latitude'] = scanned_data[code].get('latitude')
                             cache_record['longitude'] = scanned_data[code].get('longitude')
 
-                        # owner_username 变化 → 缓存可能被转移，从详情页获取新 owner GUID
-                        if not is_new and cache_record.get('owner_username') != scanned_data[code].get('owner_username'):
-                            new_guid = _extract_owner_guid_from_detail_page(code, cache_record.get('premium_only', False))
-                            if new_guid:
-                                cache_record['owner_guid'] = new_guid
+                        # Map API omits GUIDs. Keep the known identity for the same
+                        # owner; on a transfer, use the new GUID or clear the old one.
+                        if not is_new:
+                            cache_record['owner_guid'] = _resolve_owner_guid(
+                                scanned_data[code], cache_record, code
+                            )
 
                         updated_caches.append(cache_record)
                         if is_new:

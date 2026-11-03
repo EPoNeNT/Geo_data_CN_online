@@ -74,9 +74,8 @@ class CertitudeWorkflowTests(unittest.TestCase):
         self.assertNotIn("github.event.inputs.mode == 'certitude'", generator.split('steps:', 1)[0])
         gen_step = generator[generator.index('- name: Generate Certitude static data'):]
         gen_if = gen_step.split('run: python generate_certitude.py', 1)[0]
-        self.assertIn('if: success() &&', gen_if)
-        self.assertIn("needs.crawl-certitude.result != 'failure'", gen_if)
-        self.assertIn("needs.crawl-certitude.result != 'cancelled'", gen_if)
+        self.assertIn('if: success()', gen_if)
+        self.assertNotIn('needs.crawl-certitude.result', gen_if)
         self.assertNotIn('python crawl_certitude.py', generator)
 
     def test_cookie_state_settings_and_collection_command_are_only_in_crawler(self):

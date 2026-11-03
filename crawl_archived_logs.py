@@ -87,12 +87,18 @@ def utc_now_iso() -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    def nonnegative_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise argparse.ArgumentTypeError("must be zero or greater")
+        return parsed
+
     parser = argparse.ArgumentParser(
         description="Crawl logs for archived caches with retries, batching, and resume state."
     )
     parser.add_argument(
         "--limit",
-        type=int,
+        type=nonnegative_int,
         default=None,
         help="Optional maximum number of archived caches to crawl after filtering.",
     )
@@ -367,9 +373,13 @@ def count_summary_changes(summary: ChangedCacheSummary) -> int:
     )
 
 
+def raise_for_failed_items(failed_count: int) -> None:
+    if failed_count:
+        raise SystemExit(1)
+
+
 def get_archived_caches(
     db: DatabaseManager,
-    limit: Optional[int] = None,
     skip_db_crawled: bool = False,
     start_after: Optional[str] = None,
 ) -> List[CacheRow]:
@@ -388,10 +398,6 @@ def get_archived_caches(
 
     query += " ORDER BY code"
 
-    if limit is not None:
-        query += " LIMIT %s"
-        params.append(limit)
-
     db.cursor.execute(query, params)
     return [
         (code, lat, lng, bool(premium_only))
@@ -404,13 +410,22 @@ def filter_group(
     only: str,
     completed_codes: set[str],
     resume: bool,
+    limit: Optional[int] = None,
 ) -> Tuple[List[CrawlCache], List[CrawlCache]]:
     premium_caches: List[CrawlCache] = []
     nonpremium_caches: List[CrawlCache] = []
+    eligible_count = 0
 
     for code, lat, lng, premium_only in rows:
         if resume and code in completed_codes:
             continue
+        if premium_only and only not in {"all", "premium"}:
+            continue
+        if not premium_only and only not in {"all", "nonpremium"}:
+            continue
+        if limit is not None and eligible_count >= limit:
+            break
+        eligible_count += 1
         if premium_only and only in {"all", "premium"}:
             premium_caches.append((code, lat, lng))
         if not premium_only and only in {"all", "nonpremium"}:
@@ -649,7 +664,6 @@ def main() -> None:
     try:
         archived_caches = get_archived_caches(
             db,
-            limit=args.limit,
             skip_db_crawled=args.skip_db_crawled,
             start_after=args.start_after,
         )
@@ -658,6 +672,7 @@ def main() -> None:
             args.only,
             completed_codes,
             resume=resume,
+            limit=args.limit,
         )
 
         logger.info(
@@ -716,6 +731,7 @@ def main() -> None:
             total_changed_logs,
         )
         log_changed_cache_summary("Archived logs run total", total_changed_caches)
+        raise_for_failed_items(total_failed)
     finally:
         db.close()
 

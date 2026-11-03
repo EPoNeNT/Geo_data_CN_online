@@ -1,9 +1,10 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from crawl_certitude import BoundedFetcher, FetchError
+from crawl_certitude import BoundedFetcher, FetchError, _retry_after_seconds
 
 
 class Response:
@@ -26,6 +27,62 @@ class Session:
 
 
 class FetcherTests(unittest.TestCase):
+    @patch("crawl_certitude.time.sleep")
+    def test_transient_certitude_forbidden_recovers_after_cooldown(self, sleep):
+        session = Session([Response(403), Response(200)])
+        with self.assertLogs("crawl_certitude", level="WARNING") as logs:
+            result = BoundedFetcher(delay=0).get(session, "https://www.certitudes.org/", {"www.certitudes.org"})
+        self.assertEqual(result[0], "ok")
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list if call.args[0]], [30])
+        self.assertIn("cooldown_seconds=30", "\n".join(logs.output))
+
+    @patch("crawl_certitude.time.sleep")
+    def test_persistent_denial_stops_additional_site_requests(self, sleep):
+        session = Session([Response(403), Response(403), Response(403), Response(200)])
+        fetcher = BoundedFetcher(delay=0)
+        with self.assertLogs("crawl_certitude", level="WARNING"):
+            with self.assertRaises(FetchError):
+                fetcher.get(session, "https://certitudes.org/", {"certitudes.org"})
+        with self.assertRaises(FetchError) as caught:
+            fetcher.get(session, "https://www.certitudes.org/certitude?wp=GC1", {"www.certitudes.org"})
+        self.assertTrue(caught.exception.metadata["requestSuppressed"])
+        self.assertEqual(len(session.calls), 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list if call.args[0]], [30, 60])
+        self.assertEqual(fetcher.get(session, "https://example.org/", {"example.org"})[0], "ok")
+
+    @patch("crawl_certitude.time.sleep")
+    def test_retry_after_and_challenge_are_respected(self, sleep):
+        response = Response(429)
+        response.headers["Retry-After"] = "90"
+        session = Session([response, Response(200)])
+        with self.assertLogs("crawl_certitude", level="WARNING"):
+            BoundedFetcher(delay=0).get(session, "https://certitudes.org/", {"certitudes.org"})
+        self.assertEqual([call.args[0] for call in sleep.call_args_list if call.args[0]], [90])
+        for headers in ({"Retry-After": "600"}, {"cf-mitigated": "challenge"}):
+            sleep.reset_mock()
+            response = Response(403)
+            response.headers.update(headers)
+            session = Session([response, Response(200)])
+            with self.assertLogs("crawl_certitude", level="WARNING"), self.assertRaises(FetchError):
+                BoundedFetcher(delay=0).get(session, "https://certitudes.org/", {"certitudes.org"})
+            self.assertEqual(len(session.calls), 1)
+            sleep.assert_not_called()
+
+    @patch("crawl_certitude.time.sleep")
+    def test_other_sites_forbidden_does_not_retry(self, sleep):
+        session = Session([Response(403), Response(200)])
+        with self.assertRaises(FetchError):
+            BoundedFetcher(delay=0).get(session, "https://example.org/", {"example.org"})
+        self.assertEqual(len(session.calls), 1)
+        sleep.assert_not_called()
+
+    def test_retry_after_parsing(self):
+        self.assertEqual(_retry_after_seconds("40"), 40)
+        self.assertEqual(_retry_after_seconds("-1"), 0)
+        self.assertIsNone(_retry_after_seconds("secret arbitrary text"))
+        self.assertEqual(_retry_after_seconds("Sun, 01 Nov 2020 00:00:00 GMT"), 0)
+
     def test_certitude_reads_use_verified_request_profile(self):
         session = Session([Response(200)])
         BoundedFetcher(delay=0, retries=1).get(session, "https://www.certitudes.org/certitude?wp=GC1",

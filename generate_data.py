@@ -28,6 +28,7 @@ from runtime_utils import (
     require_env,
     setup_logging,
 )
+from static_publication import publish_json_reports
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
@@ -239,6 +240,7 @@ class DataGenerator:
         self.cursor = None
         self._grouped_cache = {}
         self._heatmap_cache = None
+        self._generation_timestamp = None
 
     def connect(self):
         """Connect to database."""
@@ -606,6 +608,8 @@ class DataGenerator:
 
     def get_generated_at(self) -> str:
         """Get current timestamp in ISO format."""
+        if self._generation_timestamp is not None:
+            return self._generation_timestamp
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     # ==================== OVERVIEW.JSON ====================
@@ -3318,7 +3322,7 @@ class DataGenerator:
     # ==================== MAIN GENERATION ====================
 
     def generate_all(self):
-        """Generate all JSON data files."""
+        """Generate and publish all JSON data files as one validated batch."""
         self.ensure_output_dir()
 
         files_to_generate = [
@@ -3329,26 +3333,17 @@ class DataGenerator:
             ("generated-at.json", self.generate_timestamp_json),
         ]
 
-        generated_files = []
-        failed_files = []
-
-        for filename, generator_func in files_to_generate:
-            try:
+        self._generation_timestamp = self.get_generated_at()
+        try:
+            for filename, _ in files_to_generate:
                 logger.info(f"Generating {filename}...")
-                data = generator_func()
-
-                filepath = os.path.join(OUTPUT_DIR, filename)
-                with open(filepath, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-
-                generated_files.append(filename)
-                logger.info(f"Successfully generated {filename}")
-
-            except Exception as e:
-                logger.error(f"Failed to generate {filename}: {e}")
-                failed_files.append(filename)
-
-        return generated_files, failed_files
+            publish_json_reports(OUTPUT_DIR, files_to_generate)
+        finally:
+            self._generation_timestamp = None
+        generated_files = [filename for filename, _ in files_to_generate]
+        for filename in generated_files:
+            logger.info(f"Successfully generated {filename}")
+        return generated_files, []
 
 
 def main():
@@ -3370,6 +3365,7 @@ def main():
         logger.info(f"Successful: {len(generated)} files - {', '.join(generated)}")
         if failed:
             logger.warning(f"Failed: {len(failed)} files - {', '.join(failed)}")
+            raise RuntimeError(f"Failed to generate files: {', '.join(failed)}")
         else:
             logger.info("All files generated successfully!")
         logger.info("=" * 70)

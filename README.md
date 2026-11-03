@@ -263,6 +263,10 @@ python test/fetch_first_find.py --limit 100
 
 ## 开发约定
 
+离线回归测试运行 `python -B -m unittest discover -s tests -p 'test_*.py'`，说明见 `tests/README.md`。该目录中的测试会通过独立的 `Offline regression tests` 工作流自动检查，不需要数据库或账号凭据；不要对混有维护工具的 `test/` 目录进行自动发现。
+
+普通报表会先在临时目录中完整生成和校验，再替换正式文件；生成失败不会发布已损坏的文件，普通替换异常会尝试恢复原文件。若恢复也失败，错误信息会给出保留恢复文件的目录。此机制不保证进程被强制终止时多个文件能同时切换。采集或注册资料补抓失败时，仍允许后续流程使用已有数据库内容生成，不增加网站状态提示。
+
 - 主目录下的脚本是正式版本，用于 GitHub Actions。
 - `test/` 目录用于本地测试、临时验证和实验脚本。
 - 对 `generate_data.py` 的统计口径修改，应先在 `test/generate_data.py` 和相关测试中验证，再同步到主目录脚本。
